@@ -7,7 +7,9 @@ and queen orchestration concerns separate.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +17,99 @@ if TYPE_CHECKING:
     from framework.server.session_manager import Session
 
 logger = logging.getLogger(__name__)
+
+
+def _project_workspace_from_metadata(project: dict[str, Any] | None) -> str | None:
+    """Resolve preferred workspace path from project metadata."""
+    if not isinstance(project, dict):
+        return None
+
+    def _norm(path: object) -> str | None:
+        raw = str(path or "").strip()
+        if not raw:
+            return None
+        resolved = Path(raw).expanduser().resolve()
+        return str(resolved) if resolved.exists() else None
+
+    direct = _norm(project.get("workspace_path"))
+    if direct:
+        return direct
+
+    profile = project.get("toolchain_profile")
+    if isinstance(profile, dict):
+        approved = profile.get("approved_plan")
+        if isinstance(approved, dict):
+            source = approved.get("source")
+            if isinstance(source, dict):
+                approved_ws = _norm(source.get("workspace_path"))
+                if approved_ws:
+                    return approved_ws
+    return None
+
+
+def _workspace_allow_paths_for_session(
+    *,
+    session: Session,
+    session_manager: Any,
+) -> list[str]:
+    """Collect allowed workspace roots for coder-tools in this session."""
+    paths: list[str] = []
+    try:
+        project = session_manager.get_project(session.project_id)
+    except Exception:
+        project = None
+
+    project_workspace = _project_workspace_from_metadata(project)
+    if project_workspace:
+        paths.append(project_workspace)
+
+    env_workspace_root = str(os.environ.get("HIVE_WORKSPACE_ROOT", "")).strip()
+    if env_workspace_root:
+        resolved = Path(env_workspace_root).expanduser().resolve()
+        if resolved.exists():
+            paths.append(str(resolved))
+
+    extra = str(os.environ.get("HIVE_CODER_TOOLS_ALLOWED_PATHS", "")).strip()
+    if extra:
+        for part in extra.split(os.pathsep):
+            raw = part.strip()
+            if not raw:
+                continue
+            resolved = Path(raw).expanduser().resolve()
+            if resolved.exists():
+                paths.append(str(resolved))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in paths:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _patch_mcp_server_list_for_workspace(
+    *,
+    server_list: list[dict[str, Any]],
+    allow_paths: list[str],
+) -> list[dict[str, Any]]:
+    if not allow_paths:
+        return server_list
+    patched: list[dict[str, Any]] = []
+    joined = os.pathsep.join(allow_paths)
+    for server in server_list:
+        current = dict(server)
+        if str(current.get("name") or "") == "coder-tools":
+            env = dict(current.get("env") or {})
+            existing = str(env.get("CODER_TOOLS_ALLOWED_PATHS") or "").strip()
+            if existing:
+                env["CODER_TOOLS_ALLOWED_PATHS"] = os.pathsep.join([existing, joined])
+            else:
+                env["CODER_TOOLS_ALLOWED_PATHS"] = joined
+            current["env"] = env
+        patched.append(current)
+    return patched
 
 
 async def create_queen(
@@ -86,7 +181,35 @@ async def create_queen(
     mcp_config = queen_pkg_dir / "mcp_servers.json"
     if mcp_config.exists():
         try:
-            queen_registry.load_mcp_config(mcp_config)
+            with open(mcp_config, encoding="utf-8") as f:
+                config = json.load(f)
+            server_list = config.get("servers", [])
+            if not server_list and "servers" not in config:
+                server_list = [{"name": name, **cfg} for name, cfg in config.items()]
+            allow_paths = _workspace_allow_paths_for_session(
+                session=session,
+                session_manager=session_manager,
+            )
+            if allow_paths:
+                server_list = _patch_mcp_server_list_for_workspace(
+                    server_list=server_list,
+                    allow_paths=allow_paths,
+                )
+                logger.info(
+                    "Queen: coder-tools extra allowed roots for project '%s': %s",
+                    session.project_id,
+                    allow_paths,
+                )
+            resolved_server_list = [
+                queen_registry._resolve_mcp_server_config(server_config, mcp_config.parent)
+                for server_config in server_list
+            ]
+            queen_registry.load_registry_servers(
+                resolved_server_list,
+                log_summary=False,
+                preserve_existing_tools=True,
+                log_collisions=False,
+            )
             logger.info("Queen: loaded MCP tools from %s", mcp_config)
         except Exception:
             logger.warning("Queen: MCP config failed to load", exc_info=True)
@@ -196,6 +319,32 @@ async def create_queen(
     init_memory_dir(global_dir)
     phase_state.global_memory_dir = global_dir
 
+    # Keep global recall cache fresh on real user input events.
+    async def _recall_on_user_input(event: AgentEvent) -> None:
+        content = (event.data or {}).get("content", "")
+        if not content or not isinstance(content, str):
+            return
+        try:
+            from framework.agents.queen.recall_selector import (
+                format_recall_injection,
+                select_memories,
+            )
+
+            selected = await select_memories(content, session.llm, global_dir)
+            phase_state._cached_global_recall_block = format_recall_injection(
+                selected,
+                global_dir,
+                heading="Global Memories",
+            )
+        except Exception:
+            logger.debug("recall: user-turn cache update failed", exc_info=True)
+
+    session.event_bus.subscribe(
+        [EventType.CLIENT_INPUT_RECEIVED],
+        _recall_on_user_input,
+        filter_stream="queen",
+    )
+
     # ---- Compose phase-specific prompts ------------------------------
     _orig_node = _queen_graph.nodes[0]
 
@@ -301,6 +450,25 @@ async def create_queen(
                     data={"persona": result.persona_prefix},
                 )
             )
+
+        # Seed global recall block from the initial trigger so first turn starts
+        # with relevant global memory context.
+        trigger = ctx.trigger or ""
+        if trigger:
+            try:
+                from framework.agents.queen.recall_selector import (
+                    format_recall_injection,
+                    select_memories,
+                )
+
+                selected = await select_memories(trigger, _session_llm, global_dir)
+                phase_state._cached_global_recall_block = format_recall_injection(
+                    selected,
+                    global_dir,
+                    heading="Global Memories",
+                )
+            except Exception:
+                logger.debug("recall: initial seeding failed", exc_info=True)
         return HookResult(system_prompt=phase_state.get_current_prompt())
 
     # ---- Graph preparation -------------------------------------------
@@ -314,7 +482,12 @@ async def create_queen(
         "system_prompt": initial_prompt_text,
     }
     if set(available_tools) != set(declared_tools):
-        missing = sorted(set(declared_tools) - registered_tool_names)
+        missing_set = set(declared_tools) - registered_tool_names
+        # Monitoring tools are phase-scoped: when no worker graph is loaded yet,
+        # they are expected to be absent and should not pollute startup logs.
+        if not session.graph_runtime:
+            missing_set -= {"get_worker_health_summary"}
+        missing = sorted(missing_set)
         if missing:
             logger.warning("Queen: tools not available: %s", missing)
         node_updates["tools"] = available_tools

@@ -2,6 +2,7 @@
 
 export interface LiveSession {
   session_id: string;
+  project_id?: string;
   graph_id: string | null;
   graph_name: string | null;
   has_worker: boolean;
@@ -25,6 +26,61 @@ export interface LiveSessionDetail extends LiveSession {
   graphs?: string[];
   /** True when the session exists on disk but is not live (server restarted). */
   cold?: boolean;
+}
+
+export interface ProjectInfo {
+  id: string;
+  name: string;
+  description?: string;
+  repository?: string;
+  max_concurrent_runs?: number | null;
+  policy_overrides?: {
+    risk_tier?: "low" | "medium" | "high" | "critical";
+    retry_limit_per_stage?: number | null;
+    budget_limit_usd_monthly?: number | null;
+  } | null;
+  policy_binding?: {
+    risk_tier?: "low" | "medium" | "high" | "critical";
+    retry_limit_per_stage?: number | null;
+    budget_limit_usd_monthly?: number | null;
+  } | null;
+  execution_template?: {
+    default_flow?: Array<{
+      stage: string;
+      mode: string;
+      model_profile: string;
+    }>;
+    retry_policy?: {
+      max_retries_per_stage?: number | null;
+      escalate_on?: string[];
+    };
+    github?: {
+      default_ref?: string | null;
+      default_branch?: string | null;
+      ref?: string | null;
+      branch?: string | null;
+      no_checks_policy?: "error" | "success" | "manual_pending" | "manual" | "defer" | "pass" | "ok" | null;
+    };
+    default_ref?: string | null;
+    default_branch?: string | null;
+    ref?: string | null;
+    branch?: string | null;
+    no_checks_policy?: "error" | "success" | "manual_pending" | "manual" | "defer" | "pass" | "ok" | null;
+  } | null;
+  retention_policy?: {
+    history_days?: number | null;
+    min_sessions_to_keep?: number | null;
+    archive_enabled?: boolean;
+    archive_root?: string | null;
+  } | null;
+  toolchain_profile?: {
+    pending_plan?: Record<string, unknown> | null;
+    approved_plan?: Record<string, unknown> | null;
+    last_plan?: Record<string, unknown> | null;
+    updated_at?: number;
+  } | null;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface EntryPoint {

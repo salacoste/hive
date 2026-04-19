@@ -1,0 +1,7 @@
+{
+  "name": "Template Project",
+  "project_id": "template-project",
+  "description": "Autonomous development project blueprint",
+  "repository": "org/repo",
+  "max_concurrent_runs": 2
+}

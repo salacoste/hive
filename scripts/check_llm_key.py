@@ -363,14 +363,22 @@ def main() -> None:
             result = check_minimax(api_key, api_base)
         elif api_base and provider_id == "openrouter":
             result = check_openrouter(api_key, api_base)
-        elif api_base and provider_id == "kimi":
-            # Kimi uses an Anthropic-compatible endpoint; check via /v1/messages
+        elif api_base and provider_id == "gemini":
+            # Gemini via proxy.thepeace.ru (Antigravity-Manager) is OpenAI-compatible.
+            endpoint = api_base.rstrip("/") + "/models"
+            result = check_openai_compatible(api_key, endpoint, "Gemini proxy")
+        elif api_base and provider_id in {"kimi", "hive", "anthropic", "clove"}:
+            # Anthropic-compatible endpoints: validate via /v1/messages.
+            # This is required for custom Claude proxies (e.g. Clove) where
+            # /models (OpenAI-compatible) does not apply.
+            provider_name = {
+                "kimi": "Kimi",
+                "hive": "Hive",
+                "anthropic": "Anthropic-compatible",
+                "clove": "Clove",
+            }[provider_id]
             result = check_anthropic_compatible(
-                api_key, api_base.rstrip("/") + "/v1/messages", "Kimi"
-            )
-        elif api_base and provider_id == "hive":
-            result = check_anthropic_compatible(
-                api_key, api_base.rstrip("/") + "/v1/messages", "Hive"
+                api_key, api_base.rstrip("/") + "/v1/messages", provider_name
             )
         elif api_base:
             # Custom API base (ZAI or other OpenAI-compatible)

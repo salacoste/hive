@@ -327,6 +327,18 @@ describe("sseEventToChatMessage", () => {
     expect(result!.content).toBe("do the thing");
   });
 
+  it("prefers client_message_id for client_input_received when provided", () => {
+    const event = makeEvent({
+      type: "client_input_received",
+      node_id: "queen",
+      execution_id: "abc",
+      data: { content: "do the thing", client_message_id: "client-msg-42" },
+    });
+    const result = sseEventToChatMessage(event, "t");
+    expect(result).not.toBeNull();
+    expect(result!.id).toBe("client-msg-42");
+  });
+
   it("returns null for client_input_received with empty content", () => {
     const event = makeEvent({
       type: "client_input_received",

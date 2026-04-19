@@ -95,15 +95,59 @@ edges = [
         source="intake",
         target="research",
         condition=EdgeCondition.ON_SUCCESS,
+        input_mapping={
+            "research_brief": "research_brief",
+            "source": "source",
+            "autonomous_mode": "autonomous_mode",
+            "task": "task",
+            "topic": "topic",
+            "user_request": "user_request",
+            "contract": "contract",
+        },
         priority=1,
     ),
-    # research -> review
+    # research -> review (interactive mode)
     EdgeSpec(
         id="research-to-review",
         source="research",
         target="review",
-        condition=EdgeCondition.ON_SUCCESS,
+        condition=EdgeCondition.CONDITIONAL,
+        condition_expr=(
+            "not ("
+            "(\"autonomous_mode\" in buffer and str(buffer[\"autonomous_mode\"]).lower() == \"true\") "
+            "or (\"source\" in buffer and str(buffer[\"source\"]).lower() == \"autonomous_pipeline\")"
+            ")"
+        ),
+        input_mapping={
+            "findings": "findings",
+            "sources": "sources",
+            "gaps": "gaps",
+            "research_brief": "research_brief",
+            "source": "source",
+            "autonomous_mode": "autonomous_mode",
+        },
         priority=1,
+    ),
+    # research -> report (autonomous mode shortcut)
+    EdgeSpec(
+        id="research-to-report-autonomous",
+        source="research",
+        target="report",
+        condition=EdgeCondition.CONDITIONAL,
+        condition_expr=(
+            "("
+            "(\"autonomous_mode\" in buffer and str(buffer[\"autonomous_mode\"]).lower() == \"true\") "
+            "or (\"source\" in buffer and str(buffer[\"source\"]).lower() == \"autonomous_pipeline\")"
+            ")"
+        ),
+        input_mapping={
+            "findings": "findings",
+            "sources": "sources",
+            "research_brief": "research_brief",
+            "source": "source",
+            "autonomous_mode": "autonomous_mode",
+        },
+        priority=2,
     ),
     # review -> research (feedback loop)
     EdgeSpec(
@@ -111,7 +155,13 @@ edges = [
         source="review",
         target="research",
         condition=EdgeCondition.CONDITIONAL,
-        condition_expr="needs_more_research == True",
+        condition_expr="str(needs_more_research).lower() == 'true'",
+        input_mapping={
+            "feedback": "feedback",
+            "research_brief": "research_brief",
+            "source": "source",
+            "autonomous_mode": "autonomous_mode",
+        },
         priority=1,
     ),
     # review -> report (user satisfied)
@@ -120,26 +170,15 @@ edges = [
         source="review",
         target="report",
         condition=EdgeCondition.CONDITIONAL,
-        condition_expr="needs_more_research == False",
+        condition_expr="str(needs_more_research).lower() != 'true'",
+        input_mapping={
+            "findings": "findings",
+            "sources": "sources",
+            "research_brief": "research_brief",
+            "source": "source",
+            "autonomous_mode": "autonomous_mode",
+        },
         priority=2,
-    ),
-    # report -> research (user wants deeper research on current topic)
-    EdgeSpec(
-        id="report-to-research",
-        source="report",
-        target="research",
-        condition=EdgeCondition.CONDITIONAL,
-        condition_expr="str(next_action).lower() == 'more_research'",
-        priority=2,
-    ),
-    # report -> intake (user wants a new topic — default when not more_research)
-    EdgeSpec(
-        id="report-to-intake",
-        source="report",
-        target="intake",
-        condition=EdgeCondition.CONDITIONAL,
-        condition_expr="str(next_action).lower() != 'more_research'",
-        priority=1,
     ),
 ]
 
@@ -147,7 +186,7 @@ edges = [
 entry_node = "intake"
 entry_points = {"start": "intake"}
 pause_nodes = []
-terminal_nodes = []
+terminal_nodes = ["report"]
 
 
 class DeepResearchAgent:

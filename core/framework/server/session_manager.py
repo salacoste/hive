@@ -12,6 +12,7 @@ Architecture:
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from framework.runtime.triggers import TriggerDefinition
+from framework.server.project_store import ProjectStore
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,7 @@ class Session:
     # Queen (always present once started)
     queen_executor: Any = None  # GraphExecutor for queen input injection
     queen_task: asyncio.Task | None = None
+    queen_boot_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Loaded graph (optional)
     graph_id: str | None = None
     worker_path: Path | None = None
@@ -69,6 +72,10 @@ class Session:
     # directory instead of creating a new one.  This lets cold-restores accumulate
     # all messages in the original session folder so history is never fragmented.
     queen_resume_from: str | None = None
+    # Active queen session directory used by shutdown reflection hooks.
+    queen_dir: Path | None = None
+    # Logical project grouping for multi-repo parallel work.
+    project_id: str = "default"
 
 
 class SessionManager:
@@ -78,12 +85,76 @@ class SessionManager:
     (blocking I/O) then started on the event loop.
     """
 
-    def __init__(self, model: str | None = None, credential_store=None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        model_profile: str | None = None,
+        credential_store=None,
+    ) -> None:
         self._sessions: dict[str, Session] = {}
         self._loading: set[str] = set()
         self._model = model
+        self._model_profile = model_profile
         self._credential_store = credential_store
         self._lock = asyncio.Lock()
+        # Keep strong references for background tasks (for example, shutdown
+        # reflection) so they are not garbage-collected prematurely.
+        self._background_tasks: set[asyncio.Task] = set()
+        self._project_store = ProjectStore()
+        self._default_project_id = (
+            os.environ.get("HIVE_DEFAULT_PROJECT_ID", "default").strip() or "default"
+        )
+        self._project_store.ensure_project(
+            self._default_project_id,
+            name="Default",
+            description="Default project bucket for uncategorized sessions.",
+        )
+
+    def _resolve_project_id(self, project_id: str | None) -> str:
+        resolved = (project_id or self._default_project_id).strip() or self._default_project_id
+        if self._project_store.get_project(resolved) is None:
+            raise ValueError(f"Project '{resolved}' not found")
+        return resolved
+
+    @staticmethod
+    def _project_id_from_resume(session_id: str | None) -> str | None:
+        if not session_id:
+            return None
+        meta_path = Path.home() / ".hive" / "queen" / "session" / session_id / "meta.json"
+        if not meta_path.exists():
+            return None
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            project_id = meta.get("project_id")
+            return str(project_id).strip() if project_id else None
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _resolve_project_for_session_start(
+        self,
+        *,
+        project_id: str | None,
+        queen_resume_from: str | None,
+    ) -> str | None:
+        """Resolve target project for new/restore session start.
+
+        If ``queen_resume_from`` points to an existing session with a known project,
+        and caller provides a different ``project_id``, reject to prevent cross-project
+        cold resume.
+        """
+        resume_project_id = self._project_id_from_resume(queen_resume_from)
+        requested_project_id = project_id.strip() if isinstance(project_id, str) else project_id
+        if (
+            queen_resume_from
+            and requested_project_id
+            and resume_project_id
+            and requested_project_id != resume_project_id
+        ):
+            raise ValueError(
+                f"Session '{queen_resume_from}' belongs to project '{resume_project_id}' "
+                f"and cannot be resumed into project '{requested_project_id}'"
+            )
+        return requested_project_id or resume_project_id
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -93,6 +164,8 @@ class SessionManager:
         self,
         session_id: str | None = None,
         model: str | None = None,
+        model_profile: str | None = None,
+        project_id: str | None = None,
     ) -> Session:
         """Create session infrastructure (EventBus, LLM) without starting queen.
 
@@ -109,7 +182,12 @@ class SessionManager:
                 raise ValueError(f"Session '{resolved_id}' already exists")
 
         # Load LLM config from ~/.hive/configuration.json
-        rc = RuntimeConfig(model=model or self._model or RuntimeConfig().model)
+        from framework.model_routing import resolve_model_chain, resolve_model_connection
+
+        resolved_profile = model_profile or self._model_profile or "heavy"
+        default_chain = resolve_model_chain(profile=resolved_profile)
+        default_model = default_chain[0] if default_chain else RuntimeConfig().model
+        rc = RuntimeConfig(model=model or self._model or default_model)
 
         # Session owns these — shared with queen and worker
         llm_config = get_hive_config().get("llm", {})
@@ -126,6 +204,42 @@ class SessionManager:
                 api_base=rc.api_base,
                 **rc.extra_kwargs,
             )
+
+            # Apply profile fallback chain for server-owned session LLM.
+            chain = resolve_model_chain(explicit_model=rc.model, profile=resolved_profile)
+            if len(chain) > 1:
+                from framework.llm.fallback import FallbackLLMProvider
+
+                providers = [llm]
+                seen_provider_signatures: set[tuple[str, str]] = {
+                    (
+                        str(getattr(llm, "model", "")).strip().lower(),
+                        str(getattr(llm, "api_base", "") or "").strip().rstrip("/"),
+                    )
+                }
+                cfg = get_hive_config()
+                for backup_model in chain[1:]:
+                    conn = resolve_model_connection(backup_model, cfg)
+                    api_key_env = conn.get("api_key_env_var")
+                    api_base = conn.get("api_base")
+                    api_base_env = conn.get("api_base_env_var")
+                    if api_base_env and not api_base:
+                        api_base = os.environ.get(str(api_base_env))
+                    api_key = os.environ.get(str(api_key_env)) if api_key_env else None
+                    candidate = LiteLLMProvider(
+                        model=backup_model,
+                        api_key=api_key,
+                        api_base=api_base,
+                    )
+                    signature = (
+                        str(getattr(candidate, "model", "")).strip().lower(),
+                        str(getattr(candidate, "api_base", "") or "").strip().rstrip("/"),
+                    )
+                    if signature in seen_provider_signatures:
+                        continue
+                    seen_provider_signatures.add(signature)
+                    providers.append(candidate)
+                llm = FallbackLLMProvider(providers)
         event_bus = EventBus()
 
         session = Session(
@@ -133,6 +247,7 @@ class SessionManager:
             event_bus=event_bus,
             llm=llm,
             loaded_at=time.time(),
+            project_id=self._resolve_project_id(project_id),
         )
 
         async with self._lock:
@@ -144,8 +259,10 @@ class SessionManager:
         self,
         session_id: str | None = None,
         model: str | None = None,
+        model_profile: str | None = None,
         initial_prompt: str | None = None,
         queen_resume_from: str | None = None,
+        project_id: str | None = None,
     ) -> Session:
         """Create a new session with a queen but no worker.
 
@@ -155,7 +272,16 @@ class SessionManager:
         """
         # Reuse the original session ID when cold-restoring
         resolved_session_id = queen_resume_from or session_id
-        session = await self._create_session_core(session_id=resolved_session_id, model=model)
+        resolved_project_id = self._resolve_project_for_session_start(
+            project_id=project_id,
+            queen_resume_from=queen_resume_from,
+        )
+        session = await self._create_session_core(
+            session_id=resolved_session_id,
+            model=model,
+            model_profile=model_profile,
+            project_id=resolved_project_id,
+        )
         session.queen_resume_from = queen_resume_from
 
         # Start queen immediately (queen-only, no worker tools yet)
@@ -174,8 +300,10 @@ class SessionManager:
         agent_id: str | None = None,
         session_id: str | None = None,
         model: str | None = None,
+        model_profile: str | None = None,
         initial_prompt: str | None = None,
         queen_resume_from: str | None = None,
+        project_id: str | None = None,
     ) -> Session:
         """Create a session and load a worker in one step.
 
@@ -209,15 +337,23 @@ class SessionManager:
                 return await self.create_session(
                     session_id=session_id,
                     model=model,
+                    model_profile=model_profile,
                     initial_prompt=initial_prompt,
                     queen_resume_from=queen_resume_from,
+                    project_id=project_id,
                 )
 
         # Reuse the original session ID when cold-restoring so the frontend
         # sees one continuous session instead of a new one each time.
+        resolved_project_id = self._resolve_project_for_session_start(
+            project_id=project_id,
+            queen_resume_from=queen_resume_from,
+        )
         session = await self._create_session_core(
             session_id=queen_resume_from,
             model=model,
+            model_profile=model_profile,
+            project_id=resolved_project_id,
         )
         session.queen_resume_from = queen_resume_from
         try:
@@ -227,6 +363,7 @@ class SessionManager:
                 agent_path,
                 graph_id=resolved_graph_id,
                 model=model,
+                model_profile="implementation",
             )
 
             # Restore active triggers from persisted state (cold restore)
@@ -256,8 +393,10 @@ class SessionManager:
                 return await self.create_session(
                     session_id=session_id,
                     model=model,
+                    model_profile=model_profile,
                     initial_prompt=initial_prompt,
                     queen_resume_from=queen_resume_from,
+                    project_id=project_id,
                 )
             # If anything fails (non-cold-restore), tear down the session
             await self.stop_session(session.id)
@@ -274,6 +413,7 @@ class SessionManager:
         agent_path: str | Path,
         graph_id: str | None = None,
         model: str | None = None,
+        model_profile: str | None = None,
     ) -> None:
         """Load a graph into a session (core logic).
 
@@ -298,21 +438,21 @@ class SessionManager:
             loop = asyncio.get_running_loop()
             # By default, workers share the session's LLM with the queen so
             # execution and memory reflection/recall stay on the same model.
-            session_model = getattr(session.llm, "model", None)
-            resolved_model = model or session_model or self._model
+            # Keep worker model independent from queen by default. This allows
+            # heavy queen + implementation worker routing.
+            resolved_model = model
+            resolved_profile = model_profile or "implementation"
             runner = await loop.run_in_executor(
                 None,
                 lambda: AgentRunner.load(
                     agent_path,
                     model=resolved_model,
+                    task_profile=resolved_profile,
                     interactive=False,
                     skip_credential_validation=True,
                     credential_store=self._credential_store,
                 ),
             )
-
-            if model is None:
-                runner._llm = session.llm
 
             # Setup with session's event bus
             if runner._agent_runtime is None:
@@ -533,6 +673,7 @@ class SessionManager:
         agent_path: str | Path,
         graph_id: str | None = None,
         model: str | None = None,
+        model_profile: str | None = None,
     ) -> Session:
         """Load a graph into an existing session (with running queen).
 
@@ -549,6 +690,7 @@ class SessionManager:
             agent_path,
             graph_id=graph_id,
             model=model,
+            model_profile=model_profile,
         )
 
         # Notify queen about the loaded worker (skip for queen itself).
@@ -571,6 +713,7 @@ class SessionManager:
             existing_meta["agent_path"] = (
                 str(session.worker_path) if session.worker_path else str(agent_path)
             )
+            existing_meta["project_id"] = session.project_id
             meta_path.write_text(json.dumps(existing_meta), encoding="utf-8")
         except OSError:
             pass
@@ -650,17 +793,30 @@ class SessionManager:
         if session is None:
             return False
 
-        # Capture session data for memory consolidation before teardown
-        _llm = getattr(session, "llm", None)
-        _storage_id = getattr(session, "queen_resume_from", None) or session_id
-        _session_dir = Path.home() / ".hive" / "queen" / "session" / _storage_id
-
         if session.worker_handoff_sub is not None:
             try:
                 session.event_bus.unsubscribe(session.worker_handoff_sub)
             except Exception:
                 pass
             session.worker_handoff_sub = None
+
+        # Spawn best-effort shutdown reflection before session teardown.
+        if session.queen_dir is not None:
+            try:
+                from framework.agents.queen.reflection_agent import run_shutdown_reflection
+
+                task = asyncio.create_task(
+                    asyncio.shield(run_shutdown_reflection(session.queen_dir, session.llm)),
+                    name=f"queen-memory-shutdown-reflection-{session_id}",
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            except Exception:
+                logger.warning(
+                    "Session '%s': failed to spawn shutdown reflection",
+                    session_id,
+                    exc_info=True,
+                )
 
         for sub_id in session.worker_memory_subs:
             try:
@@ -707,20 +863,6 @@ class SessionManager:
                 await session.runner.cleanup_async()
             except Exception as e:
                 logger.error("Error cleaning up worker: %s", e)
-
-        # Final long reflection — fire-and-forget so teardown isn't blocked.
-        if _llm is not None:
-            import asyncio
-
-            from framework.agents.queen.queen_memory_v2 import colony_memory_dir
-            from framework.agents.queen.reflection_agent import run_long_reflection
-
-            asyncio.create_task(
-                run_long_reflection(
-                    _llm, memory_dir=colony_memory_dir(_storage_id), caller="queen"
-                ),
-                name=f"queen-memory-long-reflection-{session_id}",
-            )
 
         # Close per-session event log
         session.event_bus.close_session_log()
@@ -835,140 +977,158 @@ class SessionManager:
         """
         from framework.server.queen_orchestrator import create_queen
 
-        logger.debug(
-            "[_start_queen] Starting for session %s, current queen_executor=%s",
-            session.id,
-            session.queen_executor,
-        )
-
-        hive_home = Path.home() / ".hive"
-
-        # Determine which session directory to use for queen storage.
-        # When queen_resume_from is set we write to the ORIGINAL session's
-        # directory so that all messages accumulate in one place.
-        storage_session_id = session.queen_resume_from or session.id
-        queen_dir = hive_home / "queen" / "session" / storage_session_id
-        queen_dir.mkdir(parents=True, exist_ok=True)
-
-        # Always write/update session metadata so history sidebar has correct
-        # agent name, path, and last-active timestamp (important so the original
-        # session directory sorts as "most recent" after a cold-restore resume).
-        _meta_path = queen_dir / "meta.json"
-        try:
-            _agent_name = (
-                session.worker_info.name
-                if session.worker_info
-                else (
-                    str(session.worker_path.name).replace("_", " ").title()
-                    if session.worker_path
-                    else None
+        async with session.queen_boot_lock:
+            if session.queen_executor is not None:
+                logger.debug(
+                    "[_start_queen] Skip: queen_executor already active for session %s",
+                    session.id,
                 )
+                return
+            if session.queen_task is not None and not session.queen_task.done():
+                logger.debug(
+                    "[_start_queen] Skip: queen_task already running for session %s",
+                    session.id,
+                )
+                return
+
+            logger.debug(
+                "[_start_queen] Starting for session %s, current queen_executor=%s",
+                session.id,
+                session.queen_executor,
             )
-            # Merge into existing meta.json to preserve fields written by
-            # _update_meta_json (e.g. phase, agent_path set during building).
-            _existing_meta: dict = {}
-            if _meta_path.exists():
-                try:
-                    _existing_meta = json.loads(_meta_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    pass
-            _new_meta: dict = {"created_at": time.time()}
-            if _agent_name is not None:
-                _new_meta["agent_name"] = _agent_name
-            if session.worker_path is not None:
-                _new_meta["agent_path"] = str(session.worker_path)
-            _existing_meta.update(_new_meta)
-            _meta_path.write_text(json.dumps(_existing_meta), encoding="utf-8")
-        except OSError:
-            pass
 
-        # Enable per-session event persistence so that all eventbus events
-        # survive server restarts and can be replayed on cold-session resume.
-        # Scan the existing event log to find the max iteration ever written,
-        # then use max+1 as offset so resumed sessions produce monotonically
-        # increasing iteration values — preventing frontend message ID collisions.
-        iteration_offset = 0
-        last_phase = ""
-        events_path = queen_dir / "events.jsonl"
-        try:
-            if events_path.exists():
-                max_iter = -1
-                with open(events_path, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            evt = json.loads(line)
-                            data = evt.get("data", {})
-                            it = data.get("iteration")
-                            if isinstance(it, int) and it > max_iter:
-                                max_iter = it
-                            # Track the latest queen phase from QUEEN_PHASE_CHANGED events
-                            if evt.get("type") == "queen_phase_changed":
-                                phase = data.get("phase")
-                                if phase:
-                                    last_phase = phase
-                        except (json.JSONDecodeError, TypeError):
-                            continue
-                if max_iter >= 0:
-                    iteration_offset = max_iter + 1
-                    logger.info(
-                        "Session '%s' resuming with iteration_offset=%d"
-                        " (from events.jsonl max), last phase: %s",
-                        session.id,
-                        iteration_offset,
-                        last_phase or "unknown",
+            hive_home = Path.home() / ".hive"
+
+            # Determine which session directory to use for queen storage.
+            # When queen_resume_from is set we write to the ORIGINAL session's
+            # directory so that all messages accumulate in one place.
+            storage_session_id = session.queen_resume_from or session.id
+            queen_dir = hive_home / "queen" / "session" / storage_session_id
+            queen_dir.mkdir(parents=True, exist_ok=True)
+            session.queen_dir = queen_dir
+
+            # Always write/update session metadata so history sidebar has correct
+            # agent name, path, and last-active timestamp (important so the original
+            # session directory sorts as "most recent" after a cold-restore resume).
+            _meta_path = queen_dir / "meta.json"
+            try:
+                _agent_name = (
+                    session.worker_info.name
+                    if session.worker_info
+                    else (
+                        str(session.worker_path.name).replace("_", " ").title()
+                        if session.worker_path
+                        else None
                     )
-        except OSError:
-            pass
-        session.event_bus.set_session_log(events_path, iteration_offset=iteration_offset)
+                )
+                # Merge into existing meta.json to preserve fields written by
+                # _update_meta_json (e.g. phase, agent_path set during building).
+                _existing_meta: dict = {}
+                if _meta_path.exists():
+                    try:
+                        _existing_meta = json.loads(_meta_path.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError):
+                        pass
+                _new_meta: dict = {"created_at": time.time()}
+                if _agent_name is not None:
+                    _new_meta["agent_name"] = _agent_name
+                if session.worker_path is not None:
+                    _new_meta["agent_path"] = str(session.worker_path)
+                _new_meta["project_id"] = session.project_id
+                _existing_meta.update(_new_meta)
+                _meta_path.write_text(json.dumps(_existing_meta), encoding="utf-8")
+            except OSError:
+                pass
 
-        logger.debug("[_start_queen] Calling create_queen...")
-        session.queen_task = await create_queen(
-            session=session,
-            session_manager=self,
-            worker_identity=worker_identity,
-            queen_dir=queen_dir,
-            initial_prompt=initial_prompt,
-        )
-        logger.debug(
-            "[_start_queen] create_queen returned, queen_task=%s, queen_executor=%s",
-            session.queen_task,
-            session.queen_executor,
-        )
+            # Enable per-session event persistence so that all eventbus events
+            # survive server restarts and can be replayed on cold-session resume.
+            # Scan the existing event log to find the max iteration ever written,
+            # then use max+1 as offset so resumed sessions produce monotonically
+            # increasing iteration values — preventing frontend message ID collisions.
+            iteration_offset = 0
+            last_phase = ""
+            events_path = queen_dir / "events.jsonl"
+            try:
+                if events_path.exists():
+                    max_iter = -1
+                    with open(events_path, encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                evt = json.loads(line)
+                                data = evt.get("data", {})
+                                it = data.get("iteration")
+                                if isinstance(it, int) and it > max_iter:
+                                    max_iter = it
+                                # Track the latest queen phase from QUEEN_PHASE_CHANGED events
+                                if evt.get("type") == "queen_phase_changed":
+                                    phase = data.get("phase")
+                                    if phase:
+                                        last_phase = phase
+                            except (json.JSONDecodeError, TypeError):
+                                continue
+                    if max_iter >= 0:
+                        iteration_offset = max_iter + 1
+                        logger.info(
+                            "Session '%s' resuming with iteration_offset=%d"
+                            " (from events.jsonl max), last phase: %s",
+                            session.id,
+                            iteration_offset,
+                            last_phase or "unknown",
+                        )
+            except OSError:
+                pass
+            session.event_bus.set_session_log(events_path, iteration_offset=iteration_offset)
 
-        # Auto-load worker on cold restore — the queen's conversation expects
-        # the agent to be loaded, but the new session has no worker.
-        if session.queen_resume_from and not session.graph_runtime:
-            meta_path = queen_dir / "meta.json"
-            if meta_path.exists():
-                try:
-                    _meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    _agent_path = _meta.get("agent_path")
-                    _phase = _meta.get("phase")
+            logger.debug("[_start_queen] Calling create_queen...")
+            session.queen_task = await create_queen(
+                session=session,
+                session_manager=self,
+                worker_identity=worker_identity,
+                queen_dir=queen_dir,
+                initial_prompt=initial_prompt,
+            )
+            logger.debug(
+                "[_start_queen] create_queen returned, queen_task=%s, queen_executor=%s",
+                session.queen_task,
+                session.queen_executor,
+            )
 
-                    if _agent_path and Path(_agent_path).exists():
-                        if _phase in ("staging", "running", None):
-                            # Agent fully built — load worker and resume
-                            await self.load_graph(session.id, _agent_path)
-                            if session.phase_state:
-                                await session.phase_state.switch_to_staging(source="auto")
-                            # Emit flowchart overlay so frontend can display it
-                            await self._emit_flowchart_on_restore(session, _agent_path)
-                            logger.info("Cold restore: auto-loaded worker from %s", _agent_path)
-                        elif _phase == "building":
-                            # Agent folder exists but incomplete — resume building
-                            if session.phase_state:
-                                session.phase_state.agent_path = _agent_path
-                                await session.phase_state.switch_to_building(source="auto")
-                            logger.info("Cold restore: resumed BUILDING phase for %s", _agent_path)
-                        elif _phase == "planning":
-                            if session.phase_state:
-                                session.phase_state.agent_path = _agent_path
-                            logger.info("Cold restore: PLANNING phase for %s", _agent_path)
-                except Exception:
-                    logger.warning("Cold restore: failed to auto-load worker", exc_info=True)
+            # Auto-load worker on cold restore — the queen's conversation expects
+            # the agent to be loaded, but the new session has no worker.
+            if session.queen_resume_from and not session.graph_runtime:
+                meta_path = queen_dir / "meta.json"
+                if meta_path.exists():
+                    try:
+                        _meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                        _agent_path = _meta.get("agent_path")
+                        _phase = _meta.get("phase")
+
+                        if _agent_path and Path(_agent_path).exists():
+                            if _phase in ("staging", "running", None):
+                                # Agent fully built — load worker and resume
+                                await self.load_graph(session.id, _agent_path)
+                                if session.phase_state:
+                                    await session.phase_state.switch_to_staging(source="auto")
+                                # Emit flowchart overlay so frontend can display it
+                                await self._emit_flowchart_on_restore(session, _agent_path)
+                                logger.info("Cold restore: auto-loaded worker from %s", _agent_path)
+                            elif _phase == "building":
+                                # Agent folder exists but incomplete — resume building
+                                if session.phase_state:
+                                    session.phase_state.agent_path = _agent_path
+                                    await session.phase_state.switch_to_building(source="auto")
+                                logger.info(
+                                    "Cold restore: resumed BUILDING phase for %s", _agent_path
+                                )
+                            elif _phase == "planning":
+                                if session.phase_state:
+                                    session.phase_state.agent_path = _agent_path
+                                logger.info("Cold restore: PLANNING phase for %s", _agent_path)
+                    except Exception:
+                        logger.warning("Cold restore: failed to auto-load worker", exc_info=True)
 
         # Memory reflection/recall subscriptions are set up inside
         # queen_orchestrator.create_queen() → _queen_loop() and stored
@@ -1153,8 +1313,68 @@ class SessionManager:
     def is_loading(self, session_id: str) -> bool:
         return session_id in self._loading
 
-    def list_sessions(self) -> list[Session]:
-        return list(self._sessions.values())
+    def list_sessions(self, project_id: str | None = None) -> list[Session]:
+        if not project_id:
+            return list(self._sessions.values())
+        return [s for s in self._sessions.values() if s.project_id == project_id]
+
+    # ------------------------------------------------------------------
+    # Project registry
+    # ------------------------------------------------------------------
+
+    def default_project_id(self) -> str:
+        return self._default_project_id
+
+    def list_projects(self) -> list[dict]:
+        return [p.__dict__.copy() for p in self._project_store.list_projects()]
+
+    def get_project(self, project_id: str) -> dict | None:
+        p = self._project_store.get_project(project_id)
+        return p.__dict__.copy() if p else None
+
+    def create_project(
+        self,
+        *,
+        name: str,
+        description: str = "",
+        repository: str = "",
+        workspace_path: str = "",
+        max_concurrent_runs: int | None = None,
+        policy_overrides: dict[str, Any] | None = None,
+        policy_binding: dict[str, Any] | None = None,
+        retention_policy: dict[str, Any] | None = None,
+        execution_template: dict[str, Any] | None = None,
+        toolchain_profile: dict[str, Any] | None = None,
+        environment_profile: dict[str, Any] | None = None,
+        project_id: str | None = None,
+    ) -> dict:
+        p = self._project_store.create_project(
+            name=name,
+            description=description,
+            repository=repository,
+            workspace_path=workspace_path,
+            max_concurrent_runs=max_concurrent_runs,
+            policy_overrides=policy_overrides,
+            policy_binding=policy_binding,
+            retention_policy=retention_policy,
+            execution_template=execution_template,
+            toolchain_profile=toolchain_profile,
+            environment_profile=environment_profile,
+            project_id=project_id,
+        )
+        return p.__dict__.copy()
+
+    def update_project(self, project_id: str, updates: dict[str, Any]) -> dict | None:
+        p = self._project_store.update_project(project_id, updates)
+        return p.__dict__.copy() if p else None
+
+    def delete_project(self, project_id: str, *, force: bool = False) -> tuple[bool, str | None]:
+        if project_id == self._default_project_id:
+            return False, "Default project cannot be deleted"
+        active = self.list_sessions(project_id=project_id)
+        if active and not force:
+            return False, f"Project has active sessions: {len(active)}"
+        return self._project_store.delete_project(project_id), None
 
     # ------------------------------------------------------------------
     # Cold session helpers (disk-only, no live runtime required)
@@ -1200,12 +1420,14 @@ class SessionManager:
         # Read extra metadata written at session start
         agent_name: str | None = None
         agent_path: str | None = None
+        project_id: str | None = None
         meta_path = queen_dir / "meta.json"
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 agent_name = meta.get("agent_name")
                 agent_path = meta.get("agent_path")
+                project_id = meta.get("project_id")
                 created_at = meta.get("created_at") or created_at
             except (json.JSONDecodeError, OSError):
                 pass
@@ -1218,6 +1440,7 @@ class SessionManager:
             "created_at": created_at,
             "agent_name": agent_name,
             "agent_path": agent_path,
+            "project_id": project_id,
         }
 
     @staticmethod
@@ -1246,12 +1469,14 @@ class SessionManager:
                 created_at = 0.0
             agent_name: str | None = None
             agent_path: str | None = None
+            project_id: str | None = None
             meta_path = d / "meta.json"
             if meta_path.exists():
                 try:
                     meta = json.loads(meta_path.read_text(encoding="utf-8"))
                     agent_name = meta.get("agent_name")
                     agent_path = meta.get("agent_path")
+                    project_id = meta.get("project_id")
                     created_at = meta.get("created_at") or created_at
                 except (json.JSONDecodeError, OSError):
                     pass
@@ -1321,6 +1546,7 @@ class SessionManager:
                     "created_at": created_at,
                     "agent_name": agent_name,
                     "agent_path": agent_path,
+                    "project_id": project_id,
                     "last_message": last_message,
                     "message_count": message_count,
                 }

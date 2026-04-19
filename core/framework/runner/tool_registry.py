@@ -68,6 +68,149 @@ class ToolRegistry:
         self._mcp_server_tools: dict[str, set[str]] = {}  # server name -> tool names
         # Agent dir for re-loading registry MCP after credential resync.
         self._mcp_registry_agent_path: Path | None = None
+        self._register_builtin_data_tools()
+
+    @staticmethod
+    def _resolve_data_path(data_dir: str | Path | None, filename: str) -> tuple[Path, Path]:
+        """Resolve *filename* under *data_dir* and prevent path traversal."""
+        exec_ctx = _execution_context.get() or {}
+        ctx_data_dir = str(exec_ctx.get("data_dir") or "").strip()
+
+        chosen_data_dir = str(data_dir or "").strip()
+        # LLMs frequently pass "." or "/app" despite explicit prompt guidance.
+        # Prefer the execution-scoped data_dir when available.
+        if not chosen_data_dir or chosen_data_dir in {".", "./", "/app", "/app/data"}:
+            chosen_data_dir = ctx_data_dir or chosen_data_dir
+
+        if not chosen_data_dir:
+            raise ValueError("data_dir is required")
+        base_path = Path(chosen_data_dir).expanduser()
+        if not base_path.is_absolute() and ctx_data_dir:
+            base = (Path(ctx_data_dir).expanduser() / base_path).resolve()
+        else:
+            base = base_path.resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        candidate = (base / str(filename or "")).resolve()
+        if not str(candidate).startswith(str(base)):
+            raise ValueError("filename must stay within data_dir")
+        return base, candidate
+
+    def _register_builtin_data_tools(self) -> None:
+        """Register framework data/file tools used by template agents."""
+
+        def save_data(filename: str, data: Any, data_dir: str = "") -> dict[str, Any]:
+            _, path = self._resolve_data_path(data_dir, filename)
+            payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, indent=2)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload, encoding="utf-8")
+            return {
+                "ok": True,
+                "filename": path.name,
+                "file_path": str(path),
+                "uri": path.as_uri(),
+                "bytes_written": len(payload.encode("utf-8")),
+            }
+
+        def append_data(filename: str, data: Any, data_dir: str = "") -> dict[str, Any]:
+            _, path = self._resolve_data_path(data_dir, filename)
+            payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(payload)
+            return {
+                "ok": True,
+                "filename": path.name,
+                "file_path": str(path),
+                "uri": path.as_uri(),
+                "bytes_appended": len(payload.encode("utf-8")),
+            }
+
+        def edit_data(filename: str, old_text: str, new_text: str, data_dir: str = "") -> dict[str, Any]:
+            _, path = self._resolve_data_path(data_dir, filename)
+            if not path.exists():
+                raise FileNotFoundError(f"File not found: {filename}")
+            content = path.read_text(encoding="utf-8")
+            updated = content.replace(old_text or "", new_text or "")
+            path.write_text(updated, encoding="utf-8")
+            return {
+                "ok": True,
+                "filename": path.name,
+                "file_path": str(path),
+                "uri": path.as_uri(),
+                "bytes_written": len(updated.encode("utf-8")),
+            }
+
+        def load_data(
+            filename: str,
+            data_dir: str = "",
+            offset_bytes: int = 0,
+            limit_bytes: int = 200000,
+        ) -> dict[str, Any]:
+            _, path = self._resolve_data_path(data_dir, filename)
+            if not path.exists():
+                raise FileNotFoundError(f"File not found: {filename}")
+            raw = path.read_bytes()
+            total = len(raw)
+            start = max(0, int(offset_bytes or 0))
+            end = min(total, start + max(1, int(limit_bytes or 1)))
+            chunk = raw[start:end]
+            return {
+                "ok": True,
+                "filename": path.name,
+                "file_path": str(path),
+                "uri": path.as_uri(),
+                "content": chunk.decode("utf-8", errors="replace"),
+                "offset_bytes": start,
+                "returned_bytes": len(chunk),
+                "total_bytes": total,
+                "has_more": end < total,
+                "next_offset_bytes": end if end < total else None,
+            }
+
+        def list_data_files(data_dir: str = "") -> dict[str, Any]:
+            base, _ = self._resolve_data_path(data_dir, ".")
+            files = []
+            for entry in sorted(base.rglob("*")):
+                if not entry.is_file():
+                    continue
+                rel = entry.relative_to(base)
+                files.append(
+                    {
+                        "filename": str(rel),
+                        "file_path": str(entry),
+                        "uri": entry.as_uri(),
+                        "size_bytes": entry.stat().st_size,
+                    }
+                )
+            return {"ok": True, "data_dir": str(base), "files": files}
+
+        def serve_file_to_user(
+            filename: str,
+            data_dir: str = "",
+            label: str = "",
+            open_in_browser: bool = False,
+        ) -> dict[str, Any]:
+            _, path = self._resolve_data_path(data_dir, filename)
+            if not path.exists():
+                raise FileNotFoundError(f"File not found: {filename}")
+            return {
+                "ok": True,
+                "filename": path.name,
+                "label": (label or path.name).strip(),
+                "file_path": str(path),
+                "uri": path.as_uri(),
+                "open_in_browser": bool(open_in_browser),
+            }
+
+        self.register_function(save_data, description="Save data to a file in the execution data directory.")
+        self.register_function(append_data, description="Append data to a file in the execution data directory.")
+        self.register_function(edit_data, description="Replace text in a data file in the execution data directory.")
+        self.register_function(load_data, description="Load data from a file with byte-range pagination support.")
+        self.register_function(list_data_files, description="List data files available in the execution data directory.")
+        self.register_function(
+            serve_file_to_user,
+            description="Return a local file path/URI for user download or opening.",
+        )
 
     def register(
         self,
@@ -526,6 +669,8 @@ class ToolRegistry:
                 )
                 if count > 0:
                     return True, count, None
+                if bool(server_config.get("allow_zero_tools", False)):
+                    return True, 0, None
                 last_error = "registered 0 tools"
             except Exception as exc:
                 last_error = str(exc)
@@ -671,11 +816,17 @@ class ToolRegistry:
             if server_name not in self._mcp_server_tools:
                 self._mcp_server_tools[server_name] = set()
             count = 0
-            for mcp_tool in client.list_tools():
+            skipped_existing = 0
+            skipped_cap = 0
+            mcp_tools = list(client.list_tools())
+            discovered_total = len(mcp_tools)
+            for idx, mcp_tool in enumerate(mcp_tools):
                 if tool_cap is not None and count >= tool_cap:
+                    skipped_cap = max(0, discovered_total - idx)
                     break
 
                 if preserve_existing_tools and mcp_tool.name in self._tools:
+                    skipped_existing += 1
                     if log_collisions:
                         origin_server = (
                             self._find_mcp_origin_server_for_tool(mcp_tool.name) or "<existing>"
@@ -759,10 +910,20 @@ class ToolRegistry:
                 extra={
                     "server": config.name,
                     "status": "success",
+                    "tools_discovered": discovered_total,
                     "tools_loaded": count,
+                    "tools_skipped_existing": skipped_existing,
+                    "tools_skipped_cap": skipped_cap,
                     "skipped_reason": None,
                 },
             )
+            if discovered_total > 0 and count == 0 and skipped_existing == discovered_total:
+                logger.info(
+                    "MCP server '%s' registered 0 new tools; all %d discovered tools "
+                    "were already present in registry (first-wins)",
+                    server_name,
+                    discovered_total,
+                )
             return count
 
         except Exception as e:

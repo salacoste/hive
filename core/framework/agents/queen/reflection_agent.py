@@ -30,21 +30,63 @@ from pathlib import Path
 from typing import Any
 
 from framework.agents.queen.queen_memory_v2 import (
+    GLOBAL_MEMORY_CATEGORIES,
     MAX_FILE_SIZE_BYTES,
     MAX_FILES,
-    MEMORY_DIR,
-    MEMORY_FRONTMATTER_EXAMPLE,
-    MEMORY_TYPES,
-    build_diary_document,
-    diary_filename,
     format_memory_manifest,
+    global_memory_dir,
     parse_frontmatter,
-    read_conversation_parts,
     scan_memory_files,
 )
 from framework.llm.provider import LLMResponse, Tool
 
 logger = logging.getLogger(__name__)
+
+# Compatibility layer for local reflection flow that still uses the historical
+# helper symbols while memory v2 now exposes a narrower API surface.
+MEMORY_DIR: Path = global_memory_dir()
+MEMORY_TYPES: tuple[str, ...] = tuple(GLOBAL_MEMORY_CATEGORIES)
+MEMORY_FRONTMATTER_EXAMPLE: tuple[str, ...] = (
+    "---",
+    "name: user-memory-slug",
+    "type: profile",
+    "description: Short searchable summary",
+    "---",
+    "",
+    "Memory body...",
+)
+
+
+def diary_filename(*, now: datetime | None = None) -> str:
+    dt = now or datetime.now()
+    return f"MEMORY-{dt.strftime('%Y-%m-%d')}.md"
+
+
+def build_diary_document(*, date_str: str, body: str) -> str:
+    return (
+        "---\n"
+        f"name: MEMORY-{date_str}\n"
+        "type: feedback\n"
+        "description: Daily session narrative\n"
+        "---\n\n"
+        f"{body.strip()}\n"
+    )
+
+
+async def read_conversation_parts(session_dir: Path) -> list[dict[str, Any]]:
+    parts_dir = session_dir / "conversations" / "parts"
+    if not parts_dir.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in sorted(parts_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        out.append(payload)
+    return out
 
 # ---------------------------------------------------------------------------
 # Reflection tool definitions (internal — not in queen's main registry)
@@ -156,7 +198,7 @@ def _inject_last_modified_by(content: str, caller: str) -> str:
     return f"---\n{new_fm}\n---{content[m.end() :]}"
 
 
-def _execute_tool(name: str, args: dict[str, Any], memory_dir: Path, caller: str) -> str:
+def _execute_tool(name: str, args: dict[str, Any], memory_dir: Path, caller: str = "queen") -> str:
     """Execute a reflection tool synchronously.  Returns the result string."""
     if name == "list_memory_files":
         files = scan_memory_files(memory_dir)
@@ -186,6 +228,11 @@ def _execute_tool(name: str, args: dict[str, Any], memory_dir: Path, caller: str
         # Enforce caller-based type restrictions.
         fm = parse_frontmatter(content)
         mem_type = (fm.get("type") or "").strip().lower()
+        if mem_type not in set(GLOBAL_MEMORY_CATEGORIES):
+            return (
+                f"ERROR: Invalid memory type '{mem_type}'. "
+                f"Allowed types: {', '.join(GLOBAL_MEMORY_CATEGORIES)}."
+            )
         if caller == "worker" and mem_type in _WORKER_BLOCKED_TYPES:
             return (
                 f"ERROR: Workers cannot write memory type '{mem_type}'. "
@@ -282,14 +329,63 @@ async def _reflection_loop(
 
         # Build assistant message.
         tool_calls_raw: list[dict[str, Any]] = []
-        if resp.raw_response and isinstance(resp.raw_response, dict):
-            tool_calls_raw = resp.raw_response.get("tool_calls", [])
+        raw_response = resp.raw_response
+        if isinstance(raw_response, dict):
+            for tc in raw_response.get("tool_calls", []) or []:
+                if not isinstance(tc, dict):
+                    continue
+                if "name" in tc:
+                    tool_calls_raw.append(
+                        {
+                            "id": tc.get("id", ""),
+                            "name": tc.get("name", ""),
+                            "input": tc.get("input", {}) or {},
+                        }
+                    )
+                    continue
+                fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+                fn_args = fn.get("arguments")
+                try:
+                    if isinstance(fn_args, str) and fn_args:
+                        parsed_args = json.loads(fn_args)
+                    else:
+                        parsed_args = {}
+                except json.JSONDecodeError:
+                    parsed_args = {}
+                tool_calls_raw.append(
+                    {
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "input": parsed_args,
+                    }
+                )
+        elif raw_response is not None:
+            # litellm/OpenAI object-style response: choices[0].message.tool_calls
+            try:
+                msg_obj = raw_response.choices[0].message
+                for tc in getattr(msg_obj, "tool_calls", None) or []:
+                    fn = getattr(tc, "function", None)
+                    fn_name = getattr(fn, "name", "")
+                    fn_args = getattr(fn, "arguments", "")
+                    try:
+                        parsed_args = json.loads(fn_args) if fn_args else {}
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_args = {}
+                    tool_calls_raw.append(
+                        {
+                            "id": getattr(tc, "id", ""),
+                            "name": fn_name,
+                            "input": parsed_args,
+                        }
+                    )
+            except (AttributeError, IndexError, TypeError):
+                pass
 
         # Log the full LLM response for debugging.
         raw_keys = (
-            list(resp.raw_response.keys())
-            if isinstance(resp.raw_response, dict)
-            else type(resp.raw_response).__name__
+            list(raw_response.keys())
+            if isinstance(raw_response, dict)
+            else type(raw_response).__name__
         )
         logger.debug(
             "reflect: turn %d — LLM response: content=%r (len=%d), stop_reason=%s, "
@@ -456,7 +552,7 @@ async def run_short_reflection(
     llm: Any,
     memory_dir: Path | None = None,
     *,
-    caller: str,
+    caller: str = "queen",
 ) -> None:
     """Run a short reflection: extract learnings from conversation."""
     mem_dir = memory_dir or MEMORY_DIR
@@ -513,7 +609,7 @@ async def run_long_reflection(
     llm: Any,
     memory_dir: Path | None = None,
     *,
-    caller: str,
+    caller: str = "queen",
 ) -> None:
     """Run a long reflection: organise and deduplicate all memories."""
     mem_dir = memory_dir or MEMORY_DIR
@@ -552,6 +648,19 @@ async def run_long_reflection(
             len(files),
             reason or "no reason given",
         )
+
+
+async def run_shutdown_reflection(
+    session_dir: Path,
+    llm: Any,
+    memory_dir: Path | None = None,
+) -> None:
+    """Best-effort final short reflection before session teardown."""
+    try:
+        await run_short_reflection(session_dir, llm, memory_dir=memory_dir, caller="queen")
+    except Exception:
+        logger.warning("reflect: shutdown reflection failed", exc_info=True)
+        _write_error("shutdown reflection")
 
 
 async def run_diary_update(

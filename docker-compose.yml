@@ -1,0 +1,196 @@
+# Hive Docker Compose
+# ──────────────────────────────────────────────
+# Usage:
+#   docker compose up -d              start all services
+#   docker compose logs -f hive-core  follow core logs
+#   docker compose exec hive-core hive run <agent> --input '{}'
+#   docker compose down               stop all
+#
+# Providers:
+#   Claude  -> claude.thepeace.ru  (Clove, Anthropic API format)
+#   Gemini  -> proxy.thepeace.ru   (Antigravity-Manager, OpenAI format)
+#   GLM-5.1 -> z.ai               (ZhipuAI native)
+#   OpenAI  -> codex.thepeace.ru   (Codex-LB, OpenAI format)
+
+services:
+  hive-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HIVE_DOCKER_INSTALL_PLAYWRIGHT: ${HIVE_DOCKER_INSTALL_PLAYWRIGHT:-1}
+        HIVE_DOCKER_INSTALL_NODE: ${HIVE_DOCKER_INSTALL_NODE:-0}
+        HIVE_DOCKER_INSTALL_GO: ${HIVE_DOCKER_INSTALL_GO:-0}
+        HIVE_DOCKER_INSTALL_RUST: ${HIVE_DOCKER_INSTALL_RUST:-0}
+        HIVE_DOCKER_INSTALL_JAVA: ${HIVE_DOCKER_INSTALL_JAVA:-0}
+    container_name: hive-core
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${HIVE_CORE_PORT:-8787}:8787"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_API_BASE=${ANTHROPIC_API_BASE:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_API_BASE=${GEMINI_API_BASE:-}
+      - ZAI_API_KEY=${ZAI_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-}
+      - HIVE_LLM_RATE_LIMIT_MAX_RETRIES=${HIVE_LLM_RATE_LIMIT_MAX_RETRIES:-3}
+      - HIVE_LLM_CLAUDE_RATE_LIMIT_MAX_RETRIES=${HIVE_LLM_CLAUDE_RATE_LIMIT_MAX_RETRIES:-1}
+      - HIVE_LLM_FAILOVER_RETRIES=${HIVE_LLM_FAILOVER_RETRIES:-3}
+      - HIVE_LLM_MAX_CONCURRENT_REQUESTS=${HIVE_LLM_MAX_CONCURRENT_REQUESTS:-4}
+      - HIVE_CREDENTIAL_KEY=${HIVE_CREDENTIAL_KEY:-}
+      - AGENT_STORAGE_PATH=/data/storage
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://hive:hive@postgres:5432/hive}
+      - GOOGLE_ACCESS_TOKEN_FILE=/data/storage/secrets/google_access_token
+      - HIVE_TELEGRAM_TEST_CHAT_ID=${HIVE_TELEGRAM_TEST_CHAT_ID:-188207447}
+      - HIVE_WORKSPACE_ROOT=${HIVE_WORKSPACE_ROOT:-/home/hiveuser/projects}
+      - PYTHONPATH=/app/tools/src
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - hive-storage:/data/storage
+      - hive-home:/home/hiveuser/.hive
+      - ./exports:/app/exports
+      - ./examples:/app/examples
+      - hive-workspaces:/home/hiveuser/projects
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8787/api/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  google-token-refresher:
+    image: ${HIVE_CORE_IMAGE:-hive-hive-core}
+    container_name: hive-google-token-refresher
+    restart: unless-stopped
+    user: "0:0"
+    env_file:
+      - .env
+    environment:
+      - GOOGLE_ACCESS_TOKEN_FILE=/data/storage/secrets/google_access_token
+      - GOOGLE_ACCESS_TOKEN_META_FILE=/data/storage/secrets/google_access_token.meta.json
+      - GOOGLE_REFRESH_STATE_FILE=/data/storage/secrets/google_refresh_state.json
+      - GOOGLE_REFRESH_INTERVAL_SECONDS=2700
+      - GOOGLE_REFRESH_ALERT_ENABLED=${GOOGLE_REFRESH_ALERT_ENABLED:-1}
+      - GOOGLE_REFRESH_ALERT_FAILURE_THRESHOLD=${GOOGLE_REFRESH_ALERT_FAILURE_THRESHOLD:-3}
+      - GOOGLE_REFRESH_ALERT_COOLDOWN_SECONDS=${GOOGLE_REFRESH_ALERT_COOLDOWN_SECONDS:-3600}
+      - GOOGLE_REFRESH_ALERT_CHAT_IDS=${GOOGLE_REFRESH_ALERT_CHAT_IDS:-}
+      - HIVE_TELEGRAM_TEST_CHAT_ID=${HIVE_TELEGRAM_TEST_CHAT_ID:-188207447}
+    command: ["uv", "run", "python", "scripts/google_token_refresher_daemon.py"]
+    healthcheck:
+      disable: true
+    volumes:
+      - hive-storage:/data/storage
+    depends_on:
+      hive-core:
+        condition: service_started
+
+  hive-scheduler:
+    image: ${HIVE_CORE_IMAGE:-hive-hive-core}
+    container_name: hive-scheduler
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - HIVE_BASE_URL=http://hive-core:8787
+      - HIVE_SCHEDULER_AUTONOMOUS_ENABLED=${HIVE_SCHEDULER_AUTONOMOUS_ENABLED:-true}
+      - HIVE_SCHEDULER_AUTONOMOUS_INTERVAL_SECONDS=${HIVE_SCHEDULER_AUTONOMOUS_INTERVAL_SECONDS:-120}
+      - HIVE_SCHEDULER_AUTO_START=${HIVE_SCHEDULER_AUTO_START:-true}
+      - HIVE_SCHEDULER_MAX_STEPS_PER_PROJECT=${HIVE_SCHEDULER_MAX_STEPS_PER_PROJECT:-3}
+      - HIVE_SCHEDULER_PROJECT_IDS=${HIVE_SCHEDULER_PROJECT_IDS:-}
+      - HIVE_SCHEDULER_SESSION_ID=${HIVE_SCHEDULER_SESSION_ID:-}
+      - HIVE_SCHEDULER_SESSION_ID_BY_PROJECT_JSON=${HIVE_SCHEDULER_SESSION_ID_BY_PROJECT_JSON:-}
+      - HIVE_SCHEDULER_ACCEPTANCE_ENABLED=${HIVE_SCHEDULER_ACCEPTANCE_ENABLED:-true}
+      - HIVE_SCHEDULER_ACCEPTANCE_INTERVAL_SECONDS=${HIVE_SCHEDULER_ACCEPTANCE_INTERVAL_SECONDS:-3600}
+      - HIVE_SCHEDULER_ACCEPTANCE_PROJECT_ID=${HIVE_SCHEDULER_ACCEPTANCE_PROJECT_ID:-default}
+      - HIVE_SCHEDULER_REQUEST_TIMEOUT_SECONDS=${HIVE_SCHEDULER_REQUEST_TIMEOUT_SECONDS:-20}
+      - HIVE_SCHEDULER_STATE_PATH=${HIVE_SCHEDULER_STATE_PATH:-/home/hiveuser/.hive/server/autonomous_loop_state.json}
+      - HIVE_SCHEDULER_HEARTBEAT_INTERVAL_SECONDS=${HIVE_SCHEDULER_HEARTBEAT_INTERVAL_SECONDS:-5}
+      - HIVE_SCHEDULER_HEALTH_STALE_SECONDS=${HIVE_SCHEDULER_HEALTH_STALE_SECONDS:-180}
+    command: ["uv", "run", "python", "scripts/autonomous_scheduler_daemon.py"]
+    depends_on:
+      hive-core:
+        condition: service_healthy
+    volumes:
+      - hive-home:/home/hiveuser/.hive
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json,os,time,sys; p=os.getenv('HIVE_SCHEDULER_STATE_PATH','/tmp/hive_scheduler_state.json'); s=float(os.getenv('HIVE_SCHEDULER_HEALTH_STALE_SECONDS','180')); d=json.load(open(p, 'r', encoding='utf-8')); u=float(d.get('updated_at', 0)); sys.exit(0 if (time.time()-u) <= s else 1)"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  hive-ops:
+    image: ${HIVE_CORE_IMAGE:-hive-hive-core}
+    container_name: hive-ops
+    profiles: ["ops"]
+    env_file:
+      - .env
+    environment:
+      - UV_PROJECT_ENVIRONMENT=/data/uvproj
+      - AGENT_STORAGE_PATH=/data/storage
+      - PYTHONPATH=/workspace/tools/src
+    working_dir: /workspace
+    command: ["sh", "-lc", "sleep infinity"]
+    volumes:
+      - ./:/workspace
+      - hive-storage:/data/storage
+      - hive-home:/home/hiveuser/.hive
+      - ./.cache/uv:/home/hiveuser/.cache/uv
+      - ./.cache/uvproj:/data/uvproj
+
+  redis:
+    image: redis:7-alpine
+    container_name: hive-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1000", "--appendonly", "yes"]
+    volumes:
+      - hive-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: hive-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-hive}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-hive}
+      - POSTGRES_DB=${POSTGRES_DB:-hive}
+    volumes:
+      - hive-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hive} -d ${POSTGRES_DB:-hive}"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  hive-storage:
+  hive-home:
+  hive-workspaces:
+  hive-redis-data:
+  hive-postgres-data:
+
+networks:
+  default:
+    driver: bridge

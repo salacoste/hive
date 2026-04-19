@@ -28,6 +28,7 @@ Or in mcp_servers.json for an agent:
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -57,10 +58,17 @@ def register_gcu_tools(
         from gcu.browser import register_tools as register_browser
 
         register_browser(mcp)
-        # Get browser tool names
-        browser_tools = [
-            name for name in mcp._tool_manager._tools.keys() if name.startswith("browser_")
-        ]
+        # Get browser tool names (FastMCP v2/v3 compatibility)
+        manager = getattr(mcp, "_tool_manager", None)
+        if manager is not None and hasattr(manager, "_tools"):
+            browser_tools = [name for name in manager._tools.keys() if name.startswith("browser_")]
+        else:
+            tools = asyncio.run(mcp.list_tools())
+            browser_tools = [
+                str(getattr(t, "name", ""))
+                for t in (tools or [])
+                if str(getattr(t, "name", "")).startswith("browser_")
+            ]
         registered.extend(browser_tools)
 
     # Future capabilities (not yet implemented)

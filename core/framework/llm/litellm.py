@@ -14,8 +14,10 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -179,11 +181,30 @@ def _ensure_ollama_chat_prefix(model: str) -> str:
     return model
 
 
-RATE_LIMIT_MAX_RETRIES = 10
+def _get_env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Read integer env var safely with a lower bound."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r, using default=%d", name, raw, default)
+        return default
+    return max(minimum, value)
+
+
+RATE_LIMIT_MAX_RETRIES = _get_env_int("HIVE_LLM_RATE_LIMIT_MAX_RETRIES", 3, minimum=0)
 RATE_LIMIT_BACKOFF_BASE = 2  # seconds
 RATE_LIMIT_MAX_DELAY = 120  # seconds - cap to prevent absurd waits
+LLM_MAX_CONCURRENT_REQUESTS = _get_env_int("HIVE_LLM_MAX_CONCURRENT_REQUESTS", 4, minimum=1)
+_SYNC_LLM_REQUEST_SEMAPHORE = threading.BoundedSemaphore(LLM_MAX_CONCURRENT_REQUESTS)
+_ASYNC_LLM_REQUEST_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
+_ASYNC_LLM_REQUEST_SEMAPHORES_LOCK = threading.Lock()
 MINIMAX_API_BASE = "https://api.minimax.io/v1"
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+GEMINI_PROXY_API_BASE_ENV = "GEMINI_API_BASE"
+ZAI_API_BASE_ENV = "ZAI_API_BASE"
 
 # Providers that accept cache_control on message content blocks.
 # Anthropic: native ephemeral caching. MiniMax & Z-AI/GLM: pass-through to their APIs.
@@ -213,6 +234,24 @@ KIMI_API_BASE = "https://api.kimi.com/coding"
 CLAUDE_CODE_VERSION = "2.1.76"
 CLAUDE_CODE_USER_AGENT = f"claude-code/{CLAUDE_CODE_VERSION}"
 _CLAUDE_CODE_BILLING_SALT = "59cf53e54c78"
+
+
+def _is_openai_compatible_proxy_base(api_base: str | None) -> bool:
+    """Return True when api_base looks like an OpenAI-compatible proxy endpoint."""
+    if not api_base:
+        return False
+    base = api_base.lower().strip()
+    # Google native Gemini endpoints should keep the Gemini provider path.
+    if "googleapis.com" in base or "generativelanguage" in base:
+        return False
+    return "/v1" in base
+
+
+def _is_zai_api_base(api_base: str | None) -> bool:
+    """Return True when api_base points to z.ai OpenAI-compatible API."""
+    if not api_base:
+        return False
+    return "api.z.ai" in api_base.lower()
 
 
 def _sample_js_code_unit(text: str, idx: int) -> str:
@@ -299,6 +338,65 @@ def _estimate_tokens(model: str, messages: list[dict]) -> tuple[int, str]:
     return total_chars // 4, "estimate"
 
 
+def _retry_budget_for_model(model: str, default_retries: int) -> int:
+    """Return retry budget for model, with optional Claude-specific cap."""
+    model_l = (model or "").lower()
+    if "claude" not in model_l and "anthropic/" not in model_l:
+        return default_retries
+    # User-requested fast failover for Claude: 1 retry by default.
+    claude_cap = _get_env_int(
+        "HIVE_LLM_CLAUDE_RATE_LIMIT_MAX_RETRIES",
+        1,
+        minimum=0,
+    )
+    return min(default_retries, claude_cap)
+
+
+def _needs_json_object_prompt_hint(response_format: dict[str, Any] | None) -> bool:
+    if not isinstance(response_format, dict):
+        return False
+    return str(response_format.get("type") or "").strip().lower() == "json_object"
+
+
+def _ensure_json_object_prompt_hint(full_messages: list[dict[str, Any]]) -> None:
+    """Ensure prompt contains the word 'json' for json_object response format.
+
+    Some providers (notably GPT-5 via OpenAI-compatible backends) reject
+    response_format={"type":"json_object"} unless at least one message explicitly
+    mentions JSON.
+    """
+    for msg in full_messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and "json" in content.lower():
+            return
+
+    instruction = "Respond with valid JSON."
+
+    # Prefer adding the hint to a user message for providers that enforce
+    # user-visible JSON instruction checks.
+    for msg in reversed(full_messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
+            continue
+        existing = msg.get("content")
+        if isinstance(existing, str):
+            msg["content"] = f"{existing.rstrip()}\n\n{instruction}" if existing.strip() else instruction
+            return
+
+    # Fallback: place hint in system message.
+    if full_messages and full_messages[0].get("role") == "system":
+        existing = full_messages[0].get("content")
+        if isinstance(existing, str):
+            full_messages[0]["content"] = (
+                f"{existing.rstrip()}\n\n{instruction}" if existing.strip() else instruction
+            )
+            return
+    full_messages.insert(0, {"role": "system", "content": instruction})
+
+
 def _prune_failed_request_dumps(max_files: int = MAX_FAILED_REQUEST_DUMPS) -> None:
     """Remove oldest dump files when the count exceeds *max_files*.
 
@@ -342,34 +440,38 @@ def _dump_failed_request(
     attempt: int,
 ) -> str:
     """Dump failed request to a file for debugging. Returns the file path."""
-    FAILED_REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        FAILED_REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"{error_type}_{model.replace('/', '_')}_{timestamp}.json"
-    filepath = FAILED_REQUESTS_DIR / filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{error_type}_{model.replace('/', '_')}_{timestamp}.json"
+        filepath = FAILED_REQUESTS_DIR / filename
 
-    # Build dump data
-    messages = kwargs.get("messages", [])
-    dump_data = {
-        "timestamp": datetime.now().isoformat(),
-        "model": model,
-        "error_type": error_type,
-        "attempt": attempt,
-        "estimated_tokens": _estimate_tokens(model, messages),
-        "num_messages": len(messages),
-        "messages": messages,
-        "tools": kwargs.get("tools"),
-        "max_tokens": kwargs.get("max_tokens"),
-        "temperature": kwargs.get("temperature"),
-    }
+        # Build dump data
+        messages = kwargs.get("messages", [])
+        dump_data = {
+            "timestamp": datetime.now().isoformat(),
+            "model": model,
+            "error_type": error_type,
+            "attempt": attempt,
+            "estimated_tokens": _estimate_tokens(model, messages),
+            "num_messages": len(messages),
+            "messages": messages,
+            "tools": kwargs.get("tools"),
+            "max_tokens": kwargs.get("max_tokens"),
+            "temperature": kwargs.get("temperature"),
+        }
 
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(dump_data, f, indent=2, default=str)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(dump_data, f, indent=2, default=str)
 
-    # Prune old dumps to prevent unbounded disk growth
-    _prune_failed_request_dumps()
+        # Prune old dumps to prevent unbounded disk growth
+        _prune_failed_request_dumps()
 
-    return str(filepath)
+        return str(filepath)
+    except OSError as e:
+        logger.warning(f"Failed to dump request debug log to {FAILED_REQUESTS_DIR}: {e}")
+        return "log_write_failed"
 
 
 def _compute_retry_delay(
@@ -426,6 +528,55 @@ def _compute_retry_delay(
     # Fallback: exponential backoff
     delay = backoff_base * (2**attempt)
     return min(delay, max_delay)
+
+
+def _get_async_llm_semaphore() -> asyncio.Semaphore:
+    """Return a loop-bound LLM request semaphore for async calls."""
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    with _ASYNC_LLM_REQUEST_SEMAPHORES_LOCK:
+        sem = _ASYNC_LLM_REQUEST_SEMAPHORES.get(loop_id)
+        if sem is None:
+            sem = asyncio.Semaphore(LLM_MAX_CONCURRENT_REQUESTS)
+            _ASYNC_LLM_REQUEST_SEMAPHORES[loop_id] = sem
+        return sem
+
+
+@contextmanager
+def _sync_llm_request_slot(model: str):
+    """Queue sync requests when concurrent LLM call budget is exhausted."""
+    sem = _SYNC_LLM_REQUEST_SEMAPHORE
+    acquired = sem.acquire(blocking=False)
+    if not acquired:
+        logger.warning(
+            "[llm-queue] Saturated (%d in-flight). Queueing sync request for %s.",
+            LLM_MAX_CONCURRENT_REQUESTS,
+            model,
+        )
+        sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+@asynccontextmanager
+async def _async_llm_request_slot(model: str):
+    """Queue async requests when concurrent LLM call budget is exhausted."""
+    sem = _get_async_llm_semaphore()
+    if sem.locked():
+        waiters = len(getattr(sem, "_waiters", ()) or ())
+        logger.warning(
+            "[llm-queue] Saturated (%d in-flight, %d queued). Queueing async request for %s.",
+            LLM_MAX_CONCURRENT_REQUESTS,
+            waiters,
+            model,
+        )
+    await sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
 
 
 def _is_stream_transient_error(exc: BaseException) -> bool:
@@ -589,6 +740,24 @@ class LiteLLMProvider(LLMProvider):
             model = "anthropic/" + model[len("hive/") :]
             if api_base and api_base.rstrip("/").endswith("/v1"):
                 api_base = api_base.rstrip("/")[:-3]
+        elif model.lower().startswith("glm-") or model.lower().startswith("z-ai/"):
+            # z.ai (GLM) is OpenAI-compatible at api.z.ai/api/coding/paas/v4.
+            # Normalize bare GLM model ids so LiteLLM can resolve the provider.
+            resolved_api_base = api_base or os.environ.get(ZAI_API_BASE_ENV, "").strip()
+            model_suffix = model.split("/", 1)[1] if "/" in model else model
+            model = "openai/" + model_suffix
+            if _is_zai_api_base(resolved_api_base):
+                api_base = resolved_api_base
+        elif model.lower().startswith("gemini/") or model.lower().startswith("google/"):
+            # Route Gemini models through OpenAI-compatible proxies (e.g. Antigravity-Manager)
+            # when GEMINI_API_BASE (or explicit api_base) points to /v1.
+            # This keeps "gemini/<model>" ergonomics in configs while sending requests to
+            # proxy /v1/chat/completions instead of Google's native SDK endpoint.
+            resolved_api_base = api_base or os.environ.get(GEMINI_PROXY_API_BASE_ENV, "").strip()
+            if _is_openai_compatible_proxy_base(resolved_api_base):
+                model_suffix = model.split("/", 1)[1] if "/" in model else model
+                model = "openai/" + model_suffix
+                api_base = resolved_api_base
         self.model = model
         self.api_key = api_key
         self.api_base = api_base or self._default_api_base_for_model(_original_model)
@@ -626,6 +795,16 @@ class LiteLLMProvider(LLMProvider):
             return MINIMAX_API_BASE
         if model_lower.startswith("openrouter/"):
             return OPENROUTER_API_BASE
+        if (
+            model_lower.startswith("glm-")
+            or model_lower.startswith("zai-glm")
+            or model_lower.startswith("z-ai/")
+        ):
+            env_base = os.environ.get(ZAI_API_BASE_ENV, "").strip()
+            return env_base or None
+        if model_lower.startswith("gemini/") or model_lower.startswith("google/"):
+            env_base = os.environ.get(GEMINI_PROXY_API_BASE_ENV, "").strip()
+            return env_base or None
         if model_lower.startswith("kimi/"):
             return KIMI_API_BASE
         if model_lower.startswith("hive/"):
@@ -638,9 +817,11 @@ class LiteLLMProvider(LLMProvider):
         """Call litellm.completion with retry on 429 rate limit errors and empty responses."""
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
+        retries = _retry_budget_for_model(str(model), retries)
         for attempt in range(retries + 1):
             try:
-                response = litellm.completion(**kwargs)  # type: ignore[union-attr]
+                with _sync_llm_request_slot(str(model)):
+                    response = litellm.completion(**kwargs)  # type: ignore[union-attr]
 
                 # Some providers (e.g. Gemini) return 200 with empty content on
                 # rate limit / quota exhaustion instead of a proper 429.  Treat
@@ -784,6 +965,8 @@ class LiteLLMProvider(LLMProvider):
                 full_messages[0]["content"] += json_instruction
             else:
                 full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
+        elif _needs_json_object_prompt_hint(response_format):
+            _ensure_json_object_prompt_hint(full_messages)
 
         # Build kwargs
         kwargs: dict[str, Any] = {
@@ -849,9 +1032,11 @@ class LiteLLMProvider(LLMProvider):
         """
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
+        retries = _retry_budget_for_model(str(model), retries)
         for attempt in range(retries + 1):
             try:
-                response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
+                async with _async_llm_request_slot(str(model)):
+                    response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
 
                 content = response.choices[0].message.content if response.choices else None
                 has_tool_calls = bool(response.choices and response.choices[0].message.tool_calls)
@@ -988,6 +1173,10 @@ class LiteLLMProvider(LLMProvider):
                 full_messages[0]["content"] += json_instruction
             else:
                 full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
+        elif _needs_json_object_prompt_hint(response_format):
+            _ensure_json_object_prompt_hint(full_messages)
+        elif _needs_json_object_prompt_hint(response_format):
+            _ensure_json_object_prompt_hint(full_messages)
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -1718,7 +1907,10 @@ class LiteLLMProvider(LLMProvider):
             kwargs.pop("max_tokens", None)
             kwargs.pop("stream_options", None)
 
-        for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        rate_limit_retries = _retry_budget_for_model(self.model, RATE_LIMIT_MAX_RETRIES)
+        transient_retries = _retry_budget_for_model(self.model, STREAM_TRANSIENT_MAX_RETRIES)
+        max_attempts = max(rate_limit_retries, transient_retries, EMPTY_STREAM_MAX_RETRIES)
+        for attempt in range(max_attempts + 1):
             # Post-stream events (ToolCall, TextEnd, Finish) are buffered
             # because they depend on the full stream.  TextDeltaEvents are
             # yielded immediately so callers see tokens in real time.
@@ -1731,146 +1923,149 @@ class LiteLLMProvider(LLMProvider):
             stream_finish_reason: str | None = None
 
             try:
-                response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
+                async with _async_llm_request_slot(self.model):
+                    response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
 
-                async for chunk in response:
-                    # Capture usage from the trailing usage-only chunk that
-                    # stream_options={"include_usage": True} sends with empty choices.
-                    if not chunk.choices:
-                        usage = getattr(chunk, "usage", None)
-                        if usage:
-                            input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-                            output_tokens = getattr(usage, "completion_tokens", 0) or 0
-                            logger.debug(
-                                "[tokens] trailing usage chunk: input=%d output=%d model=%s",
-                                input_tokens,
-                                output_tokens,
-                                self.model,
-                            )
-                        else:
-                            logger.debug(
-                                "[tokens] empty-choices chunk with no usage (model=%s)",
-                                self.model,
-                            )
-                        continue
-                    choice = chunk.choices[0]
-
-                    delta = choice.delta
-
-                    # --- Text content — yield immediately for real-time streaming ---
-                    if delta and delta.content:
-                        accumulated_text += delta.content
-                        yield TextDeltaEvent(
-                            content=delta.content,
-                            snapshot=accumulated_text,
-                        )
-
-                    # --- Tool calls (accumulate across chunks) ---
-                    # The Codex/Responses API bridge (litellm bug) hardcodes
-                    # index=0 on every ChatCompletionToolCallChunk, even for
-                    # parallel tool calls.  We work around this by using tc.id
-                    # (set on output_item.added events) as a "new tool call"
-                    # signal and tracking the most recently opened slot for
-                    # argument deltas that arrive with id=None.
-                    if delta and delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            idx = tc.index if hasattr(tc, "index") and tc.index is not None else 0
-
-                            if tc.id:
-                                # New tool call announced (or done event re-sent).
-                                # Check if this id already has a slot.
-                                existing_idx = next(
-                                    (k for k, v in tool_calls_acc.items() if v["id"] == tc.id),
-                                    None,
+                    async for chunk in response:
+                        # Capture usage from the trailing usage-only chunk that
+                        # stream_options={"include_usage": True} sends with empty choices.
+                        if not chunk.choices:
+                            usage = getattr(chunk, "usage", None)
+                            if usage:
+                                input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                                output_tokens = getattr(usage, "completion_tokens", 0) or 0
+                                logger.debug(
+                                    "[tokens] trailing usage chunk: input=%d output=%d model=%s",
+                                    input_tokens,
+                                    output_tokens,
+                                    self.model,
                                 )
-                                if existing_idx is not None:
-                                    idx = existing_idx
-                                elif idx in tool_calls_acc and tool_calls_acc[idx]["id"] not in (
-                                    "",
-                                    tc.id,
-                                ):
-                                    # Slot taken by a different call — assign new index
-                                    idx = max(tool_calls_acc.keys()) + 1
-                                _last_tool_idx = idx
                             else:
-                                # Argument delta with no id — route to last opened slot
-                                idx = _last_tool_idx
-
-                            if idx not in tool_calls_acc:
-                                tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
-                            if tc.id:
-                                tool_calls_acc[idx]["id"] = tc.id
-                            if tc.function:
-                                if tc.function.name:
-                                    tool_calls_acc[idx]["name"] = tc.function.name
-                                if tc.function.arguments:
-                                    tool_calls_acc[idx]["arguments"] += tc.function.arguments
-
-                    # --- Finish ---
-                    if choice.finish_reason:
-                        # Kimi's 'pause_turn' means the model emitted tool
-                        # calls and expects results — equivalent to 'tool_calls'.
-                        if choice.finish_reason == "pause_turn":
-                            choice.finish_reason = "tool_calls" if tool_calls_acc else "stop"
-                        stream_finish_reason = choice.finish_reason
-                        for _idx, tc_data in sorted(tool_calls_acc.items()):
-                            parsed_args = self._parse_tool_call_arguments(
-                                tc_data.get("arguments", ""),
-                                tc_data.get("name", ""),
-                            )
-                            tail_events.append(
-                                ToolCallEvent(
-                                    tool_use_id=tc_data["id"],
-                                    tool_name=tc_data["name"],
-                                    tool_input=parsed_args,
+                                logger.debug(
+                                    "[tokens] empty-choices chunk with no usage (model=%s)",
+                                    self.model,
                                 )
+                            continue
+                        choice = chunk.choices[0]
+
+                        delta = choice.delta
+
+                        # --- Text content — yield immediately for real-time streaming ---
+                        if delta and delta.content:
+                            accumulated_text += delta.content
+                            yield TextDeltaEvent(
+                                content=delta.content,
+                                snapshot=accumulated_text,
                             )
 
-                        if accumulated_text:
-                            tail_events.append(TextEndEvent(full_text=accumulated_text))
+                        # --- Tool calls (accumulate across chunks) ---
+                        # The Codex/Responses API bridge (litellm bug) hardcodes
+                        # index=0 on every ChatCompletionToolCallChunk, even for
+                        # parallel tool calls.  We work around this by using tc.id
+                        # (set on output_item.added events) as a "new tool call"
+                        # signal and tracking the most recently opened slot for
+                        # argument deltas that arrive with id=None.
+                        if delta and delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                idx = (
+                                    tc.index if hasattr(tc, "index") and tc.index is not None else 0
+                                )
 
-                        usage = getattr(chunk, "usage", None)
-                        logger.debug(
-                            "[tokens] finish-chunk raw usage: %r (type=%s)",
-                            usage,
-                            type(usage).__name__,
-                        )
-                        cached_tokens = 0
-                        if usage:
-                            input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-                            output_tokens = getattr(usage, "completion_tokens", 0) or 0
-                            _details = getattr(usage, "prompt_tokens_details", None)
-                            cached_tokens = (
-                                getattr(_details, "cached_tokens", 0) or 0
-                                if _details is not None
-                                else getattr(usage, "cache_read_input_tokens", 0) or 0
-                            )
+                                if tc.id:
+                                    # New tool call announced (or done event re-sent).
+                                    # Check if this id already has a slot.
+                                    existing_idx = next(
+                                        (k for k, v in tool_calls_acc.items() if v["id"] == tc.id),
+                                        None,
+                                    )
+                                    if existing_idx is not None:
+                                        idx = existing_idx
+                                    elif idx in tool_calls_acc and tool_calls_acc[idx]["id"] not in (
+                                        "",
+                                        tc.id,
+                                    ):
+                                        # Slot taken by a different call — assign new index
+                                        idx = max(tool_calls_acc.keys()) + 1
+                                    _last_tool_idx = idx
+                                else:
+                                    # Argument delta with no id — route to last opened slot
+                                    idx = _last_tool_idx
+
+                                if idx not in tool_calls_acc:
+                                    tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                                if tc.id:
+                                    tool_calls_acc[idx]["id"] = tc.id
+                                if tc.function:
+                                    if tc.function.name:
+                                        tool_calls_acc[idx]["name"] = tc.function.name
+                                    if tc.function.arguments:
+                                        tool_calls_acc[idx]["arguments"] += tc.function.arguments
+
+                        # --- Finish ---
+                        if choice.finish_reason:
+                            # Kimi's 'pause_turn' means the model emitted tool
+                            # calls and expects results — equivalent to 'tool_calls'.
+                            if choice.finish_reason == "pause_turn":
+                                choice.finish_reason = "tool_calls" if tool_calls_acc else "stop"
+                            stream_finish_reason = choice.finish_reason
+                            for _idx, tc_data in sorted(tool_calls_acc.items()):
+                                parsed_args = self._parse_tool_call_arguments(
+                                    tc_data.get("arguments", ""),
+                                    tc_data.get("name", ""),
+                                )
+                                tail_events.append(
+                                    ToolCallEvent(
+                                        tool_use_id=tc_data["id"],
+                                        tool_name=tc_data["name"],
+                                        tool_input=parsed_args,
+                                    )
+                                )
+
+                            if accumulated_text:
+                                tail_events.append(TextEndEvent(full_text=accumulated_text))
+
+                            usage = getattr(chunk, "usage", None)
                             logger.debug(
-                                "[tokens] finish-chunk usage: "
-                                "input=%d output=%d cached=%d model=%s",
+                                "[tokens] finish-chunk raw usage: %r (type=%s)",
+                                usage,
+                                type(usage).__name__,
+                            )
+                            cached_tokens = 0
+                            if usage:
+                                input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                                output_tokens = getattr(usage, "completion_tokens", 0) or 0
+                                _details = getattr(usage, "prompt_tokens_details", None)
+                                cached_tokens = (
+                                    getattr(_details, "cached_tokens", 0) or 0
+                                    if _details is not None
+                                    else getattr(usage, "cache_read_input_tokens", 0) or 0
+                                )
+                                logger.debug(
+                                    "[tokens] finish-chunk usage: "
+                                    "input=%d output=%d cached=%d model=%s",
+                                    input_tokens,
+                                    output_tokens,
+                                    cached_tokens,
+                                    self.model,
+                                )
+
+                            logger.debug(
+                                "[tokens] finish event: input=%d output=%d cached=%d stop=%s model=%s",
                                 input_tokens,
                                 output_tokens,
                                 cached_tokens,
+                                choice.finish_reason,
                                 self.model,
                             )
-
-                        logger.debug(
-                            "[tokens] finish event: input=%d output=%d cached=%d stop=%s model=%s",
-                            input_tokens,
-                            output_tokens,
-                            cached_tokens,
-                            choice.finish_reason,
-                            self.model,
-                        )
-                        tail_events.append(
-                            FinishEvent(
-                                stop_reason=choice.finish_reason,
-                                input_tokens=input_tokens,
-                                output_tokens=output_tokens,
-                                cached_tokens=cached_tokens,
-                                model=self.model,
+                            tail_events.append(
+                                FinishEvent(
+                                    stop_reason=choice.finish_reason,
+                                    input_tokens=input_tokens,
+                                    output_tokens=output_tokens,
+                                    cached_tokens=cached_tokens,
+                                    model=self.model,
+                                )
                             )
-                        )
 
                 # Fallback: LiteLLM strips usage from yielded chunks before
                 # returning them to us, but appends the original chunk (with
@@ -2014,12 +2209,12 @@ class LiteLLMProvider(LLMProvider):
                 return
 
             except RateLimitError as e:
-                if attempt < RATE_LIMIT_MAX_RETRIES:
+                if attempt < rate_limit_retries:
                     wait = _compute_retry_delay(attempt, exception=e)
                     logger.warning(
                         f"[stream-retry] {self.model} rate limited (429): {e!s}. "
                         f"Retrying in {wait:.1f}s "
-                        f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{rate_limit_retries})"
                     )
                     await asyncio.sleep(wait)
                     continue
@@ -2067,13 +2262,13 @@ class LiteLLMProvider(LLMProvider):
                     ):
                         yield event
                     return
-                if _is_stream_transient_error(e) and attempt < STREAM_TRANSIENT_MAX_RETRIES:
+                if _is_stream_transient_error(e) and attempt < transient_retries:
                     wait = _compute_retry_delay(attempt, exception=e)
                     logger.warning(
                         f"[stream-retry] {self.model} transient error "
                         f"({type(e).__name__}): {e!s}. "
                         f"Retrying in {wait:.1f}s "
-                        f"(attempt {attempt + 1}/{STREAM_TRANSIENT_MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{transient_retries})"
                     )
                     await asyncio.sleep(wait)
                     continue

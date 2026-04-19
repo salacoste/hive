@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-04-14T05:19:18",
+  "health": {
+    "status": "ok",
+    "sessions": 2,
+    "agents_loaded": 1
+  },
+  "ops": {
+    "status": "ok",
+    "runs_total": 0,
+    "stuck_runs_total": 0,
+    "no_progress_projects_total": 0
+  },
+  "telegram_bridge": {
+    "status": "ok",
+    "running": true,
+    "poller_owner": true
+  }
+}

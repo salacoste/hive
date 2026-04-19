@@ -1,0 +1,7 @@
+{
+  "policy_binding": {
+    "risk_tier": "medium",
+    "retry_limit_per_stage": 1,
+    "budget_limit_usd_monthly": 100
+  }
+}

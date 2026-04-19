@@ -1,0 +1,204 @@
+{
+  "generated_at": "2026-04-19T19:19:48Z",
+  "base_url": "http://localhost:8787",
+  "project_id": "default",
+  "operator": "ivan",
+  "scenario": "both",
+  "manual_status": "pass",
+  "machine_ok": true,
+  "overall_status": "pass",
+  "notes": "Manual Telegram smoke confirmed by operator (/status,/sessions,plain text,bootstrap flow); post-cutover runtime healthy.",
+  "machine_checks": [
+    {
+      "name": "telegram_bridge_status",
+      "ok": true,
+      "detail": "enabled=true poller_owner=true running=true startup_status=running",
+      "http_status": 200
+    },
+    {
+      "name": "health_telegram_snapshot",
+      "ok": true,
+      "detail": "status=ok telegram_running=true startup_status=running",
+      "http_status": 200
+    },
+    {
+      "name": "autonomous_ops_status",
+      "ok": true,
+      "detail": "status=ok include_runs=true projects_total=0 runs_total=0",
+      "http_status": 200
+    },
+    {
+      "name": "remediate_stale_dry_run",
+      "ok": true,
+      "detail": "status=ok candidates_total=0 selected_total=0",
+      "http_status": 200
+    }
+  ],
+  "manual_checklist": [
+    {
+      "step": "Send /status",
+      "expectation": "Correct project/session; no bridge/runtime errors"
+    },
+    {
+      "step": "Send /sessions",
+      "expectation": "Active session list is rendered correctly"
+    },
+    {
+      "step": "Send plain text (for example: ping bridge)",
+      "expectation": "Bot response received; no duplicate side effects"
+    },
+    {
+      "step": "Run one bootstrap flow",
+      "expectation": "Trace contains task_id, run_id, report endpoint, optional PR URL"
+    }
+  ],
+  "raw": {
+    "bridge_status": {
+      "http_status": 200,
+      "payload": {
+        "status": "ok",
+        "bridge": {
+          "enabled": true,
+          "mode": "polling",
+          "single_consumer": true,
+          "poll_lock_path": "/home/hiveuser/.hive/server/telegram-poll.lock",
+          "poller_owner": true,
+          "running": true,
+          "startup_status": "running",
+          "last_poll_error": null
+        }
+      }
+    },
+    "health": {
+      "http_status": 200,
+      "payload": {
+        "status": "ok",
+        "sessions": 1,
+        "agents_loaded": 0,
+        "telegram_bridge": {
+          "enabled": true,
+          "mode": "polling",
+          "single_consumer": true,
+          "poll_lock_path": "/home/hiveuser/.hive/server/telegram-poll.lock",
+          "poller_owner": true,
+          "running": true,
+          "startup_status": "running",
+          "last_poll_error": null
+        }
+      }
+    },
+    "ops_status": {
+      "http_status": 200,
+      "payload": {
+        "status": "ok",
+        "timestamp": 1776626388.478931,
+        "summary": {
+          "project_filter": "default",
+          "include_runs": true,
+          "include_orphaned": false,
+          "projects_total": 0,
+          "projects_with_pipeline_state": 0,
+          "tasks_total": 0,
+          "runs_total": 0,
+          "docker_lane_enabled": false,
+          "docker_lane_ready": false,
+          "orphaned_tasks_total": 7,
+          "orphaned_runs_total": 7,
+          "tasks_by_status": {},
+          "runs_by_status": {},
+          "runs_by_stage": {}
+        },
+        "alerts": {
+          "stuck_threshold_seconds": 1800,
+          "stuck_runs_total": 0,
+          "stuck_runs": [],
+          "no_progress_threshold_seconds": 900,
+          "no_progress_projects_total": 0,
+          "no_progress_projects": [],
+          "loop_stale_threshold_seconds": 600,
+          "loop_stale": false,
+          "loop_stale_seconds": 3.073322296142578
+        },
+        "projects": {},
+        "active_runs": [],
+        "runtime": {
+          "docker_lane": {
+            "enabled": false,
+            "profile": "docker_local",
+            "feature_flag": "HIVE_AUTONOMOUS_DOCKER_LANE_ENABLED",
+            "docker_cli_available": false,
+            "docker_cli_path": "",
+            "healthcheck_timeout_seconds": 5,
+            "ready": false,
+            "status": "disabled",
+            "reason": "feature_flag_disabled"
+          }
+        },
+        "loop": {
+          "state_path": "/home/hiveuser/.hive/server/autonomous_loop_state.json",
+          "state": {
+            "status": "running",
+            "started_at": 1776554121.875373,
+            "updated_at": 1776626385.4056087,
+            "config": {
+              "base_url": "http://hive-core:8787",
+              "autonomous_interval_seconds": 120,
+              "acceptance_interval_seconds": 3600,
+              "project_ids": [
+                "n8n-builder-demo-234328"
+              ]
+            },
+            "counters": {
+              "autonomous_ok": 600,
+              "autonomous_failed": 0,
+              "acceptance_ok": 21,
+              "acceptance_failed": 0
+            },
+            "last_autonomous_run": {
+              "at": 1776626360.2974331,
+              "ok": true,
+              "status": 200,
+              "projects_total": 1,
+              "completed": 0,
+              "failed": 0,
+              "escalated": 0,
+              "manual_deferred": 0,
+              "in_progress": 0,
+              "idle": 0
+            },
+            "last_acceptance_probe": {
+              "at": 1776626132.517583,
+              "ok": true,
+              "health_status": 200,
+              "core_status": "ok",
+              "ops_status": 200,
+              "stuck_runs": 0,
+              "no_progress_projects": 0
+            }
+          },
+          "stale": false,
+          "stale_seconds": 3.073322296142578,
+          "stale_threshold_seconds": 600
+        }
+      }
+    },
+    "remediate_stale_dry_run": {
+      "http_status": 200,
+      "payload": {
+        "status": "ok",
+        "dry_run": true,
+        "project_filter": "default",
+        "include_orphaned": false,
+        "action": "escalated",
+        "older_than_seconds": 1800,
+        "max_runs": 100,
+        "orphaned_skipped_total": 0,
+        "candidates_total": 0,
+        "selected_total": 0,
+        "selected": [],
+        "remediated_total": 0,
+        "remediated": []
+      }
+    }
+  }
+}

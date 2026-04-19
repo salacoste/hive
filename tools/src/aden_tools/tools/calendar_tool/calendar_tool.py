@@ -25,6 +25,8 @@ from zoneinfo import available_timezones
 import httpx
 from fastmcp import FastMCP
 
+from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
+
 if TYPE_CHECKING:
     from framework.credentials.oauth2 import TokenLifecycleManager
 
@@ -85,7 +87,7 @@ def register_tools(
             return credentials.get("google")
 
         # Fall back to environment variable
-        return os.getenv("GOOGLE_ACCESS_TOKEN")
+        return get_google_access_token_from_env_or_file()
 
     def _get_headers() -> dict[str, str]:
         """Get authorization headers for API requests.

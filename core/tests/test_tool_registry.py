@@ -7,6 +7,7 @@ could cause a json.JSONDecodeError and crash execution.
 """
 
 import logging
+import json
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
@@ -557,7 +558,10 @@ def test_get_registered_names_lists_all_tools():
     for name in ("alpha", "beta", "gamma"):
         t = Tool(name=name, description="d", parameters={"type": "object", "properties": {}})
         registry.register(name, t, lambda inputs: inputs)
-    assert set(registry.get_registered_names()) == {"alpha", "beta", "gamma"}
+    # Registry may include built-in framework tools by default; ensure the
+    # explicitly registered names are present without assuming exclusivity.
+    names = set(registry.get_registered_names())
+    assert {"alpha", "beta", "gamma"}.issubset(names)
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +676,44 @@ def test_execution_context_overrides_session_context(monkeypatch):
 
     assert received, "call_tool was never called"
     assert received[0]["workspace_id"] == "exec-ws"
+
+
+def test_builtin_save_data_uses_execution_context_when_data_dir_omitted(tmp_path):
+    registry = ToolRegistry()
+    data_dir = tmp_path / "ctx-data"
+    token = ToolRegistry.set_execution_context(data_dir=str(data_dir))
+    try:
+        executor = registry.get_executor()
+        result = executor(ToolUse(id="t1", name="save_data", input={"filename": "a.txt", "data": "hello"}))
+    finally:
+        ToolRegistry.reset_execution_context(token)
+
+    payload = json.loads(result.content)
+    assert payload["ok"] is True
+    assert payload["file_path"] == str(data_dir / "a.txt")
+    assert (data_dir / "a.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_builtin_save_data_prefers_execution_context_for_dot_data_dir(tmp_path):
+    registry = ToolRegistry()
+    data_dir = tmp_path / "ctx-data-dot"
+    token = ToolRegistry.set_execution_context(data_dir=str(data_dir))
+    try:
+        executor = registry.get_executor()
+        result = executor(
+            ToolUse(
+                id="t2",
+                name="save_data",
+                input={"filename": "b.txt", "data": "hello-dot", "data_dir": "."},
+            )
+        )
+    finally:
+        ToolRegistry.reset_execution_context(token)
+
+    payload = json.loads(result.content)
+    assert payload["ok"] is True
+    assert payload["file_path"] == str(data_dir / "b.txt")
+    assert (data_dir / "b.txt").read_text(encoding="utf-8") == "hello-dot"
 
 
 # ---------------------------------------------------------------------------

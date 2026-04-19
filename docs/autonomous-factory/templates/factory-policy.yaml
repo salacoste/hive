@@ -1,0 +1,59 @@
+# Hive factory policy template
+# Save as: automation/hive.factory-policy.yaml
+
+schema_version: "1.0"
+
+factory:
+  mode: "semi-auto" # assist | semi-auto | auto
+  default_risk_tier: "low" # low | medium | high | critical
+  max_parallel_tasks: 3
+  retry_limit_per_stage: 2
+
+risk_policy:
+  low:
+    plan_approval_required: false
+    run_approval_required: false
+    merge_approval_required: true
+  medium:
+    plan_approval_required: true
+    run_approval_required: true
+    merge_approval_required: true
+  high:
+    plan_approval_required: true
+    run_approval_required: true
+    merge_approval_required: true
+  critical:
+    allowed: false
+
+hard_guards:
+  blocked_actions:
+    - "force_push_protected_branch"
+    - "direct_production_deploy"
+    - "direct_production_db_write"
+  require_allowlist_egress: true
+
+validation_policy:
+  required_stages:
+    - "lint"
+    - "test"
+  optional_stages:
+    - "typecheck"
+    - "build"
+    - "smoke"
+  fail_on_security_findings: true
+
+publish_policy:
+  create_pr_on_success: true
+  include_evidence_bundle: true
+  require_pr_template_sections:
+    - "Summary"
+    - "Changes"
+    - "Validation"
+    - "Risks"
+    - "Rollback"
+
+observability:
+  keep_task_logs_days: 90
+  keep_artifacts_days: 90
+  emit_decision_timeline: true
+

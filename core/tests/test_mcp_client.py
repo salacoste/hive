@@ -1,5 +1,8 @@
 """Unit tests for MCP client transport and reconnect behavior."""
 
+import asyncio
+import logging
+
 from types import SimpleNamespace
 
 import httpx
@@ -226,3 +229,39 @@ def test_call_tool_http_preserves_runtime_error_wrapping(monkeypatch):
     assert "Failed to call tool via HTTP" in str(exc_info.value)
     assert exc_info.value.__cause__ is connect_error
     assert reconnects == []
+
+
+def test_cleanup_demotes_known_anyio_teardown_quirk_to_debug(caplog):
+    class QuirkSession:
+        async def __aexit__(self, exc_type, exc, tb):
+            raise RuntimeError(
+                "Attempted to exit cancel scope in a different task than it was entered in"
+            )
+
+    client = MCPClient(MCPServerConfig(name="stdio-server", transport="stdio"))
+    client._session = QuirkSession()  # noqa: SLF001 - direct unit test
+
+    caplog.set_level(logging.DEBUG)
+    asyncio.run(client._cleanup_stdio_async())  # noqa: SLF001 - direct unit test
+
+    assert any(
+        "MCP session teardown (known anyio quirk)" in rec.message for rec in caplog.records
+    )
+    assert not any(
+        "Error closing MCP session" in rec.message and rec.levelno >= logging.WARNING
+        for rec in caplog.records
+    )
+
+
+def test_cleanup_keeps_warning_for_real_session_close_error(caplog):
+    class BrokenSession:
+        async def __aexit__(self, exc_type, exc, tb):
+            raise RuntimeError("boom")
+
+    client = MCPClient(MCPServerConfig(name="stdio-server", transport="stdio"))
+    client._session = BrokenSession()  # noqa: SLF001 - direct unit test
+
+    caplog.set_level(logging.WARNING)
+    asyncio.run(client._cleanup_stdio_async())  # noqa: SLF001 - direct unit test
+
+    assert any("Error closing MCP session: boom" in rec.message for rec in caplog.records)

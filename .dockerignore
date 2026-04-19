@@ -1,26 +1,42 @@
 # Git
 .git/
 .gitignore
+.gitattributes
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+core/frontend/node_modules/
 
 # Documentation
-*.md
-docs/
+# Keep only runtime docs needed by container-side ops/backlog scripts.
+docs/*
+!docs/LOCAL_PROD_RUNBOOK.md
+!docs/ops/**
+!docs/autonomous-factory/**
+!docs/browser-extension-setup.html
+!docs/configuration.md
+!docs/developer-guide.md
+!docs/environment-setup.md
 LICENSE
+SECURITY.md
 
 # IDE
 .idea/
 .vscode/
+.claude/
 
-# Dependencies (rebuilt in container)
-node_modules/
-
-# Build artifacts
-dist/
-build/
-coverage/
-
-# Environment files
+# Environment & secrets
 .env*
+!.env.example
 config.yaml
 
 # Logs
@@ -31,5 +47,20 @@ logs/
 .DS_Store
 Thumbs.db
 
-# GitHub
+# GitHub & CI
 .github/
+
+# Docker
+docker-compose*.yml
+Dockerfile
+
+# Build artifacts
+coverage/
+
+# Scripts not needed in container
+scripts/benchmark_quickstart.ps1
+scripts/setup_worker_model.ps1
+scripts/setup_worker_model.sh
+
+# Test data
+core/tests/dummy_agents/

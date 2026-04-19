@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 from fastmcp import FastMCP
@@ -133,6 +134,7 @@ from .twilio_tool import register_tools as register_twilio
 from .twitter_tool import register_tools as register_twitter
 from .vercel_tool import register_tools as register_vercel
 from .vision_tool import register_tools as register_vision
+from .wandb_tool import register_tools as register_wandb
 
 try:
     from .web_scrape_tool import register_tools as register_web_scrape
@@ -147,6 +149,27 @@ from .youtube_transcript_tool import register_tools as register_youtube_transcri
 from .zendesk_tool import register_tools as register_zendesk
 from .zoho_crm_tool import register_tools as register_zoho_crm
 from .zoom_tool import register_tools as register_zoom
+
+
+def _list_registered_tool_names(mcp: FastMCP) -> list[str]:
+    """Return tool names across FastMCP versions (v2/v3 compatibility)."""
+    # FastMCP v2
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is not None and hasattr(manager, "_tools"):
+        return list(manager._tools.keys())
+
+    # FastMCP v3 (async API)
+    list_tools = getattr(mcp, "list_tools", None)
+    if callable(list_tools):
+        tools = asyncio.run(list_tools())
+        names: list[str] = []
+        for t in tools or []:
+            name = getattr(t, "name", None)
+            if name:
+                names.append(str(name))
+        return names
+
+    return []
 
 
 def _register_verified(
@@ -306,6 +329,7 @@ def _register_unverified(
     register_zendesk(mcp, credentials=credentials)
     register_zoho_crm(mcp, credentials=credentials)
     register_zoom(mcp, credentials=credentials)
+    register_wandb(mcp, credentials=credentials)
     register_freshdesk(mcp, credentials=credentials)
 
 
@@ -332,7 +356,7 @@ def register_all_tools(
     if include_unverified:
         _register_unverified(mcp, credentials=credentials)
 
-    return list(mcp._tool_manager._tools.keys())
+    return _list_registered_tool_names(mcp)
 
 
 __all__ = ["register_all_tools"]

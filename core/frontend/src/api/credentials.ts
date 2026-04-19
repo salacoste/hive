@@ -25,6 +25,43 @@ export interface AgentCredentialRequirement {
   alternative_group: string | null;
 }
 
+export interface CredentialReadinessItem {
+  env_var: string;
+  available: boolean;
+}
+
+export interface CredentialReadinessSummary {
+  ready: boolean;
+  required_total: number;
+  required_available: number;
+  required_missing: number;
+  optional_total: number;
+  optional_available: number;
+  optional_missing: number;
+}
+
+export interface CredentialReadinessProvider {
+  provider: string;
+  credentials_total: number;
+  credentials_available: number;
+  credentials_missing: number;
+  env_vars: string[];
+  missing_env_vars: string[];
+}
+
+export interface CredentialReadinessResponse {
+  bundle: string;
+  required: CredentialReadinessItem[];
+  optional: CredentialReadinessItem[];
+  missing: {
+    required: string[];
+    optional: string[];
+  };
+  summary: CredentialReadinessSummary;
+  providers: CredentialReadinessProvider[];
+  checked_at: string;
+}
+
 export const credentialsApi = {
   list: () =>
     api.get<{ credentials: CredentialInfo[] }>("/credentials"),
@@ -45,5 +82,10 @@ export const credentialsApi = {
     api.post<{ required: AgentCredentialRequirement[]; has_aden_key: boolean }>(
       "/credentials/check-agent",
       { agent_path: agentPath },
+    ),
+
+  readiness: (bundle = "local_pro_stack") =>
+    api.get<CredentialReadinessResponse>(
+      `/credentials/readiness?bundle=${encodeURIComponent(bundle)}`,
     ),
 };

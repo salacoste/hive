@@ -84,8 +84,9 @@ export function sseEventToChatMessage(
     case "client_input_received": {
       const userContent = (event.data?.content as string) || "";
       if (!userContent) return null;
+      const clientMessageId = String(event.data?.client_message_id || "").trim();
       return {
-        id: `user-input-${event.timestamp}`,
+        id: clientMessageId || `user-input-${event.timestamp}`,
         agent: "You",
         agentColor: "",
         content: userContent,

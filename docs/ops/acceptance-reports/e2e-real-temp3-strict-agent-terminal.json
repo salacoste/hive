@@ -1,0 +1,165 @@
+{
+  "status": "failed",
+  "started_at": 1776389725.336032,
+  "finished_at": 1776389726.242101,
+  "duration_seconds": 0.906,
+  "base_url": "http://localhost:8787",
+  "strict_onboarding": true,
+  "scenarios_total": 1,
+  "scenarios_ok": 0,
+  "scenarios_failed": 1,
+  "scenarios_skipped": 0,
+  "results": [
+    {
+      "project_id": "e2e-real-1776389725",
+      "repository": "https://github.com/salacoste/mcp-n8n-workflow-builder",
+      "steps": [
+        {
+          "name": "repository_bind",
+          "status": 200
+        },
+        {
+          "name": "onboarding",
+          "status": 200
+        },
+        {
+          "name": "backlog_create",
+          "status": 201
+        },
+        {
+          "name": "execute_next",
+          "status": 200
+        },
+        {
+          "name": "run_report",
+          "status": 200
+        },
+        {
+          "name": "run_until_terminal",
+          "status": 200
+        }
+      ],
+      "trace": {
+        "repository_url": "https://github.com/salacoste/mcp-n8n-workflow-builder",
+        "repository_full_name": "salacoste/mcp-n8n-workflow-builder",
+        "onboarding_workspace_requested": "/tmp/mcp-n8n-workflow-builder",
+        "onboarding_ready": true,
+        "workspace_path": "/tmp/mcp-n8n-workflow-builder",
+        "task_id": "task_dea29ba31a",
+        "run_id": "run_9f5ce7c6f3",
+        "terminal": false,
+        "terminal_status": null,
+        "selected_task_id": "task_dea29ba31a",
+        "report_endpoint": "/api/projects/e2e-real-1776389725/autonomous/runs/run_9f5ce7c6f3/report",
+        "session_id": "session_20260417_013525_3c5c040e"
+      },
+      "error": "run did not reach terminal state",
+      "details": {
+        "project_id": "e2e-real-1776389725",
+        "run_id": "run_9f5ce7c6f3",
+        "terminal": false,
+        "terminal_status": null,
+        "current_stage": "execution",
+        "status": "in_progress",
+        "steps_executed": 1,
+        "max_steps": 3,
+        "action": "await_execution_stage_result",
+        "steps": [
+          {
+            "status": 202,
+            "action": "await_execution_stage_result",
+            "project_id": "e2e-real-1776389725",
+            "outcome": {
+              "status": "running",
+              "execution_id": "session_20260417_013525_3c5c040e",
+              "session_id": "session_20260417_013525_3c5c040e",
+              "worker_graph_id": "repo_developer-graph"
+            },
+            "run": {
+              "id": "run_9f5ce7c6f3",
+              "project_id": "e2e-real-1776389725",
+              "task_id": "task_dea29ba31a",
+              "status": "in_progress",
+              "current_stage": "execution",
+              "stage_states": {
+                "execution": "running",
+                "review": "pending",
+                "validation": "pending"
+              },
+              "attempts": {
+                "execution": 0,
+                "review": 0,
+                "validation": 0
+              },
+              "artifacts": {
+                "report": {},
+                "stages": {
+                  "execution": {
+                    "result": "running",
+                    "timestamp": 1776389726.2139187,
+                    "output": {
+                      "execution": {
+                        "status": "running",
+                        "execution_id": "session_20260417_013525_3c5c040e",
+                        "session_id": "session_20260417_013525_3c5c040e",
+                        "worker_graph_id": "repo_developer-graph"
+                      }
+                    },
+                    "attempt": 1,
+                    "source": "execution_event_poll"
+                  }
+                }
+              },
+              "started_at": 1776389726.0677388,
+              "updated_at": 1776389726.2139218,
+              "finished_at": null
+            }
+          }
+        ],
+        "run": {
+          "id": "run_9f5ce7c6f3",
+          "project_id": "e2e-real-1776389725",
+          "task_id": "task_dea29ba31a",
+          "status": "in_progress",
+          "current_stage": "execution",
+          "stage_states": {
+            "execution": "running",
+            "review": "pending",
+            "validation": "pending"
+          },
+          "attempts": {
+            "execution": 0,
+            "review": 0,
+            "validation": 0
+          },
+          "artifacts": {
+            "report": {},
+            "stages": {
+              "execution": {
+                "result": "running",
+                "timestamp": 1776389726.2139187,
+                "output": {
+                  "execution": {
+                    "status": "running",
+                    "execution_id": "session_20260417_013525_3c5c040e",
+                    "session_id": "session_20260417_013525_3c5c040e",
+                    "worker_graph_id": "repo_developer-graph"
+                  }
+                },
+                "attempt": 1,
+                "source": "execution_event_poll"
+              }
+            }
+          },
+          "started_at": 1776389726.0677388,
+          "updated_at": 1776389726.2139218,
+          "finished_at": null
+        }
+      },
+      "scenario": "real_repo",
+      "ok": false,
+      "project_created": true,
+      "project_used": "e2e-real-1776389725"
+    }
+  ]
+}

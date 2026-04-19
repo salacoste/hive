@@ -1,0 +1,136 @@
+{
+  "window_days": 7,
+  "artifacts_total": 16,
+  "pass": 16,
+  "fail": 0,
+  "recent": [
+    {
+      "generated_at": "2026-04-17T14:27:36",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260417-142736.json"
+    },
+    {
+      "generated_at": "2026-04-17T14:18:51",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260417-141851.json"
+    },
+    {
+      "generated_at": "2026-04-17T14:17:18",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260417-141718.json"
+    },
+    {
+      "generated_at": "2026-04-14T05:19:18",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-051918.json"
+    },
+    {
+      "generated_at": "2026-04-14T05:12:49",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-051249.json"
+    },
+    {
+      "generated_at": "2026-04-14T05:11:38",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-051138.json"
+    },
+    {
+      "generated_at": "2026-04-14T05:05:54",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-050554.json"
+    },
+    {
+      "generated_at": "2026-04-14T05:04:41",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-050441.json"
+    },
+    {
+      "generated_at": "2026-04-14T05:00:55",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-050055.json"
+    },
+    {
+      "generated_at": "2026-04-14T04:59:02",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-045902.json"
+    },
+    {
+      "generated_at": "2026-04-14T04:54:26",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-045426.json"
+    },
+    {
+      "generated_at": "2026-04-14T04:50:22",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-045022.json"
+    },
+    {
+      "generated_at": "2026-04-14T04:49:15",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260414-044915.json"
+    },
+    {
+      "generated_at": "2026-04-12T04:11:16",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260412-041116.json"
+    },
+    {
+      "generated_at": "2026-04-12T04:10:55",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260412-041055.json"
+    },
+    {
+      "generated_at": "2026-04-12T04:06:42",
+      "result": "PASS",
+      "health": "ok",
+      "ops": "ok",
+      "telegram": "ok",
+      "artifact": "acceptance-report-20260412-040642.json"
+    }
+  ]
+}

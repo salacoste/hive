@@ -269,9 +269,18 @@ interface HistorySidebarProps {
   activeHistorySourceId?: string | null;
   /** Increment this to force a refresh of the session list. */
   refreshKey?: number;
+  /** Optional active project filter. */
+  projectId?: string | null;
 }
 
-export default function HistorySidebar({ onOpen, openSessionIds = [], activeSessionId, activeHistorySourceId, refreshKey }: HistorySidebarProps) {
+export default function HistorySidebar({
+  onOpen,
+  openSessionIds = [],
+  activeSessionId,
+  activeHistorySourceId,
+  refreshKey,
+  projectId,
+}: HistorySidebarProps) {
   const [collapsed, setCollapsed] = useState(false);
   // Raw sessions from the backend (may contain duplicates per agent)
   const [rawSessions, setRawSessions] = useState<HistorySession[]>([]);
@@ -281,11 +290,11 @@ export default function HistorySidebar({ onOpen, openSessionIds = [], activeSess
   const refresh = useCallback(() => {
     setLoading(true);
     sessionsApi
-      .history()
+      .history(projectId || undefined)
       .then((r) => setRawSessions(r.sessions))
       .catch(() => { })
       .finally(() => setLoading(false));
-  }, []);
+  }, [projectId]);
 
   // Refresh on mount and whenever the parent forces a refresh
   useEffect(() => {
@@ -342,7 +351,7 @@ export default function HistorySidebar({ onOpen, openSessionIds = [], activeSess
       >
         {!collapsed && (
           <span className="text-[11px] font-semibold text-muted-foreground/60 uppercase tracking-wider flex-1">
-            History
+            Session History
           </span>
         )}
         <button

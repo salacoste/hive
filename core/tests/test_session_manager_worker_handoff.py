@@ -126,7 +126,7 @@ async def test_stop_session_unsubscribes_worker_handoff() -> None:
 
 
 @pytest.mark.asyncio
-async def test_load_worker_core_defaults_to_session_llm_model(monkeypatch, tmp_path) -> None:
+async def test_load_worker_core_defaults_to_implementation_profile_model(monkeypatch, tmp_path) -> None:
     bus = EventBus()
     manager = SessionManager(model="manager-default")
     session_llm = SimpleNamespace(model="queen-shared-model")
@@ -155,9 +155,9 @@ async def test_load_worker_core_defaults_to_session_llm_model(monkeypatch, tmp_p
 
     await manager._load_worker_core(session, tmp_path / "worker_agent")
 
-    assert load_calls[0]["model"] == "queen-shared-model"
+    assert load_calls[0]["model"] is None
     assert session.runner is runner
-    assert session.runner._llm is session_llm
+    assert session.runner._llm is None
     assert runtime._dynamic_memory_provider_factory is not None
 
 
@@ -233,3 +233,53 @@ async def test_load_worker_core_continues_when_colony_memory_subscription_fails(
     assert session.runner is runner
     assert session.graph_runtime is runtime
     assert session.worker_path == tmp_path / "worker_agent"
+
+
+@pytest.mark.asyncio
+async def test_create_session_rejects_cross_project_resume(monkeypatch) -> None:
+    manager = SessionManager()
+
+    monkeypatch.setattr(
+        SessionManager,
+        "_project_id_from_resume",
+        staticmethod(lambda _sid: "project-a"),
+    )
+    monkeypatch.setattr(manager, "_create_session_core", AsyncMock())
+    monkeypatch.setattr(manager, "_start_queen", AsyncMock())
+
+    with pytest.raises(ValueError, match="cannot be resumed into project"):
+        await manager.create_session(
+            queen_resume_from="session_old",
+            project_id="project-b",
+        )
+
+    assert manager._create_session_core.await_count == 0
+    assert manager._start_queen.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_create_session_allows_resume_with_same_project(monkeypatch) -> None:
+    manager = SessionManager()
+
+    monkeypatch.setattr(
+        SessionManager,
+        "_project_id_from_resume",
+        staticmethod(lambda _sid: "default"),
+    )
+
+    session = Session(id="session_old", event_bus=MagicMock(), llm=object(), loaded_at=0.0)
+    monkeypatch.setattr(manager, "_create_session_core", AsyncMock(return_value=session))
+    monkeypatch.setattr(manager, "_start_queen", AsyncMock())
+
+    created = await manager.create_session(
+        queen_resume_from="session_old",
+        project_id="default",
+    )
+
+    assert created is session
+    manager._create_session_core.assert_awaited_once_with(
+        session_id="session_old",
+        model=None,
+        model_profile=None,
+        project_id="default",
+    )

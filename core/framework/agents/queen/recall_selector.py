@@ -1,11 +1,11 @@
-"""Recall selector — pre-turn memory selection for queen and worker memory.
+"""Recall selector — pre-turn global memory selection for the queen.
 
 Before each conversation turn the system:
-  1. Scans the memory directory for ``.md`` files (cap: 200).
+  1. Scans the global memory directory for ``.md`` files (cap: 200).
   2. Reads headers (frontmatter + first 30 lines).
   3. Uses a single LLM call with structured JSON output to pick the ~5
      most relevant memories.
-  4. Injects them into context with staleness warnings for older ones.
+  4. Injects them into the system prompt.
 
 The selector only sees the user's query string — no full conversation
 context.  This keeps it cheap and fast.  Errors are caught and return
@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 from framework.agents.queen.queen_memory_v2 import (
-    MEMORY_DIR,
     format_memory_manifest,
-    memory_freshness_text,
+    global_memory_dir,
     scan_memory_files,
 )
 
@@ -30,29 +30,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Structured output schema
-# ---------------------------------------------------------------------------
-
-RECALL_SCHEMA: dict[str, Any] = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "memory_selection",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "selected_memories": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-            },
-            "required": ["selected_memories"],
-            "additionalProperties": False,
-        },
-    },
-}
-
-# ---------------------------------------------------------------------------
-# System prompt
 # ---------------------------------------------------------------------------
 
 SELECT_MEMORIES_SYSTEM_PROMPT = """\
@@ -72,9 +49,6 @@ name and description.
 query, then do not include it in your list.  Be selective and discerning.
 - If there are no memories in the list that would clearly be useful, \
 return an empty list.
-- If a list of recently-used tools is provided, do not select memories \
-that are usage reference or API documentation for those tools (the Queen \
-is already exercising them).  Still select warnings or gotchas about them.
 """
 
 # ---------------------------------------------------------------------------
@@ -82,11 +56,50 @@ is already exercising them).  Still select warnings or gotchas about them.
 # ---------------------------------------------------------------------------
 
 
+def _extract_json_payload(raw: str) -> Any:
+    """Best-effort JSON extraction from raw LLM text.
+
+    The selector requests ``json_object`` mode, but some providers can still
+    wrap payloads with markdown fences or brief prefixed/suffixed text.
+    """
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty response")
+
+    # 1) Fast path: strict JSON payload.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2) Markdown code fences (```json ... ``` or ``` ... ```).
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE):
+        candidate = match.group(1).strip()
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    # 3) First JSON-looking object/array slice from the text.
+    start_candidates = [i for i in (text.find("{"), text.find("[")) if i >= 0]
+    if start_candidates:
+        start = min(start_candidates)
+        end_obj = text.rfind("}")
+        end_arr = text.rfind("]")
+        end = max(end_obj, end_arr)
+        if end > start:
+            candidate = text[start : end + 1].strip()
+            return json.loads(candidate)
+
+    raise ValueError("no JSON payload found")
+
+
 async def select_memories(
     query: str,
     llm: Any,
     memory_dir: Path | None = None,
-    active_tools: list[str] | None = None,
     *,
     max_results: int = 5,
 ) -> list[str]:
@@ -94,51 +107,53 @@ async def select_memories(
 
     Returns a list of filenames.  Best-effort: on any error returns ``[]``.
     """
-    mem_dir = memory_dir or MEMORY_DIR
+    mem_dir = memory_dir or global_memory_dir()
     files = scan_memory_files(mem_dir)
     if not files:
         logger.debug("recall: no memory files found, skipping selection")
         return []
 
-    logger.debug("recall: selecting from %d memory files for query: %.80s", len(files), query)
+    logger.debug("recall: selecting from %d memories for query: %.100s", len(files), query)
     manifest = format_memory_manifest(files)
-
-    user_msg_parts = [f"## User query\n\n{query}\n\n## Available memories\n\n{manifest}"]
-    if active_tools:
-        user_msg_parts.append(f"\n\n## Recently-used tools\n\n{', '.join(active_tools)}")
-
-    user_msg = "".join(user_msg_parts)
+    user_msg = f"## User query\n\n{query}\n\n## Available memories\n\n{manifest}"
 
     try:
         resp = await llm.acomplete(
             messages=[{"role": "user", "content": user_msg}],
             system=SELECT_MEMORIES_SYSTEM_PROMPT,
-            max_tokens=512,
-            response_format=RECALL_SCHEMA,
+            max_tokens=1024,
+            response_format={"type": "json_object"},
         )
-        data = json.loads(resp.content)
-        selected = data.get("selected_memories", [])
-        # Validate: only return filenames that actually exist.
+        raw = (resp.content or "").strip()
+        if not raw:
+            logger.warning(
+                "recall: LLM returned empty response (model=%s, stop=%s)",
+                resp.model,
+                resp.stop_reason,
+            )
+            return []
+        data = _extract_json_payload(raw)
+        if isinstance(data, list):
+            selected = data
+        elif isinstance(data, dict):
+            selected = data.get("selected_memories", [])
+        else:
+            selected = []
         valid_names = {f.filename for f in files}
         result = [s for s in selected if s in valid_names][:max_results]
         logger.debug("recall: selected %d memories: %s", len(result), result)
         return result
-    except Exception:
-        logger.debug("recall: memory selection failed, returning []", exc_info=True)
+    except Exception as exc:
+        logger.warning("recall: memory selection failed (%s), returning []", exc)
         return []
 
 
 def format_recall_injection(
     filenames: list[str],
     memory_dir: Path | None = None,
-    *,
-    heading: str = "Selected Memories",
 ) -> str:
-    """Read selected memory files and format for system prompt injection.
-
-    Prepends a staleness warning for memories older than 1 day.
-    """
-    mem_dir = memory_dir or MEMORY_DIR
+    """Read selected memory files and format for system prompt injection."""
+    mem_dir = memory_dir or global_memory_dir()
     if not filenames:
         return ""
 
@@ -151,86 +166,10 @@ def format_recall_injection(
             content = path.read_text(encoding="utf-8").strip()
         except OSError:
             continue
-
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            mtime = 0.0
-
-        freshness = memory_freshness_text(mtime)
-        header = f"### {fname}"
-        if freshness:
-            header += f"\n\n> {freshness}"
-        blocks.append(f"{header}\n\n{content}")
+        blocks.append(f"### {fname}\n\n{content}")
 
     if not blocks:
         return ""
 
     body = "\n\n---\n\n".join(blocks)
-    logger.debug("recall: injecting %d memory blocks into context", len(blocks))
-    return f"--- {heading} ---\n\n{body}\n\n--- End {heading} ---"
-
-
-# ---------------------------------------------------------------------------
-# Cache update (called after each queen turn)
-# ---------------------------------------------------------------------------
-
-
-async def update_recall_cache(
-    session_dir: Path,
-    llm: Any,
-    phase_state: Any | None = None,
-    memory_dir: Path | None = None,
-    *,
-    cache_setter: Any = None,
-    heading: str = "Selected Memories",
-    active_tools: list[str] | None = None,
-) -> None:
-    """Update the recall cache on *phase_state* for the next turn.
-
-    Reads the latest user message from conversation parts to use as the
-    query for memory selection.
-    """
-    mem_dir = memory_dir or MEMORY_DIR
-
-    # Extract latest user message as the query.
-    query = _extract_latest_user_query(session_dir)
-    if not query:
-        logger.debug("recall: no user query found, skipping cache update")
-        return
-    logger.debug("recall: updating cache for query: %.80s", query)
-
-    try:
-        selected = await select_memories(
-            query,
-            llm,
-            mem_dir,
-            active_tools=active_tools,
-        )
-        injection = format_recall_injection(selected, mem_dir, heading=heading)
-        if cache_setter is not None:
-            cache_setter(injection)
-        elif phase_state is not None:
-            phase_state._cached_recall_block = injection
-    except Exception:
-        logger.debug("recall: cache update failed", exc_info=True)
-
-
-def _extract_latest_user_query(session_dir: Path) -> str:
-    """Read the most recent user message from conversation parts."""
-    parts_dir = session_dir / "conversations" / "parts"
-    if not parts_dir.is_dir():
-        return ""
-
-    part_files = sorted(parts_dir.glob("*.json"), reverse=True)
-    for f in part_files[:20]:  # Look back at most 20 messages.
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            if data.get("role") == "user":
-                content = str(data.get("content", "")).strip()
-                if content:
-                    # Truncate very long queries.
-                    return content[:1000] if len(content) > 1000 else content
-        except (json.JSONDecodeError, OSError):
-            continue
-    return ""
+    return f"--- Global Memories ---\n\n{body}\n\n--- End Global Memories ---"

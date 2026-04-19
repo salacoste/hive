@@ -59,6 +59,9 @@ export default function MyAgents() {
             <p className="text-sm text-muted-foreground mt-1">
               {activeCount} active · {idleCount} idle
             </p>
+            <p className="text-xs text-muted-foreground/70 mt-1">
+              Agent catalog (from `exports/`) — separate from Session History counts.
+            </p>
           </div>
           <button
             onClick={() => navigate("/workspace?agent=new-agent")}

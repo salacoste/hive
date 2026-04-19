@@ -85,8 +85,41 @@ def _find_project_root() -> str:
 def _resolve_path(path: str) -> str:
     """Resolve path relative to PROJECT_ROOT. Raises ValueError if outside.
 
-    Also allows access to ~/.hive/ directory for agent session data files.
+    Also allows access to:
+    - ~/.hive/ directory for agent session data files.
+    - Extra roots from CODER_TOOLS_ALLOWED_PATHS (os.pathsep-separated).
     """
+    def _allowed_roots() -> list[str]:
+        roots: list[str] = [os.path.abspath(PROJECT_ROOT)]
+        roots.append(os.path.abspath(os.path.expanduser("~/.hive")))
+        extra = os.environ.get("CODER_TOOLS_ALLOWED_PATHS", "")
+        if extra:
+            for raw in extra.split(os.pathsep):
+                item = raw.strip()
+                if not item:
+                    continue
+                roots.append(os.path.abspath(os.path.expanduser(item)))
+        # De-duplicate while preserving order
+        out: list[str] = []
+        seen: set[str] = set()
+        for root in roots:
+            if root in seen:
+                continue
+            seen.add(root)
+            out.append(root)
+        return out
+
+    def _is_within_allowed(resolved_path: str, roots: list[str]) -> bool:
+        for root in roots:
+            try:
+                if os.path.commonpath([resolved_path, root]) == root:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    allowed_roots = _allowed_roots()
+
     # Normalize slashes for cross-platform (e.g. exports/hi_agent from LLM)
     path = path.replace("/", os.sep)
 
@@ -96,20 +129,7 @@ def _resolve_path(path: str) -> str:
 
     if os.path.isabs(path):
         resolved = os.path.abspath(path)
-
-        # Allow access to ~/.hive/ for agent session data
-        hive_dir = os.path.expanduser("~/.hive")
-        try:
-            if os.path.commonpath([resolved, hive_dir]) == hive_dir:
-                return resolved  # Path is under ~/.hive, allow it
-        except ValueError:
-            pass
-
-        try:
-            common = os.path.commonpath([resolved, PROJECT_ROOT])
-        except ValueError:
-            common = ""
-        if common != PROJECT_ROOT:
+        if not _is_within_allowed(resolved, allowed_roots):
             # LLM may emit wrong-root paths (/mnt/data, /workspace, etc.).
             # Strip known prefixes and treat the remainder as relative to PROJECT_ROOT.
             path_norm = path.replace("\\", "/")
@@ -143,15 +163,15 @@ def _resolve_path(path: str) -> str:
                     path = os.sep.join(parts[idx:])
                     resolved = os.path.abspath(os.path.join(PROJECT_ROOT, path))
                 else:
-                    raise ValueError(f"Access denied: '{path}' is outside the project root.")
+                    allowed = ", ".join(allowed_roots)
+                    raise ValueError(
+                        f"Access denied: '{path}' is outside allowed roots: {allowed}"
+                    )
     else:
         resolved = os.path.abspath(os.path.join(PROJECT_ROOT, path))
-    try:
-        common = os.path.commonpath([resolved, PROJECT_ROOT])
-    except ValueError as err:
-        raise ValueError(f"Access denied: '{path}' is outside the project root.") from err
-    if common != PROJECT_ROOT:
-        raise ValueError(f"Access denied: '{path}' is outside the project root.")
+    if not _is_within_allowed(resolved, allowed_roots):
+        allowed = ", ".join(allowed_roots)
+        raise ValueError(f"Access denied: '{path}' is outside allowed roots: {allowed}")
     return resolved
 
 
@@ -559,13 +579,24 @@ def list_agent_tools(
         }
 
     def _tool_credentials_available(tool_name: str, available_creds: set[str]) -> bool:
-        """True if all credentials required by tool_name are available (or tool needs none)."""
-        required = set()
-        for provider_creds in tool_provider_auth.get(tool_name, {}).values():
-            required.update(provider_creds.keys())
-        if not required:
+        """True if at least one provider path for a tool can be satisfied.
+
+        Some tools support multiple providers (example: send_email via google OR resend).
+        Those tools should be considered available when any provider's required
+        credential set is available.
+        """
+        provider_paths = tool_provider_auth.get(tool_name, {})
+        if not provider_paths:
             return True  # no credentials needed
-        return required.issubset(available_creds)
+
+        for provider_creds in provider_paths.values():
+            # Provider path is available only when all credentials bound to that
+            # provider path are present. `spec.required=False` is a global
+            # validation hint and does not mean "optional inside this path".
+            required = set(provider_creds.keys())
+            if required.issubset(available_creds):
+                return True
+        return False
 
     def _group_by_provider(tools: list[dict]) -> dict[str, dict]:
         """Group tools by provider, including auth metadata and providerless tools."""
@@ -597,9 +628,11 @@ def list_agent_tools(
                     {
                         "authorization": {},
                         "tools": [],
+                        "_tool_names": set(),
                     },
                 )
                 bucket["tools"].append(tool_payload)
+                bucket["_tool_names"].add(t["name"])
 
                 # Only accumulate full auth metadata for simple/full schemas.
                 # summary/names use compact representations.
@@ -609,13 +642,14 @@ def list_agent_tools(
                         bucket["authorization"][cred_name] = auth
 
         for provider, bucket in groups.items():
+            tool_names = sorted(bucket.pop("_tool_names", set()))
+            cred_keys: set[str] = set()
+            for tn in tool_names:
+                provider_creds = tool_provider_auth.get(tn, {}).get(provider, {})
+                cred_keys.update(provider_creds.keys())
+
             if output_schema == "names":
                 # Collapse to compact structure: flat sorted name list + credential keys only
-                tool_names = sorted(set(bucket["tools"]))
-                cred_keys: set[str] = set()
-                for tn in tool_names:
-                    for prov_creds in tool_provider_auth.get(tn, {}).values():
-                        cred_keys.update(prov_creds.keys())
                 groups[provider] = {
                     "tool_count": len(tool_names),
                     "credentials_required": sorted(cred_keys),
@@ -624,6 +658,9 @@ def list_agent_tools(
             else:
                 bucket["tools"] = sorted(bucket["tools"], key=lambda x: x["name"])
                 bucket["authorization"] = dict(sorted(bucket["authorization"].items()))
+                if output_schema == "summary":
+                    bucket["tool_names"] = tool_names
+                    bucket["credentials_required"] = sorted(cred_keys)
 
         return dict(sorted(groups.items()))
 
@@ -688,12 +725,19 @@ def list_agent_tools(
             full_groups = _group_by_provider(all_tools) if credentials != "all" else provider_groups
             summary_providers: dict = {}
             for prov, bucket in full_groups.items():
-                cred_names = bucket.get(
-                    "credentials_required", sorted(bucket.get("authorization", {}).keys())
+                provider_tool_names = bucket.get(
+                    "tool_names", [entry.get("name") for entry in bucket.get("tools", [])]
                 )
+                cred_names_set: set[str] = set()
+                for tool_name in provider_tool_names:
+                    cred_names_set.update(tool_provider_auth.get(tool_name, {}).get(prov, {}).keys())
+                if not cred_names_set:
+                    # Backward-compat fallback for schemas carrying explicit auth metadata.
+                    cred_names_set.update(bucket.get("authorization", {}).keys())
+                cred_names = sorted(cred_names_set)
                 creds_ok = all(c in available_creds for c in cred_names) if cred_names else True
                 summary_providers[prov] = {
-                    "tool_count": len(bucket.get("tool_names", bucket.get("tools", []))),
+                    "tool_count": len(provider_tool_names),
                     "credentials_required": cred_names,
                     "credentials_available": creds_ok,
                 }
@@ -720,16 +764,13 @@ def list_agent_tools(
             for tn in sorted(set(provider_tool_names)):
                 svc = _infer_service(tn)
                 if svc not in services:
-                    svc_creds: set[str] = set()
-                    for prov_creds in tool_provider_auth.get(tn, {}).values():
-                        svc_creds.update(prov_creds.keys())
+                    svc_creds: set[str] = set(tool_provider_auth.get(tn, {}).get(group, {}).keys())
                     services[svc] = {"tool_count": 0, "credentials_required": sorted(svc_creds)}
                 services[svc]["tool_count"] += 1
                 # Accumulate credentials for other tools in this service
-                for prov_creds in tool_provider_auth.get(tn, {}).values():
-                    existing = set(services[svc]["credentials_required"])
-                    existing.update(prov_creds.keys())
-                    services[svc]["credentials_required"] = sorted(existing)
+                existing = set(services[svc]["credentials_required"])
+                existing.update(tool_provider_auth.get(tn, {}).get(group, {}).keys())
+                services[svc]["credentials_required"] = sorted(existing)
 
             result = {
                 "provider": group,
@@ -2299,14 +2340,22 @@ if __name__ == "__main__":
             "command": "uv",
             "args": ["run", "python", "mcp_server.py", "--stdio"],
             "cwd": "../../tools",
-            "description": "Hive tools MCP server",
+            "description": "Primary integration server: web, GitHub, Telegram, Google, data stores",
         },
         "gcu-tools": {
             "transport": "stdio",
             "command": "uv",
             "args": ["run", "python", "-m", "gcu.server", "--stdio"],
             "cwd": "../../tools",
-            "description": "GCU browser automation tools",
+            "description": "Browser automation tools",
+        },
+        "files-tools": {
+            "transport": "stdio",
+            "command": "uv",
+            "args": ["run", "python", "files_server.py", "--stdio"],
+            "cwd": "../../tools",
+            "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+            "description": "Focused file operations server",
         },
     }
 

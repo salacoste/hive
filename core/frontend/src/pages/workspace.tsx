@@ -1,26 +1,40 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import ReactDOM from "react-dom";
 import { useSearchParams, useNavigate } from "react-router-dom";
-import { Plus, KeyRound, Sparkles, Layers, ChevronLeft, Bot, Loader2, WifiOff, X, FolderOpen } from "lucide-react";
+import { Plus, KeyRound, Sparkles, Layers, ChevronLeft, Bot, Loader2, WifiOff, X, FolderOpen, Download, RefreshCw } from "lucide-react";
 import type { GraphNode, NodeStatus } from "@/components/graph-types";
 import DraftGraph from "@/components/DraftGraph";
 import ChatPanel, { type ChatMessage } from "@/components/ChatPanel";
 import TopBar from "@/components/TopBar";
+import HistorySidebar from "@/components/HistorySidebar";
 import { TAB_STORAGE_KEY, loadPersistedTabs, savePersistedTabs, type PersistedTabState } from "@/lib/tab-persistence";
 import NodeDetailPanel from "@/components/NodeDetailPanel";
 import CredentialsModal, { type Credential, createFreshCredentials, cloneCredentials, allRequiredCredentialsMet, clearCredentialCache } from "@/components/CredentialsModal";
 import { agentsApi } from "@/api/agents";
+import {
+  credentialsApi,
+  type CredentialReadinessResponse,
+} from "@/api/credentials";
 import { executionApi } from "@/api/execution";
 import { graphsApi } from "@/api/graphs";
 import { sessionsApi } from "@/api/sessions";
+import { projectsApi } from "@/api/projects";
+import {
+  autonomousApi,
+  type AutonomousOpsStatusResponse,
+  type AutonomousRemediateStaleResponse,
+  type BacklogTask as AutonomousBacklogTask,
+  type PipelineRun as AutonomousPipelineRun,
+} from "@/api/autonomous";
 import { useMultiSSE } from "@/hooks/use-sse";
-import type { LiveSession, AgentEvent, DiscoverEntry, NodeSpec, DraftGraph as DraftGraphData } from "@/api/types";
+import type { LiveSession, AgentEvent, DiscoverEntry, NodeSpec, DraftGraph as DraftGraphData, ProjectInfo } from "@/api/types";
 import { sseEventToChatMessage, formatAgentDisplayName } from "@/lib/chat-helpers";
 import { topologyToGraphNodes } from "@/lib/graph-converter";
 import { cronToLabel } from "@/lib/graphUtils";
 import { ApiError } from "@/api/client";
 
 const makeId = () => Math.random().toString(36).slice(2, 9);
+const ACTIVE_PROJECT_STORAGE_KEY = "hive:active-project-id";
 
 /**
  * Strip the instance suffix added when multiple tabs share the same agentType.
@@ -28,6 +42,20 @@ const makeId = () => Math.random().toString(36).slice(2, 9);
  * First-instance keys (no "::") are returned unchanged.
  */
 const baseAgentType = (key: string): string => key.split("::")[0];
+
+function formatPct(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "--";
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatSeconds(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "--";
+  if (value < 1) return "<1s";
+  if (value < 60) return `${Math.round(value)}s`;
+  const mins = Math.floor(value / 60);
+  const secs = Math.round(value % 60);
+  return `${mins}m ${String(secs).padStart(2, "0")}s`;
+}
 
 /** Format seconds into a compact countdown string. */
 function formatCountdown(totalSecs: number): string {
@@ -79,6 +107,163 @@ interface Session {
   historySourceId?: string;
 }
 
+type ProjectMetrics = {
+  project_id: string;
+  summary: {
+    active_sessions: number;
+    historical_sessions: number;
+    executions_total: number;
+    messages_total: number;
+    user_messages_total: number;
+  };
+  kpis: {
+    success_rate: number | null;
+    cycle_time_seconds_p50: number | null;
+    cycle_time_seconds_avg: number | null;
+    intervention_ratio: number;
+  };
+};
+
+type ProjectComparisonRow = {
+  project: { id: string; name: string; repository: string };
+  summary: {
+    active_sessions: number;
+    historical_sessions: number;
+    executions_total: number;
+    messages_total: number;
+    user_messages_total: number;
+  };
+  kpis: {
+    success_rate: number | null;
+    cycle_time_seconds_p50: number | null;
+    cycle_time_seconds_avg: number | null;
+    intervention_ratio: number;
+  };
+};
+
+type ProjectTemplateProfile = {
+  id: string;
+  name: string;
+  description: string;
+  stack: "node" | "python" | "go" | "jvm" | "rust" | "fullstack";
+  repo_type: "single" | "monorepo";
+  required_checks: string[];
+  commands: Partial<Record<"install" | "lint" | "typecheck" | "test" | "build" | "smoke", string>>;
+  dry_run_command?: string;
+};
+
+type ProjectRetentionView = {
+  project_id: string;
+  defaults: Record<string, unknown>;
+  overrides: Record<string, unknown>;
+  effective: {
+    history_days: number;
+    min_sessions_to_keep: number;
+    archive_enabled: boolean;
+    archive_root: string;
+  };
+  plan: {
+    historical_sessions: number;
+    eligible_count: number;
+    cutoff_timestamp: number;
+    candidates: Array<{ session_id: string; created_at: number; age_days: number }>;
+  };
+};
+
+type ProjectExecutionTemplateView = {
+  project_id: string;
+  defaults: {
+    execution_template: {
+      default_flow: Array<{ stage: string; mode: string; model_profile: string }>;
+      retry_policy: { max_retries_per_stage: number; escalate_on: string[] };
+      github?: {
+        default_ref?: string;
+        default_branch?: string;
+        ref?: string;
+        branch?: string;
+        no_checks_policy?: "error" | "success" | "manual_pending";
+      };
+      default_ref?: string;
+      default_branch?: string;
+      ref?: string;
+      branch?: string;
+      no_checks_policy?: "error" | "success" | "manual_pending";
+    };
+    policy_binding: Record<string, unknown>;
+  };
+  execution_template: {
+    default_flow?: Array<{ stage: string; mode: string; model_profile: string }>;
+    retry_policy?: { max_retries_per_stage?: number; escalate_on?: string[] };
+    github?: {
+      default_ref?: string;
+      default_branch?: string;
+      ref?: string;
+      branch?: string;
+      no_checks_policy?: "error" | "success" | "manual_pending" | "manual" | "defer" | "pass" | "ok";
+    };
+    default_ref?: string;
+    default_branch?: string;
+    ref?: string;
+    branch?: string;
+    no_checks_policy?: "error" | "success" | "manual_pending" | "manual" | "defer" | "pass" | "ok";
+  };
+  policy_binding: {
+    risk_tier?: "low" | "medium" | "high" | "critical";
+    retry_limit_per_stage?: number;
+    budget_limit_usd_monthly?: number;
+  };
+  effective: {
+    execution_template: {
+      default_flow: Array<{ stage: string; mode: string; model_profile: string }>;
+      retry_policy: { max_retries_per_stage: number; escalate_on: string[] };
+      github?: {
+        default_ref?: string;
+        default_branch?: string;
+        ref?: string;
+        branch?: string;
+        no_checks_policy?: "error" | "success" | "manual_pending";
+      };
+      default_ref?: string;
+      default_branch?: string;
+      ref?: string;
+      branch?: string;
+      no_checks_policy?: "error" | "success" | "manual_pending";
+    };
+    policy: {
+      risk_tier?: "low" | "medium" | "high" | "critical";
+      retry_limit_per_stage?: number;
+      budget_limit_usd_monthly?: number;
+    };
+  };
+};
+
+type ProjectNoChecksPolicy = "error" | "success" | "manual_pending";
+
+type ProjectToolchainProfileView = {
+  project_id: string;
+  toolchain_profile: {
+    pending_plan?: {
+      source?: {
+        workspace_path?: string | null;
+        repository?: string | null;
+      };
+      plan?: {
+        toolchains?: string[];
+        recommended_stack?: string;
+        docker_build_args?: Record<string, number>;
+        plan_fingerprint?: string;
+        confirm_token?: string;
+        generated_at?: number;
+      };
+    } | null;
+    approved_plan?: Record<string, unknown> | null;
+    last_plan?: Record<string, unknown> | null;
+    updated_at?: number;
+  };
+};
+
+const DEFAULT_PROJECT_TEMPLATE_ID = "backend-python-api";
+
 function createSession(agentType: string, label: string, existingCredentials?: Credential[]): Session {
   return {
     id: makeId(),
@@ -97,7 +282,6 @@ interface NewTabPopoverProps {
   open: boolean;
   onClose: () => void;
   anchorRef: React.RefObject<HTMLButtonElement | null>;
-  activeWorker: string;
   discoverAgents: DiscoverEntry[];
   onFromScratch: () => void;
   onCloneAgent: (agentPath: string, agentName: string) => void;
@@ -110,18 +294,36 @@ function NewTabPopover({ open, onClose, anchorRef, discoverAgents, onFromScratch
 
   useEffect(() => { if (open) setStep("root"); }, [open]);
 
-  // Compute position from anchor button
+  // Compute position from anchor button and keep it within viewport bounds.
   useEffect(() => {
-    if (open && anchorRef.current) {
+    if (!open) return;
+
+    const updatePosition = () => {
+      if (!anchorRef.current) return;
       const rect = anchorRef.current.getBoundingClientRect();
       const POPUP_WIDTH = 240; // w-60 = 15rem = 240px
-      const overflows = rect.left + POPUP_WIDTH > window.innerWidth - 8;
-      console.log("Anchor rect:", rect, "Overflows:", overflows);
-setPos({
-  top: rect.bottom + 4,
-  left: overflows ? rect.right - POPUP_WIDTH : rect.left,
-});
-    }
+      const EDGE_MARGIN = 8;
+      const preferredLeft =
+        rect.left + POPUP_WIDTH > window.innerWidth - EDGE_MARGIN
+          ? rect.right - POPUP_WIDTH
+          : rect.left;
+      const clampedLeft = Math.max(
+        EDGE_MARGIN,
+        Math.min(preferredLeft, window.innerWidth - POPUP_WIDTH - EDGE_MARGIN),
+      );
+      setPos({
+        top: rect.bottom + 4,
+        left: clampedLeft,
+      });
+    };
+
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
   }, [open, anchorRef]);
 
   // Close on outside click
@@ -401,6 +603,104 @@ function defaultAgentState(): AgentBackendState {
 export default function Workspace() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string>(
+    () => localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY) || "default",
+  );
+  const [projectBusy, setProjectBusy] = useState(false);
+  const [projectModalOpen, setProjectModalOpen] = useState(false);
+  const [projectNameDraft, setProjectNameDraft] = useState("");
+  const [projectDescriptionDraft, setProjectDescriptionDraft] = useState("");
+  const [projectRepositoryDraft, setProjectRepositoryDraft] = useState("");
+  const [projectOnboardEnabled, setProjectOnboardEnabled] = useState(true);
+  const [projectWorkspacePathDraft, setProjectWorkspacePathDraft] = useState("");
+  const [projectStackDraft, setProjectStackDraft] = useState<"node" | "python" | "go" | "jvm" | "rust" | "fullstack">("node");
+  const [projectTemplates, setProjectTemplates] = useState<ProjectTemplateProfile[]>([]);
+  const [projectTemplateIdDraft, setProjectTemplateIdDraft] = useState(DEFAULT_PROJECT_TEMPLATE_ID);
+  const [projectCreateError, setProjectCreateError] = useState<string | null>(null);
+  const [projectMetrics, setProjectMetrics] = useState<ProjectMetrics | null>(null);
+  const [projectMetricsLoading, setProjectMetricsLoading] = useState(false);
+  const [projectMetricsError, setProjectMetricsError] = useState<string | null>(null);
+  const [projectMetricsBoardOpen, setProjectMetricsBoardOpen] = useState(false);
+  const [projectMetricsRows, setProjectMetricsRows] = useState<ProjectComparisonRow[]>([]);
+  const [projectMetricsBoardLoading, setProjectMetricsBoardLoading] = useState(false);
+  const [projectMetricsBoardError, setProjectMetricsBoardError] = useState<string | null>(null);
+  const [projectMetricsSortBy, setProjectMetricsSortBy] = useState<"success_rate" | "executions_total" | "cycle_time_p50" | "intervention_ratio">("success_rate");
+  const [projectRetentionOpen, setProjectRetentionOpen] = useState(false);
+  const [projectRetentionLoading, setProjectRetentionLoading] = useState(false);
+  const [projectRetentionSaving, setProjectRetentionSaving] = useState(false);
+  const [projectRetentionApplying, setProjectRetentionApplying] = useState(false);
+  const [projectRetentionError, setProjectRetentionError] = useState<string | null>(null);
+  const [projectRetentionData, setProjectRetentionData] = useState<ProjectRetentionView | null>(null);
+  const [projectRetentionHistoryDaysDraft, setProjectRetentionHistoryDaysDraft] = useState("30");
+  const [projectRetentionMinKeepDraft, setProjectRetentionMinKeepDraft] = useState("20");
+  const [projectRetentionArchiveEnabledDraft, setProjectRetentionArchiveEnabledDraft] = useState(true);
+  const [projectRetentionArchiveRootDraft, setProjectRetentionArchiveRootDraft] = useState("~/.hive/queen/archive");
+  const [projectRetentionRunResult, setProjectRetentionRunResult] = useState<Record<string, unknown> | null>(null);
+  const [projectExecutionOpen, setProjectExecutionOpen] = useState(false);
+  const [projectExecutionLoading, setProjectExecutionLoading] = useState(false);
+  const [projectExecutionSaving, setProjectExecutionSaving] = useState(false);
+  const [projectExecutionError, setProjectExecutionError] = useState<string | null>(null);
+  const [projectExecutionData, setProjectExecutionData] = useState<ProjectExecutionTemplateView | null>(null);
+  const [projectExecutionDesignProfileDraft, setProjectExecutionDesignProfileDraft] = useState("strategy_heavy");
+  const [projectExecutionImplementProfileDraft, setProjectExecutionImplementProfileDraft] = useState("implementation");
+  const [projectExecutionReviewProfileDraft, setProjectExecutionReviewProfileDraft] = useState("review_validation");
+  const [projectExecutionValidateProfileDraft, setProjectExecutionValidateProfileDraft] = useState("review_validation");
+  const [projectExecutionRetryDraft, setProjectExecutionRetryDraft] = useState("1");
+  const [projectExecutionEscalateOnDraft, setProjectExecutionEscalateOnDraft] = useState("review,validate");
+  const [projectExecutionGithubDefaultRefDraft, setProjectExecutionGithubDefaultRefDraft] = useState("");
+  const [projectExecutionNoChecksPolicyDraft, setProjectExecutionNoChecksPolicyDraft] = useState<ProjectNoChecksPolicy>("error");
+  const [projectExecutionRiskTierDraft, setProjectExecutionRiskTierDraft] = useState<"low" | "medium" | "high" | "critical">("low");
+  const [projectExecutionPolicyRetryDraft, setProjectExecutionPolicyRetryDraft] = useState("2");
+  const [projectExecutionBudgetDraft, setProjectExecutionBudgetDraft] = useState("");
+  const [projectToolchainOpen, setProjectToolchainOpen] = useState(false);
+  const [projectToolchainLoading, setProjectToolchainLoading] = useState(false);
+  const [projectToolchainPlanning, setProjectToolchainPlanning] = useState(false);
+  const [projectToolchainApproving, setProjectToolchainApproving] = useState(false);
+  const [projectToolchainError, setProjectToolchainError] = useState<string | null>(null);
+  const [projectToolchainData, setProjectToolchainData] = useState<ProjectToolchainProfileView | null>(null);
+  const [projectToolchainWorkspaceDraft, setProjectToolchainWorkspaceDraft] = useState("");
+  const [projectToolchainRepositoryDraft, setProjectToolchainRepositoryDraft] = useState("");
+  const [projectToolchainConfirmDraft, setProjectToolchainConfirmDraft] = useState("");
+  const [projectToolchainInstructions, setProjectToolchainInstructions] = useState<{
+    preview_command?: string;
+    apply_command?: string;
+    env_exports?: string[];
+  } | null>(null);
+  const [projectAutonomousOpen, setProjectAutonomousOpen] = useState(false);
+  const [projectAutonomousLoading, setProjectAutonomousLoading] = useState(false);
+  const [projectAutonomousError, setProjectAutonomousError] = useState<string | null>(null);
+  const [projectAutonomousBacklog, setProjectAutonomousBacklog] = useState<AutonomousBacklogTask[]>([]);
+  const [projectAutonomousRuns, setProjectAutonomousRuns] = useState<AutonomousPipelineRun[]>([]);
+  const [projectAutonomousCreating, setProjectAutonomousCreating] = useState(false);
+  const [projectAutonomousActionBusy, setProjectAutonomousActionBusy] = useState(false);
+  const [projectAutonomousTaskTitleDraft, setProjectAutonomousTaskTitleDraft] = useState("");
+  const [projectAutonomousTaskGoalDraft, setProjectAutonomousTaskGoalDraft] = useState("");
+  const [projectAutonomousTaskCriteriaDraft, setProjectAutonomousTaskCriteriaDraft] = useState("");
+  const [projectAutonomousTaskPriorityDraft, setProjectAutonomousTaskPriorityDraft] = useState<"low" | "medium" | "high" | "critical">("medium");
+  const [projectAutonomousTaskRepositoryDraft, setProjectAutonomousTaskRepositoryDraft] = useState("");
+  const [projectAutonomousTaskBranchDraft, setProjectAutonomousTaskBranchDraft] = useState("");
+  const [projectAutonomousLiveSessions, setProjectAutonomousLiveSessions] = useState<LiveSession[]>([]);
+  const [projectAutonomousRunSessionIdDraft, setProjectAutonomousRunSessionIdDraft] = useState("");
+  const [projectAutonomousGitHubRepoDraft, setProjectAutonomousGitHubRepoDraft] = useState("");
+  const [projectAutonomousGitHubRefDraft, setProjectAutonomousGitHubRefDraft] = useState("");
+  const [projectAutonomousGitHubPrUrlDraft, setProjectAutonomousGitHubPrUrlDraft] = useState("");
+  const [projectAutonomousGitHubRequiredChecksDraft, setProjectAutonomousGitHubRequiredChecksDraft] = useState("");
+  const [projectAutonomousSelectedRunId, setProjectAutonomousSelectedRunId] = useState<string | null>(null);
+  const [projectAutonomousAdvanceResultDraft, setProjectAutonomousAdvanceResultDraft] = useState<"success" | "failed">("success");
+  const [projectAutonomousAdvanceNotesDraft, setProjectAutonomousAdvanceNotesDraft] = useState("");
+  const [projectAutonomousChecksDraft, setProjectAutonomousChecksDraft] = useState("review:pass");
+  const [projectAutonomousReportData, setProjectAutonomousReportData] = useState<Record<string, unknown> | null>(null);
+  const [projectAutonomousCycleSummary, setProjectAutonomousCycleSummary] = useState<Record<string, unknown> | null>(null);
+  const [projectAutonomousCycleResult, setProjectAutonomousCycleResult] = useState<Record<string, unknown> | null>(null);
+  const [projectAutonomousOpsStatus, setProjectAutonomousOpsStatus] = useState<AutonomousOpsStatusResponse | null>(null);
+  const [projectAutonomousOpsLoading, setProjectAutonomousOpsLoading] = useState(false);
+  const [projectAutonomousRemediateActionDraft, setProjectAutonomousRemediateActionDraft] = useState<"failed" | "escalated">("escalated");
+  const [projectAutonomousRemediateOlderThanDraft, setProjectAutonomousRemediateOlderThanDraft] = useState("1800");
+  const [projectAutonomousRemediateMaxRunsDraft, setProjectAutonomousRemediateMaxRunsDraft] = useState("25");
+  const [projectAutonomousRemediateBusy, setProjectAutonomousRemediateBusy] = useState(false);
+  const [projectAutonomousRemediateResult, setProjectAutonomousRemediateResult] = useState<AutonomousRemediateStaleResponse | null>(null);
+  const [projectAutonomousLastExecutionSnapshot, setProjectAutonomousLastExecutionSnapshot] = useState<Record<string, unknown> | null>(null);
   const rawAgent = searchParams.get("agent") || "new-agent";
   const hasExplicitAgent = searchParams.has("agent");
   const initialPrompt = searchParams.get("prompt") || "";
@@ -570,6 +870,12 @@ export default function Workspace() {
   const initialAgentRef = useRef(initialAgent);
   const mountedRef = useRef(false);
   const [credentialsOpen, setCredentialsOpen] = useState(false);
+  const [credentialReadiness, setCredentialReadiness] =
+    useState<CredentialReadinessResponse | null>(null);
+  const [credentialReadinessLoading, setCredentialReadinessLoading] = useState(false);
+  const [credentialReadinessError, setCredentialReadinessError] = useState<string | null>(null);
+  const [credentialReadinessOpen, setCredentialReadinessOpen] = useState(false);
+  const [credentialReadinessShowAllProviders, setCredentialReadinessShowAllProviders] = useState(false);
   // Explicit agent path for the credentials modal — set from 424 responses
   // when activeWorker doesn't match the actual agent (e.g. "new-agent" tab).
   const [credentialAgentPath, setCredentialAgentPath] = useState<string | null>(null);
@@ -652,6 +958,1117 @@ export default function Workspace() {
 
   // --- Consolidated per-agent backend state ---
   const [agentStates, setAgentStates] = useState<Record<string, AgentBackendState>>({});
+
+  const refreshProjects = useCallback(async () => {
+    const data = await projectsApi.list();
+    setProjects(data.projects || []);
+    const nextActive = (activeProjectId && data.projects.some(p => p.id === activeProjectId))
+      ? activeProjectId
+      : data.default_project_id;
+    setActiveProjectId(nextActive);
+    localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, nextActive);
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    refreshProjects().catch(() => {});
+  }, [refreshProjects]);
+
+  const refreshProjectTemplates = useCallback(async () => {
+    try {
+      const data = await projectsApi.templates();
+      const templates = Array.isArray(data.templates) ? (data.templates as ProjectTemplateProfile[]) : [];
+      setProjectTemplates(templates);
+      if (templates.length > 0 && !templates.some((t) => t.id === projectTemplateIdDraft)) {
+        setProjectTemplateIdDraft(templates[0].id);
+        setProjectStackDraft(templates[0].stack);
+      }
+    } catch {
+      // Keep create modal usable even if template catalog is temporarily unavailable.
+      setProjectTemplates([]);
+    }
+  }, [projectTemplateIdDraft]);
+
+  useEffect(() => {
+    refreshProjectTemplates().catch(() => {});
+  }, [refreshProjectTemplates]);
+
+  const selectedProjectTemplate = useMemo(
+    () => projectTemplates.find((t) => t.id === projectTemplateIdDraft) ?? null,
+    [projectTemplateIdDraft, projectTemplates],
+  );
+
+  const refreshCredentialReadiness = useCallback(async () => {
+    setCredentialReadinessLoading(true);
+    setCredentialReadinessError(null);
+    try {
+      const data = await credentialsApi.readiness("local_pro_stack");
+      setCredentialReadiness(data);
+    } catch (e) {
+      setCredentialReadinessError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCredentialReadinessLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshCredentialReadiness().catch(() => {});
+  }, [refreshCredentialReadiness]);
+
+  const refreshProjectMetrics = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectMetricsLoading(true);
+    setProjectMetricsError(null);
+    try {
+      const data = await projectsApi.metrics(activeProjectId);
+      setProjectMetrics(data as ProjectMetrics);
+    } catch (e) {
+      setProjectMetricsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectMetricsLoading(false);
+    }
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    refreshProjectMetrics().catch(() => {});
+  }, [refreshProjectMetrics]);
+
+  const refreshProjectMetricsBoard = useCallback(async () => {
+    setProjectMetricsBoardLoading(true);
+    setProjectMetricsBoardError(null);
+    try {
+      const data = await projectsApi.compareMetrics();
+      setProjectMetricsRows(Array.isArray(data.projects) ? (data.projects as ProjectComparisonRow[]) : []);
+    } catch (e) {
+      setProjectMetricsBoardError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectMetricsBoardLoading(false);
+    }
+  }, []);
+
+  const sortedProjectMetricsRows = useMemo(() => {
+    const rows = [...projectMetricsRows];
+    const numeric = (v: number | null | undefined, fallback = -1) => (v === null || v === undefined ? fallback : v);
+    rows.sort((a, b) => {
+      if (projectMetricsSortBy === "executions_total") {
+        return numeric(b.summary.executions_total, 0) - numeric(a.summary.executions_total, 0);
+      }
+      if (projectMetricsSortBy === "cycle_time_p50") {
+        return numeric(a.kpis.cycle_time_seconds_p50, Number.POSITIVE_INFINITY) - numeric(b.kpis.cycle_time_seconds_p50, Number.POSITIVE_INFINITY);
+      }
+      if (projectMetricsSortBy === "intervention_ratio") {
+        return numeric(b.kpis.intervention_ratio, 0) - numeric(a.kpis.intervention_ratio, 0);
+      }
+      return numeric(b.kpis.success_rate) - numeric(a.kpis.success_rate);
+    });
+    return rows;
+  }, [projectMetricsRows, projectMetricsSortBy]);
+
+  const refreshProjectRetention = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectRetentionLoading(true);
+    setProjectRetentionError(null);
+    try {
+      const data = await projectsApi.retention(activeProjectId);
+      const view = data as ProjectRetentionView;
+      setProjectRetentionData(view);
+      setProjectRetentionHistoryDaysDraft(String(view.effective.history_days ?? 30));
+      setProjectRetentionMinKeepDraft(String(view.effective.min_sessions_to_keep ?? 20));
+      setProjectRetentionArchiveEnabledDraft(Boolean(view.effective.archive_enabled));
+      setProjectRetentionArchiveRootDraft(String(view.effective.archive_root || "~/.hive/queen/archive"));
+    } catch (e) {
+      setProjectRetentionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectRetentionLoading(false);
+    }
+  }, [activeProjectId]);
+
+  const saveProjectRetentionPolicy = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectRetentionSaving(true);
+    setProjectRetentionError(null);
+    try {
+      const historyDays = Number.parseInt(projectRetentionHistoryDaysDraft, 10);
+      const minKeep = Number.parseInt(projectRetentionMinKeepDraft, 10);
+      await projectsApi.updateRetention(activeProjectId, {
+        history_days: Number.isFinite(historyDays) ? historyDays : null,
+        min_sessions_to_keep: Number.isFinite(minKeep) ? minKeep : null,
+        archive_enabled: projectRetentionArchiveEnabledDraft,
+        archive_root: projectRetentionArchiveRootDraft.trim() || null,
+      });
+      await refreshProjectRetention();
+    } catch (e) {
+      setProjectRetentionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectRetentionSaving(false);
+    }
+  }, [
+    activeProjectId,
+    projectRetentionArchiveEnabledDraft,
+    projectRetentionArchiveRootDraft,
+    projectRetentionHistoryDaysDraft,
+    projectRetentionMinKeepDraft,
+    refreshProjectRetention,
+  ]);
+
+  const runProjectRetention = useCallback(async (dryRun: boolean) => {
+    if (!activeProjectId) return;
+    setProjectRetentionApplying(true);
+    setProjectRetentionError(null);
+    setProjectRetentionRunResult(null);
+    try {
+      const historyDays = Number.parseInt(projectRetentionHistoryDaysDraft, 10);
+      const minKeep = Number.parseInt(projectRetentionMinKeepDraft, 10);
+      const data = await projectsApi.applyRetention(activeProjectId, {
+        dry_run: dryRun,
+        history_days: Number.isFinite(historyDays) ? historyDays : undefined,
+        min_sessions_to_keep: Number.isFinite(minKeep) ? minKeep : undefined,
+        archive_enabled: projectRetentionArchiveEnabledDraft,
+        archive_root: projectRetentionArchiveRootDraft.trim() || undefined,
+      });
+      setProjectRetentionRunResult(data as unknown as Record<string, unknown>);
+      await refreshProjectRetention();
+    } catch (e) {
+      setProjectRetentionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectRetentionApplying(false);
+    }
+  }, [
+    activeProjectId,
+    projectRetentionArchiveEnabledDraft,
+    projectRetentionArchiveRootDraft,
+    projectRetentionHistoryDaysDraft,
+    projectRetentionMinKeepDraft,
+    refreshProjectRetention,
+  ]);
+
+  useEffect(() => {
+    refreshProjectRetention().catch(() => {});
+  }, [refreshProjectRetention]);
+
+  const refreshProjectExecutionTemplate = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectExecutionLoading(true);
+    setProjectExecutionError(null);
+    try {
+      const data = await projectsApi.executionTemplate(activeProjectId);
+      const view = data as ProjectExecutionTemplateView;
+      const normalizeNoChecksPolicy = (value: unknown): ProjectNoChecksPolicy => {
+        const raw = String(value || "").trim().toLowerCase();
+        if (raw === "manual" || raw === "defer" || raw === "manual_pending") return "manual_pending";
+        if (raw === "pass" || raw === "ok" || raw === "success") return "success";
+        return "error";
+      };
+      setProjectExecutionData(view);
+      const flow = view.effective.execution_template.default_flow || [];
+      const byStage = new Map(flow.map((row) => [row.stage, row.model_profile]));
+      setProjectExecutionDesignProfileDraft(byStage.get("design") || "strategy_heavy");
+      setProjectExecutionImplementProfileDraft(byStage.get("implement") || "implementation");
+      setProjectExecutionReviewProfileDraft(byStage.get("review") || "review_validation");
+      setProjectExecutionValidateProfileDraft(byStage.get("validate") || "review_validation");
+      setProjectExecutionRetryDraft(String(view.effective.execution_template.retry_policy.max_retries_per_stage ?? 1));
+      setProjectExecutionEscalateOnDraft((view.effective.execution_template.retry_policy.escalate_on || ["review", "validate"]).join(","));
+      setProjectExecutionRiskTierDraft(
+        (view.effective.policy.risk_tier as "low" | "medium" | "high" | "critical" | undefined) || "low",
+      );
+      setProjectExecutionPolicyRetryDraft(String(view.effective.policy.retry_limit_per_stage ?? 2));
+      setProjectExecutionBudgetDraft(
+        view.effective.policy.budget_limit_usd_monthly === undefined || view.effective.policy.budget_limit_usd_monthly === null
+          ? ""
+          : String(view.effective.policy.budget_limit_usd_monthly),
+      );
+      const projectGitHub = view.execution_template.github || {};
+      const effectiveGitHub = view.effective.execution_template.github || {};
+      const githubDefaultRef =
+        projectGitHub.default_ref ||
+        projectGitHub.default_branch ||
+        view.execution_template.default_ref ||
+        view.execution_template.default_branch ||
+        effectiveGitHub.default_ref ||
+        effectiveGitHub.default_branch ||
+        view.effective.execution_template.default_ref ||
+        view.effective.execution_template.default_branch ||
+        "";
+      const githubNoChecksPolicyRaw =
+        projectGitHub.no_checks_policy ||
+        view.execution_template.no_checks_policy ||
+        effectiveGitHub.no_checks_policy ||
+        view.effective.execution_template.no_checks_policy ||
+        "error";
+      setProjectExecutionGithubDefaultRefDraft(githubDefaultRef);
+      setProjectExecutionNoChecksPolicyDraft(normalizeNoChecksPolicy(githubNoChecksPolicyRaw));
+    } catch (e) {
+      setProjectExecutionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectExecutionLoading(false);
+    }
+  }, [activeProjectId]);
+
+  const saveProjectExecutionTemplate = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectExecutionSaving(true);
+    setProjectExecutionError(null);
+    try {
+      const maxRetries = Number.parseInt(projectExecutionRetryDraft, 10);
+      const policyRetry = Number.parseInt(projectExecutionPolicyRetryDraft, 10);
+      const budget = Number.parseFloat(projectExecutionBudgetDraft);
+      const escalateOn = projectExecutionEscalateOnDraft
+        .split(",")
+        .map((part) => part.trim().toLowerCase())
+        .filter(Boolean);
+      await projectsApi.updateExecutionTemplate(activeProjectId, {
+        execution_template: {
+          default_flow: [
+            { stage: "design", mode: "queen_plan", model_profile: projectExecutionDesignProfileDraft.trim() || "strategy_heavy" },
+            { stage: "implement", mode: "worker_execute", model_profile: projectExecutionImplementProfileDraft.trim() || "implementation" },
+            { stage: "review", mode: "worker_review", model_profile: projectExecutionReviewProfileDraft.trim() || "review_validation" },
+            { stage: "validate", mode: "worker_validate", model_profile: projectExecutionValidateProfileDraft.trim() || "review_validation" },
+          ],
+          retry_policy: {
+            max_retries_per_stage: Number.isFinite(maxRetries) ? maxRetries : 1,
+            escalate_on: escalateOn,
+          },
+          github: {
+            default_ref: projectExecutionGithubDefaultRefDraft.trim() || null,
+            no_checks_policy: projectExecutionNoChecksPolicyDraft,
+          },
+        },
+        policy_binding: {
+          risk_tier: projectExecutionRiskTierDraft,
+          retry_limit_per_stage: Number.isFinite(policyRetry) ? policyRetry : null,
+          budget_limit_usd_monthly: Number.isFinite(budget) ? budget : null,
+        },
+      });
+      await refreshProjectExecutionTemplate();
+      await refreshProjects();
+    } catch (e) {
+      setProjectExecutionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectExecutionSaving(false);
+    }
+  }, [
+    activeProjectId,
+    projectExecutionBudgetDraft,
+    projectExecutionDesignProfileDraft,
+    projectExecutionEscalateOnDraft,
+    projectExecutionGithubDefaultRefDraft,
+    projectExecutionImplementProfileDraft,
+    projectExecutionNoChecksPolicyDraft,
+    projectExecutionPolicyRetryDraft,
+    projectExecutionRetryDraft,
+    projectExecutionReviewProfileDraft,
+    projectExecutionRiskTierDraft,
+    projectExecutionValidateProfileDraft,
+    refreshProjectExecutionTemplate,
+    refreshProjects,
+  ]);
+
+  useEffect(() => {
+    refreshProjectExecutionTemplate().catch(() => {});
+  }, [refreshProjectExecutionTemplate]);
+
+  const refreshProjectToolchainProfile = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectToolchainLoading(true);
+    setProjectToolchainError(null);
+    try {
+      const data = (await projectsApi.toolchainProfile(activeProjectId)) as ProjectToolchainProfileView;
+      setProjectToolchainData(data);
+      const pending = data.toolchain_profile?.pending_plan;
+      const pendingSource = pending?.source || {};
+      const pendingPlan = pending?.plan || {};
+      if (pendingSource.workspace_path) {
+        setProjectToolchainWorkspaceDraft(String(pendingSource.workspace_path));
+      }
+      if (pendingSource.repository) {
+        setProjectToolchainRepositoryDraft(String(pendingSource.repository));
+      } else if (!pendingSource.workspace_path) {
+        const active = projects.find((p) => p.id === activeProjectId);
+        if (active?.repository) setProjectToolchainRepositoryDraft(active.repository);
+      }
+      const token = String(pendingPlan.confirm_token || "");
+      if (token) setProjectToolchainConfirmDraft(token);
+    } catch (e) {
+      setProjectToolchainError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectToolchainLoading(false);
+    }
+  }, [activeProjectId, projects]);
+
+  const planProjectToolchainProfile = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectToolchainPlanning(true);
+    setProjectToolchainError(null);
+    try {
+      const workspace = projectToolchainWorkspaceDraft.trim();
+      const repository = projectToolchainRepositoryDraft.trim();
+      const payload: { workspace_path?: string; repository?: string } = {};
+      if (workspace) payload.workspace_path = workspace;
+      if (!workspace && repository) payload.repository = repository;
+      const data = await projectsApi.planToolchainProfile(activeProjectId, payload);
+      setProjectToolchainInstructions(data.instructions || null);
+      const pending = (data.pending_plan || {}) as {
+        plan?: { confirm_token?: string };
+      };
+      const token = String(pending.plan?.confirm_token || "");
+      if (token) setProjectToolchainConfirmDraft(token);
+      await refreshProjectToolchainProfile();
+      await refreshProjects();
+    } catch (e) {
+      setProjectToolchainError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectToolchainPlanning(false);
+    }
+  }, [
+    activeProjectId,
+    projectToolchainRepositoryDraft,
+    projectToolchainWorkspaceDraft,
+    refreshProjectToolchainProfile,
+    refreshProjects,
+  ]);
+
+  const approveProjectToolchainProfile = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectToolchainApproving(true);
+    setProjectToolchainError(null);
+    try {
+      const token = projectToolchainConfirmDraft.trim();
+      if (!token) {
+        throw new Error("confirm token is required");
+      }
+      const data = await projectsApi.approveToolchainProfile(activeProjectId, {
+        confirm_token: token,
+        revalidate: true,
+      });
+      setProjectToolchainInstructions(data.instructions || null);
+      await refreshProjectToolchainProfile();
+      await refreshProjects();
+    } catch (e) {
+      setProjectToolchainError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectToolchainApproving(false);
+    }
+  }, [activeProjectId, projectToolchainConfirmDraft, refreshProjectToolchainProfile, refreshProjects]);
+
+  useEffect(() => {
+    refreshProjectToolchainProfile().catch(() => {});
+  }, [refreshProjectToolchainProfile]);
+
+  const refreshProjectAutonomousOpsStatus = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectAutonomousOpsLoading(true);
+    try {
+      const ops = await autonomousApi.opsStatus({ project_id: activeProjectId, include_runs: true });
+      setProjectAutonomousOpsStatus(ops as AutonomousOpsStatusResponse);
+    } finally {
+      setProjectAutonomousOpsLoading(false);
+    }
+  }, [activeProjectId]);
+
+  const refreshProjectAutonomous = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectAutonomousLoading(true);
+    setProjectAutonomousError(null);
+    try {
+      const [backlog, runs, sessionsData, ops] = await Promise.all([
+        autonomousApi.listBacklog(activeProjectId),
+        autonomousApi.listRuns(activeProjectId),
+        sessionsApi.list(activeProjectId),
+        autonomousApi.opsStatus({ project_id: activeProjectId, include_runs: true }),
+      ]);
+      const backlogItems = Array.isArray(backlog.tasks) ? backlog.tasks : [];
+      const runItems = Array.isArray(runs.runs) ? runs.runs : [];
+      const liveSessions = Array.isArray(sessionsData.sessions) ? sessionsData.sessions : [];
+      setProjectAutonomousBacklog(backlogItems);
+      setProjectAutonomousRuns(runItems);
+      setProjectAutonomousLiveSessions(liveSessions);
+      if (!projectAutonomousRunSessionIdDraft && liveSessions.length > 0) {
+        setProjectAutonomousRunSessionIdDraft(liveSessions[0].session_id);
+      }
+      if (projectAutonomousRunSessionIdDraft && !liveSessions.some((s) => s.session_id === projectAutonomousRunSessionIdDraft)) {
+        setProjectAutonomousRunSessionIdDraft(liveSessions[0]?.session_id || "");
+      }
+      if (!projectAutonomousSelectedRunId && runItems.length > 0) {
+        setProjectAutonomousSelectedRunId(runItems[0].id);
+      }
+      if (projectAutonomousSelectedRunId && !runItems.some((r) => r.id === projectAutonomousSelectedRunId)) {
+        setProjectAutonomousSelectedRunId(runItems[0]?.id ?? null);
+      }
+      setProjectAutonomousOpsStatus(ops as AutonomousOpsStatusResponse);
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousLoading(false);
+    }
+  }, [activeProjectId, projectAutonomousRunSessionIdDraft, projectAutonomousSelectedRunId]);
+
+  const remediateProjectAutonomousStaleRuns = useCallback(async (dryRun: boolean) => {
+    if (!activeProjectId) return;
+    const olderThan = Number.parseInt(projectAutonomousRemediateOlderThanDraft, 10);
+    const maxRuns = Number.parseInt(projectAutonomousRemediateMaxRunsDraft, 10);
+    if (!Number.isFinite(olderThan) || olderThan < 60) {
+      setProjectAutonomousError("older_than_seconds must be >= 60");
+      return;
+    }
+    if (!Number.isFinite(maxRuns) || maxRuns < 1 || maxRuns > 2000) {
+      setProjectAutonomousError("max_runs must be between 1 and 2000");
+      return;
+    }
+
+    if (!dryRun) {
+      const approved = window.confirm(
+        `Apply stale remediation for project '${activeProjectId}'? This will move selected active runs to '${projectAutonomousRemediateActionDraft}'.`,
+      );
+      if (!approved) return;
+    }
+
+    setProjectAutonomousRemediateBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const result = await autonomousApi.remediateStaleRuns({
+        project_id: activeProjectId,
+        dry_run: dryRun,
+        confirm: !dryRun,
+        older_than_seconds: olderThan,
+        max_runs: maxRuns,
+        action: projectAutonomousRemediateActionDraft,
+        reason: dryRun ? "ui_preview" : "ui_apply",
+      });
+      setProjectAutonomousRemediateResult(result as AutonomousRemediateStaleResponse);
+      await refreshProjectAutonomous();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousRemediateBusy(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousRemediateActionDraft,
+    projectAutonomousRemediateMaxRunsDraft,
+    projectAutonomousRemediateOlderThanDraft,
+    refreshProjectAutonomous,
+  ]);
+
+  const createProjectAutonomousTask = useCallback(async () => {
+    if (!activeProjectId) return;
+    const title = projectAutonomousTaskTitleDraft.trim();
+    const goal = projectAutonomousTaskGoalDraft.trim();
+    const criteria = projectAutonomousTaskCriteriaDraft
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (!title || !goal || criteria.length === 0) {
+      setProjectAutonomousError("Title, goal, and at least one acceptance criterion are required.");
+      return;
+    }
+    setProjectAutonomousCreating(true);
+    setProjectAutonomousError(null);
+    try {
+      await autonomousApi.createBacklogTask(activeProjectId, {
+        title,
+        goal,
+        acceptance_criteria: criteria,
+        priority: projectAutonomousTaskPriorityDraft,
+        repository: projectAutonomousTaskRepositoryDraft.trim() || undefined,
+        branch: projectAutonomousTaskBranchDraft.trim() || undefined,
+      });
+      setProjectAutonomousTaskTitleDraft("");
+      setProjectAutonomousTaskGoalDraft("");
+      setProjectAutonomousTaskCriteriaDraft("");
+      setProjectAutonomousTaskPriorityDraft("medium");
+      setProjectAutonomousTaskRepositoryDraft("");
+      setProjectAutonomousTaskBranchDraft("");
+      await refreshProjectAutonomous();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousCreating(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousTaskBranchDraft,
+    projectAutonomousTaskCriteriaDraft,
+    projectAutonomousTaskGoalDraft,
+    projectAutonomousTaskPriorityDraft,
+    projectAutonomousTaskRepositoryDraft,
+    projectAutonomousTaskTitleDraft,
+    refreshProjectAutonomous,
+  ]);
+
+  const startProjectAutonomousRun = useCallback(async (taskId: string) => {
+    if (!activeProjectId) return;
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const run = await autonomousApi.createRun(activeProjectId, {
+        task_id: taskId,
+        auto_start: true,
+        session_id: projectAutonomousRunSessionIdDraft.trim() || undefined,
+      });
+      setProjectAutonomousSelectedRunId(run.id);
+      setProjectAutonomousReportData(null);
+      await refreshProjectAutonomous();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [activeProjectId, projectAutonomousRunSessionIdDraft, refreshProjectAutonomous]);
+
+  const dispatchNextProjectAutonomousRun = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const response = await autonomousApi.dispatchNextRun(activeProjectId, {
+        auto_start: true,
+        session_id: projectAutonomousRunSessionIdDraft.trim() || undefined,
+      });
+      setProjectAutonomousSelectedRunId(response.run.id);
+      setProjectAutonomousReportData(null);
+      await refreshProjectAutonomous();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [activeProjectId, projectAutonomousRunSessionIdDraft, refreshProjectAutonomous]);
+
+  const tickProjectAutonomousLoop = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const requiredChecks = projectAutonomousGitHubRequiredChecksDraft
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const response = await autonomousApi.loopTick(activeProjectId, {
+        auto_start: true,
+        session_id: projectAutonomousRunSessionIdDraft.trim() || undefined,
+        repository: projectAutonomousGitHubRepoDraft.trim() || undefined,
+        ref: projectAutonomousGitHubRefDraft.trim() || undefined,
+        pr_url: projectAutonomousGitHubPrUrlDraft.trim() || undefined,
+        required_checks: requiredChecks.length > 0 ? requiredChecks : undefined,
+        notes: projectAutonomousAdvanceNotesDraft.trim() || undefined,
+      });
+      if (response.action === "manual_evaluate_required") {
+        setProjectAutonomousError(`Loop tick deferred: ${response.reason || "manual evaluate required"}`);
+      }
+      if (response.run?.id) {
+        setProjectAutonomousSelectedRunId(response.run.id);
+      }
+      await refreshProjectAutonomous();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousAdvanceNotesDraft,
+    projectAutonomousGitHubRefDraft,
+    projectAutonomousGitHubPrUrlDraft,
+    projectAutonomousGitHubRepoDraft,
+    projectAutonomousGitHubRequiredChecksDraft,
+    projectAutonomousRunSessionIdDraft,
+    refreshProjectAutonomous,
+  ]);
+
+  const runCycleProjectAutonomous = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const requiredChecks = projectAutonomousGitHubRequiredChecksDraft
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const response = await autonomousApi.runCycle({
+        project_ids: [activeProjectId],
+        auto_start: true,
+        max_steps_per_project: 3,
+        session_id_by_project: projectAutonomousRunSessionIdDraft.trim()
+          ? { [activeProjectId]: projectAutonomousRunSessionIdDraft.trim() }
+          : undefined,
+        repository: projectAutonomousGitHubRepoDraft.trim() || undefined,
+        ref: projectAutonomousGitHubRefDraft.trim() || undefined,
+        pr_url: projectAutonomousGitHubPrUrlDraft.trim() || undefined,
+        required_checks: requiredChecks.length > 0 ? requiredChecks : undefined,
+        notes: projectAutonomousAdvanceNotesDraft.trim() || undefined,
+      });
+      const row = Array.isArray(response.results) ? response.results.find((r) => r.project_id === activeProjectId) : null;
+      setProjectAutonomousCycleSummary((response.summary as unknown as Record<string, unknown>) || null);
+      setProjectAutonomousCycleResult((row as unknown as Record<string, unknown>) || null);
+      if (row?.run?.id) {
+        setProjectAutonomousSelectedRunId(row.run.id);
+      }
+      if (row?.action === "manual_evaluate_required") {
+        setProjectAutonomousError(`Run Cycle deferred: ${row.reason || "manual evaluate required"}`);
+      }
+      await refreshProjectAutonomous();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousAdvanceNotesDraft,
+    projectAutonomousGitHubRefDraft,
+    projectAutonomousGitHubPrUrlDraft,
+    projectAutonomousGitHubRepoDraft,
+    projectAutonomousGitHubRequiredChecksDraft,
+    projectAutonomousRunSessionIdDraft,
+    refreshProjectAutonomous,
+  ]);
+
+  const selectedAutonomousRun = useMemo(
+    () => projectAutonomousRuns.find((r) => r.id === projectAutonomousSelectedRunId) || null,
+    [projectAutonomousRuns, projectAutonomousSelectedRunId],
+  );
+  const selectedAutonomousTask = useMemo(
+    () =>
+      selectedAutonomousRun
+        ? projectAutonomousBacklog.find((t) => t.id === selectedAutonomousRun.task_id) || null
+        : null,
+    [projectAutonomousBacklog, selectedAutonomousRun],
+  );
+  const projectAutonomousCycleOutcomes = useMemo(() => {
+    if (!projectAutonomousCycleSummary) return [];
+    const raw = projectAutonomousCycleSummary.outcomes;
+    if (!raw || typeof raw !== "object") return [];
+    return Object.entries(raw as Record<string, unknown>)
+      .map(([k, v]) => [k, Number(v)] as const)
+      .filter(([, v]) => Number.isFinite(v))
+      .sort((a, b) => b[1] - a[1]);
+  }, [projectAutonomousCycleSummary]);
+
+  const refreshProjectAutonomousReport = useCallback(async () => {
+    if (!activeProjectId || !projectAutonomousSelectedRunId) {
+      setProjectAutonomousReportData(null);
+      return;
+    }
+    try {
+      const report = await autonomousApi.report(activeProjectId, projectAutonomousSelectedRunId);
+      setProjectAutonomousReportData(report as unknown as Record<string, unknown>);
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    }
+  }, [activeProjectId, projectAutonomousSelectedRunId]);
+
+  useEffect(() => {
+    refreshProjectAutonomousReport().catch(() => {});
+  }, [refreshProjectAutonomousReport]);
+
+  const executeNextProjectAutonomousRun = useCallback(async () => {
+    if (!activeProjectId) return;
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const requiredChecks = projectAutonomousGitHubRequiredChecksDraft
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const response = await autonomousApi.executeNextRun(activeProjectId, {
+        auto_start: true,
+        max_steps: 8,
+        session_id: projectAutonomousRunSessionIdDraft.trim() || undefined,
+        repository: projectAutonomousGitHubRepoDraft.trim() || undefined,
+        ref: projectAutonomousGitHubRefDraft.trim() || undefined,
+        pr_url: projectAutonomousGitHubPrUrlDraft.trim() || undefined,
+        required_checks: requiredChecks.length > 0 ? requiredChecks : undefined,
+        notes: projectAutonomousAdvanceNotesDraft.trim() || undefined,
+      });
+      if (response.run?.id) {
+        setProjectAutonomousSelectedRunId(response.run.id);
+      }
+      if (!response.terminal && response.action === "manual_evaluate_required") {
+        setProjectAutonomousError(`Execute Next deferred: ${response.steps?.[0]?.reason || "manual evaluate required"}`);
+      }
+      setProjectAutonomousLastExecutionSnapshot({
+        source: "execute_next",
+        updated_at: Date.now(),
+        action: response.action ?? null,
+        terminal: response.terminal ?? false,
+        terminal_status: response.terminal_status ?? null,
+        status: response.status ?? null,
+        steps_executed: response.steps_executed ?? 0,
+        run_id: response.run?.id ?? response.run_id ?? null,
+        last_error: null,
+      });
+      await refreshProjectAutonomous();
+      await refreshProjectAutonomousReport();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setProjectAutonomousError(msg);
+      setProjectAutonomousLastExecutionSnapshot({
+        source: "execute_next",
+        updated_at: Date.now(),
+        action: "error",
+        terminal: false,
+        terminal_status: null,
+        status: null,
+        steps_executed: 0,
+        run_id: selectedAutonomousRun?.id ?? null,
+        last_error: msg,
+      });
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousAdvanceNotesDraft,
+    projectAutonomousGitHubRefDraft,
+    projectAutonomousGitHubPrUrlDraft,
+    projectAutonomousGitHubRepoDraft,
+    projectAutonomousGitHubRequiredChecksDraft,
+    projectAutonomousRunSessionIdDraft,
+    refreshProjectAutonomous,
+    refreshProjectAutonomousReport,
+    selectedAutonomousRun?.id,
+  ]);
+
+  useEffect(() => {
+    if (!selectedAutonomousTask) return;
+    if (!projectAutonomousGitHubRepoDraft && selectedAutonomousTask.repository) {
+      setProjectAutonomousGitHubRepoDraft(selectedAutonomousTask.repository);
+    }
+    if (!projectAutonomousGitHubRefDraft && selectedAutonomousTask.branch) {
+      setProjectAutonomousGitHubRefDraft(selectedAutonomousTask.branch);
+    }
+  }, [
+    projectAutonomousGitHubRefDraft,
+    projectAutonomousGitHubRepoDraft,
+    selectedAutonomousTask,
+  ]);
+
+  useEffect(() => {
+    if (projectAutonomousGitHubPrUrlDraft) return;
+    const report = projectAutonomousReportData;
+    if (!report || typeof report !== "object") return;
+    const reportObj = report as Record<string, unknown>;
+    const prObj = reportObj.pr;
+    if (!prObj || typeof prObj !== "object") return;
+    const url = String((prObj as Record<string, unknown>).url || "").trim();
+    if (url) setProjectAutonomousGitHubPrUrlDraft(url);
+  }, [projectAutonomousGitHubPrUrlDraft, projectAutonomousReportData]);
+
+  const advanceProjectAutonomousRun = useCallback(async () => {
+    if (!activeProjectId || !selectedAutonomousRun) return;
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      await autonomousApi.advanceRun(activeProjectId, selectedAutonomousRun.id, {
+        stage: selectedAutonomousRun.current_stage,
+        result: projectAutonomousAdvanceResultDraft,
+        notes: projectAutonomousAdvanceNotesDraft.trim() || undefined,
+      });
+      setProjectAutonomousAdvanceNotesDraft("");
+      await refreshProjectAutonomous();
+      await refreshProjectAutonomousReport();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousAdvanceNotesDraft,
+    projectAutonomousAdvanceResultDraft,
+    refreshProjectAutonomous,
+    refreshProjectAutonomousReport,
+    selectedAutonomousRun,
+  ]);
+
+  const runUntilTerminalProjectAutonomousRun = useCallback(async () => {
+    if (!activeProjectId || !selectedAutonomousRun) return;
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const requiredChecks = projectAutonomousGitHubRequiredChecksDraft
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const response = await autonomousApi.runUntilTerminal(activeProjectId, selectedAutonomousRun.id, {
+        max_steps: 8,
+        auto_start: true,
+        session_id: projectAutonomousRunSessionIdDraft.trim() || undefined,
+        repository: projectAutonomousGitHubRepoDraft.trim() || undefined,
+        ref: projectAutonomousGitHubRefDraft.trim() || undefined,
+        pr_url: projectAutonomousGitHubPrUrlDraft.trim() || undefined,
+        required_checks: requiredChecks.length > 0 ? requiredChecks : undefined,
+        notes: projectAutonomousAdvanceNotesDraft.trim() || undefined,
+      });
+      setProjectAutonomousCycleResult({
+        action: response.action,
+        terminal: response.terminal,
+        terminal_status: response.terminal_status || null,
+        steps_executed: response.steps_executed,
+        run_id: response.run_id,
+        status: response.status,
+      });
+      setProjectAutonomousLastExecutionSnapshot({
+        source: "run_until_terminal",
+        updated_at: Date.now(),
+        action: response.action ?? null,
+        terminal: response.terminal ?? false,
+        terminal_status: response.terminal_status ?? null,
+        status: response.status ?? null,
+        steps_executed: response.steps_executed ?? 0,
+        run_id: response.run?.id ?? response.run_id ?? null,
+        last_error: null,
+      });
+      setProjectAutonomousSelectedRunId(response.run.id);
+      await refreshProjectAutonomous();
+      await refreshProjectAutonomousReport();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setProjectAutonomousError(msg);
+      setProjectAutonomousLastExecutionSnapshot({
+        source: "run_until_terminal",
+        updated_at: Date.now(),
+        action: "error",
+        terminal: false,
+        terminal_status: null,
+        status: null,
+        steps_executed: 0,
+        run_id: selectedAutonomousRun?.id ?? null,
+        last_error: msg,
+      });
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousAdvanceNotesDraft,
+    projectAutonomousGitHubRefDraft,
+    projectAutonomousGitHubPrUrlDraft,
+    projectAutonomousGitHubRepoDraft,
+    projectAutonomousGitHubRequiredChecksDraft,
+    projectAutonomousRunSessionIdDraft,
+    refreshProjectAutonomous,
+    refreshProjectAutonomousReport,
+    selectedAutonomousRun,
+    selectedAutonomousRun?.id,
+  ]);
+
+  const evaluateProjectAutonomousRun = useCallback(async () => {
+    if (!activeProjectId || !selectedAutonomousRun) return;
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const checks = projectAutonomousChecksDraft
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const [nameRaw, resultRaw] = line.split(":");
+          const name = (nameRaw || "").trim();
+          const resultText = (resultRaw || "pass").trim().toLowerCase();
+          return {
+            name,
+            passed: resultText === "pass" || resultText === "ok" || resultText === "success",
+            severity: "error" as const,
+            details: "",
+          };
+        })
+        .filter((c) => c.name);
+      if (checks.length === 0) {
+        setProjectAutonomousError("Checks cannot be empty. Use one per line: check_name:pass|fail");
+        return;
+      }
+      await autonomousApi.evaluateRun(activeProjectId, selectedAutonomousRun.id, {
+        stage: selectedAutonomousRun.current_stage,
+        source: "ui_checks",
+        checks,
+        notes: projectAutonomousAdvanceNotesDraft.trim() || undefined,
+      });
+      setProjectAutonomousAdvanceNotesDraft("");
+      await refreshProjectAutonomous();
+      await refreshProjectAutonomousReport();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousAdvanceNotesDraft,
+    projectAutonomousChecksDraft,
+    refreshProjectAutonomous,
+    refreshProjectAutonomousReport,
+    selectedAutonomousRun,
+  ]);
+
+  const evaluateProjectAutonomousRunFromGitHub = useCallback(async () => {
+    if (!activeProjectId || !selectedAutonomousRun) return;
+    const repo = projectAutonomousGitHubRepoDraft.trim();
+    const ref = projectAutonomousGitHubRefDraft.trim();
+    const prUrl = projectAutonomousGitHubPrUrlDraft.trim();
+    if ((!repo || !ref) && !prUrl) {
+      setProjectAutonomousError("Provide repository+ref or PR URL for GitHub evaluate.");
+      return;
+    }
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const requiredChecks = projectAutonomousGitHubRequiredChecksDraft
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      await autonomousApi.evaluateRunFromGitHub(activeProjectId, selectedAutonomousRun.id, {
+        stage: selectedAutonomousRun.current_stage,
+        repository: repo,
+        ref,
+        required_checks: requiredChecks.length > 0 ? requiredChecks : undefined,
+        pr_url: prUrl || undefined,
+        notes: projectAutonomousAdvanceNotesDraft.trim() || undefined,
+      });
+      await refreshProjectAutonomous();
+      await refreshProjectAutonomousReport();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousAdvanceNotesDraft,
+    projectAutonomousGitHubRefDraft,
+    projectAutonomousGitHubPrUrlDraft,
+    projectAutonomousGitHubRepoDraft,
+    projectAutonomousGitHubRequiredChecksDraft,
+    refreshProjectAutonomous,
+    refreshProjectAutonomousReport,
+    selectedAutonomousRun,
+  ]);
+
+  const autoNextProjectAutonomousRun = useCallback(async () => {
+    if (!activeProjectId || !selectedAutonomousRun) return;
+    const stage = selectedAutonomousRun.current_stage;
+    if (stage !== "review" && stage !== "validation") {
+      setProjectAutonomousError(`Auto Next supports review/validation stages only (current: ${stage}).`);
+      return;
+    }
+    const repo = projectAutonomousGitHubRepoDraft.trim();
+    const ref = projectAutonomousGitHubRefDraft.trim();
+    const prUrl = projectAutonomousGitHubPrUrlDraft.trim();
+    if ((!repo || !ref) && !prUrl) {
+      setProjectAutonomousError("Auto Next requires repo+ref or PR URL for GitHub checks.");
+      return;
+    }
+    setProjectAutonomousActionBusy(true);
+    setProjectAutonomousError(null);
+    try {
+      const requiredChecks = projectAutonomousGitHubRequiredChecksDraft
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+      await autonomousApi.autoNextRun(activeProjectId, selectedAutonomousRun.id, {
+        repository: repo,
+        ref,
+        required_checks: requiredChecks.length > 0 ? requiredChecks : undefined,
+        pr_url: prUrl || undefined,
+        notes: projectAutonomousAdvanceNotesDraft.trim() || undefined,
+      });
+      await refreshProjectAutonomous();
+      await refreshProjectAutonomousReport();
+    } catch (e) {
+      setProjectAutonomousError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAutonomousActionBusy(false);
+    }
+  }, [
+    activeProjectId,
+    projectAutonomousAdvanceNotesDraft,
+    projectAutonomousGitHubRefDraft,
+    projectAutonomousGitHubPrUrlDraft,
+    projectAutonomousGitHubRepoDraft,
+    projectAutonomousGitHubRequiredChecksDraft,
+    refreshProjectAutonomous,
+    refreshProjectAutonomousReport,
+    selectedAutonomousRun,
+  ]);
+
+  const createProjectFromForm = useCallback(async () => {
+    const name = projectNameDraft.trim();
+    if (!name) {
+      setProjectCreateError("Project name is required");
+      return;
+    }
+    if (projectOnboardEnabled && !projectWorkspacePathDraft.trim()) {
+      setProjectCreateError("Workspace path is required when onboarding is enabled");
+      return;
+    }
+    setProjectBusy(true);
+    setProjectCreateError(null);
+    try {
+      const repository = projectRepositoryDraft.trim() || undefined;
+      const created = await projectsApi.create(
+        name,
+        projectDescriptionDraft.trim() || undefined,
+        repository,
+      );
+      if (projectOnboardEnabled) {
+        await projectsApi.onboarding(created.id, {
+          template_id: projectTemplateIdDraft || undefined,
+          repository,
+          workspace_path: projectWorkspacePathDraft.trim() || undefined,
+          stack: projectStackDraft,
+          repo_type: selectedProjectTemplate?.repo_type || "single",
+          create_manifest: true,
+          dry_run: true,
+        });
+      }
+      await refreshProjects();
+      setActiveProjectId(created.id);
+      localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, created.id);
+      setProjectModalOpen(false);
+      setProjectNameDraft("");
+      setProjectDescriptionDraft("");
+      setProjectRepositoryDraft("");
+      setProjectWorkspacePathDraft("");
+      setProjectStackDraft("node");
+      setProjectTemplateIdDraft(DEFAULT_PROJECT_TEMPLATE_ID);
+      setProjectOnboardEnabled(true);
+    } catch (e) {
+      const message = e instanceof ApiError
+        ? `Create/onboarding failed: ${e.message || `HTTP ${e.status}`}`
+        : String(e);
+      setProjectCreateError(message);
+    } finally {
+      setProjectBusy(false);
+    }
+  }, [
+    projectDescriptionDraft,
+    projectNameDraft,
+    projectOnboardEnabled,
+    projectRepositoryDraft,
+    projectStackDraft,
+    projectTemplateIdDraft,
+    projectWorkspacePathDraft,
+    refreshProjects,
+    selectedProjectTemplate,
+  ]);
+
+  const apiCreateSession = useCallback(
+    (
+      agentPath?: string,
+      agentId?: string,
+      model?: string,
+      initialPrompt?: string,
+      queenResumeFrom?: string,
+    ) => sessionsApi.create(agentPath, agentId, model, initialPrompt, queenResumeFrom, activeProjectId),
+    [activeProjectId],
+  );
+  const apiListSessions = useCallback(
+    () => sessionsApi.list(activeProjectId),
+    [activeProjectId],
+  );
+  const apiHistorySessions = useCallback(
+    () => sessionsApi.history(activeProjectId),
+    [activeProjectId],
+  );
 
   const updateAgentState = useCallback((agentType: string, patch: Partial<AgentBackendState>) => {
     setAgentStates(prev => ({
@@ -795,7 +2212,7 @@ export default function Workspace() {
         // home and must always get its own session.
         if (!liveSession && !coldRestoreId && !prompt) {
           try {
-            const { sessions: allLive } = await sessionsApi.list();
+            const { sessions: allLive } = await apiListSessions();
             const existing = allLive.find(s => !s.has_worker && !s.agent_path);
             if (existing) {
               const alreadyOwned = Object.values(sessionsRef.current).flat()
@@ -809,7 +2226,7 @@ export default function Workspace() {
           // If no live session, check history for a cold queen-only session
           if (!liveSession) {
             try {
-              const { sessions: allHistory } = await sessionsApi.history();
+              const { sessions: allHistory } = await apiHistorySessions();
               const coldMatch = allHistory.find(
                 s => !s.agent_path && s.has_messages
               );
@@ -859,7 +2276,7 @@ export default function Workspace() {
 
           // Pass coldRestoreId as queenResumeFrom so the backend writes queen
           // messages into the ORIGINAL session's directory.
-          liveSession = await sessionsApi.create(undefined, undefined, undefined, prompt, coldRestoreId ?? undefined);
+          liveSession = await apiCreateSession(undefined, undefined, undefined, prompt, coldRestoreId ?? undefined);
 
           if (preRestoredMsgs.length > 0) {
             preRestoredMsgs.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
@@ -976,7 +2393,7 @@ export default function Workspace() {
       // or server restarted with conversation files on disk).
       if (!liveSession && !coldRestoreId) {
         try {
-          const { sessions: allLive } = await sessionsApi.list();
+          const { sessions: allLive } = await apiListSessions();
           const existingLive = allLive.find(s => s.agent_path.endsWith(agentPath));
           if (existingLive) {
             const alreadyOwned = Object.values(sessionsRef.current).flat()
@@ -991,7 +2408,7 @@ export default function Workspace() {
         // If no live session, check history for a cold session to restore
         if (!liveSession) {
           try {
-            const { sessions: allHistory } = await sessionsApi.history();
+            const { sessions: allHistory } = await apiHistorySessions();
             const coldMatch = allHistory.find(
               s => s.agent_path?.endsWith(agentPath) && s.has_messages
             );
@@ -1056,7 +2473,7 @@ export default function Workspace() {
           // Pass coldRestoreId as queenResumeFrom so the backend writes queen
           // messages into the ORIGINAL session's directory — all conversation
           // history accumulates in one place across server restarts.
-          liveSession = await sessionsApi.create(agentPath, undefined, undefined, undefined, coldRestoreId ?? undefined);
+          liveSession = await apiCreateSession(agentPath, undefined, undefined, undefined, coldRestoreId ?? undefined);
         } catch (loadErr: unknown) {
           // 424 = credentials required — open the credentials modal
           if (loadErr instanceof ApiError && loadErr.status === 424) {
@@ -1211,7 +2628,7 @@ export default function Workspace() {
     } finally {
       loadingRef.current.delete(agentType);
     }
-  }, [updateAgentState, initialPrompt]);
+  }, [updateAgentState, initialPrompt, apiCreateSession, apiListSessions, apiHistorySessions]);
 
   // Auto-load agents when new tabs appear in sessionsByAgent.
   // Only eagerly load the active tab — background tabs are deferred until the
@@ -1548,7 +2965,7 @@ export default function Workspace() {
             if (idx >= 0) {
               // Update existing message in place, preserve position
               newMessages = s.messages.map((m, i) =>
-                i === idx ? { ...chatMsg, createdAt: m.createdAt ?? chatMsg.createdAt } : m,
+                i === idx ? { ...m, ...chatMsg, createdAt: m.createdAt ?? chatMsg.createdAt } : m,
               );
             } else {
               const shouldReconcileOptimisticUser =
@@ -2558,6 +3975,16 @@ export default function Workspace() {
         hasRunning: session.graphNodes.some(n => n.status === "running" || n.status === "looping"),
       };
     });
+  const openHistorySessionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const sessions of Object.values(sessionsByAgent)) {
+      for (const s of sessions) {
+        if (s.backendSessionId) ids.add(s.backendSessionId);
+        if (s.historySourceId) ids.add(s.historySourceId);
+      }
+    }
+    return Array.from(ids);
+  }, [sessionsByAgent]);
 
   // --- handleSend ---
   const handleSend = useCallback((text: string, thread: string, images?: import("@/components/ChatPanel").ImageContent[]) => {
@@ -2588,8 +4015,9 @@ export default function Workspace() {
       updateAgentState(activeWorker, { pendingQuestion: null, pendingOptions: null, pendingQuestions: null, pendingQuestionSource: null });
     }
 
+    const clientMessageId = makeId();
     const userMsg: ChatMessage = {
-      id: makeId(), agent: "You", agentColor: "",
+      id: clientMessageId, agent: "You", agentColor: "",
       content: text, timestamp: "", type: "user", thread, createdAt: Date.now(),
       images,
     };
@@ -2603,7 +4031,7 @@ export default function Workspace() {
     updateAgentState(activeWorker, { isTyping: true, queenIsTyping: true });
 
     if (state?.sessionId && state?.ready) {
-      executionApi.chat(state.sessionId, text, images).catch((err: unknown) => {
+      executionApi.chat(state.sessionId, text, images, undefined, clientMessageId).catch((err: unknown) => {
         const errMsg = err instanceof Error ? err.message : String(err);
         const errorChatMsg: ChatMessage = {
           id: makeId(), agent: "System", agentColor: "",
@@ -2860,25 +4288,76 @@ export default function Workspace() {
     if (!sid) return;
     // Fetch agent metadata from the backend so handleHistoryOpen gets the right
     // agentPath and agentName (needed to label the tab correctly).
-    sessionsApi.history().then(r => {
+    apiHistorySessions().then(r => {
       const match = r.sessions.find((s: { session_id: string }) => s.session_id === sid);
+      if (!match) {
+        // Enforce project boundary: do not auto-open a session that is not in
+        // the active project's history list.
+        return;
+      }
       handleHistoryOpen(
         sid,
-        match?.agent_path ?? initialAgentRef.current !== "new-agent" ? initialAgentRef.current : null,
-        match?.agent_name ?? null,
+        match.agent_path ?? (initialAgentRef.current !== "new-agent" ? initialAgentRef.current : null),
+        match.agent_name ?? null,
       );
     }).catch(() => {
-      // History fetch failed — still open the session with what we know.
-      handleHistoryOpen(
-        sid,
-        initialAgentRef.current !== "new-agent" ? initialAgentRef.current : null,
-        null,
-      );
+      // History fetch failed — skip auto-open to avoid crossing project boundaries.
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const activeWorkerLabel = activeAgentState?.displayName || formatAgentDisplayName(baseAgentType(activeWorker));
+  const readinessSummary = credentialReadiness?.summary;
+  const readinessMissingRequiredList = credentialReadiness?.missing.required ?? [];
+  const readinessMissingRequiredCount = readinessSummary?.required_missing ?? 0;
+  const readinessBadgeTone = credentialReadinessError
+    ? "border-destructive/50 bg-destructive/10 text-destructive"
+    : readinessSummary?.ready
+      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300"
+      : "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-300";
+  const readinessTitle = credentialReadinessError
+    ? `Credentials readiness error: ${credentialReadinessError}`
+    : readinessSummary
+      ? `Required ${readinessSummary.required_available}/${readinessSummary.required_total}, missing: ${readinessMissingRequiredList.join(", ") || "none"}`
+      : "Credentials readiness is not loaded yet";
+  const readinessRequiredRows = credentialReadiness?.required ?? [];
+  const readinessOptionalRows = credentialReadiness?.optional ?? [];
+  const readinessProviders = credentialReadiness?.providers ?? [];
+  const readinessBundleEnvVars = useMemo(
+    () => new Set([...readinessRequiredRows, ...readinessOptionalRows].map((row) => row.env_var)),
+    [readinessOptionalRows, readinessRequiredRows],
+  );
+  const readinessProvidersMissing = useMemo(
+    () => readinessProviders.filter((row) => row.credentials_missing > 0),
+    [readinessProviders],
+  );
+  const readinessProvidersBundleScoped = useMemo(
+    () =>
+      readinessProvidersMissing.filter((row) =>
+        row.env_vars.some((envVar) => readinessBundleEnvVars.has(envVar)) ||
+        row.missing_env_vars.some((envVar) => readinessBundleEnvVars.has(envVar)),
+      ),
+    [readinessBundleEnvVars, readinessProvidersMissing],
+  );
+  const readinessProvidersVisible = useMemo(() => {
+    if (credentialReadinessShowAllProviders || readinessProvidersBundleScoped.length === 0) {
+      return readinessProvidersMissing;
+    }
+    return readinessProvidersBundleScoped;
+  }, [
+    credentialReadinessShowAllProviders,
+    readinessProvidersBundleScoped,
+    readinessProvidersMissing,
+  ]);
+  const readinessHiddenProviderCount = Math.max(
+    0,
+    readinessProvidersMissing.length - readinessProvidersVisible.length,
+  );
+  const credentialsButtonTone = credentialReadinessError
+    ? "text-destructive border-destructive/40 bg-destructive/10"
+    : readinessMissingRequiredCount > 0
+      ? "text-amber-300 border-amber-500/40 bg-amber-500/10"
+      : "text-muted-foreground";
 
   return (
     <div className="flex flex-col h-screen bg-background overflow-hidden">
@@ -2907,7 +4386,6 @@ export default function Workspace() {
               open={newTabOpen}
               onClose={() => setNewTabOpen(false)}
               anchorRef={newTabBtnRef}
-              activeWorker={activeWorker}
               discoverAgents={discoverAgents}
               onFromScratch={() => { addAgentSession("new-agent"); }}
               onCloneAgent={(agentPath, agentName) => { addAgentSession(agentPath, agentName); }}
@@ -2915,27 +4393,1378 @@ export default function Workspace() {
           </>
         }
       >
+        <div className="flex items-center gap-1.5">
+          <select
+            value={activeProjectId}
+            onChange={(e) => {
+              const next = e.target.value;
+              setActiveProjectId(next);
+              localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, next);
+            }}
+            className="h-7 max-w-[180px] rounded-md border border-border/60 bg-background px-2 text-[11px] text-foreground"
+            title="Active project"
+          >
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={() => {
+              setProjectCreateError(null);
+              setProjectModalOpen(true);
+            }}
+            disabled={projectBusy}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors disabled:opacity-50"
+            title="Create project"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Project
+          </button>
+          <div className="hidden lg:flex items-center gap-1 ml-1">
+            <span className="px-1.5 py-1 rounded border border-border/60 bg-background text-[10px] text-muted-foreground">
+              Exec {projectMetrics?.summary.executions_total ?? 0}
+            </span>
+            <span className="px-1.5 py-1 rounded border border-border/60 bg-background text-[10px] text-muted-foreground">
+              SR {formatPct(projectMetrics?.kpis.success_rate)}
+            </span>
+            <span className="px-1.5 py-1 rounded border border-border/60 bg-background text-[10px] text-muted-foreground">
+              P50 {formatSeconds(projectMetrics?.kpis.cycle_time_seconds_p50)}
+            </span>
+            <span className="px-1.5 py-1 rounded border border-border/60 bg-background text-[10px] text-muted-foreground">
+              HITL {formatPct(projectMetrics?.kpis.intervention_ratio ?? 0)}
+            </span>
+            <button
+              onClick={() => {
+                setProjectRetentionOpen(true);
+                setProjectRetentionRunResult(null);
+                refreshProjectRetention().catch(() => {});
+              }}
+              className={`px-1.5 py-1 rounded border text-[10px] ${
+                (projectRetentionData?.plan.eligible_count ?? 0) > 0
+                  ? "border-destructive/50 bg-destructive/10 text-destructive"
+                  : "border-border/60 bg-background text-muted-foreground"
+              }`}
+              title="Open retention plan"
+            >
+              Eligible {projectRetentionData?.plan.eligible_count ?? "--"}
+            </button>
+            <button
+              onClick={() => refreshProjectMetrics().catch(() => {})}
+              disabled={projectMetricsLoading}
+              className="h-6 w-6 inline-flex items-center justify-center rounded border border-border/60 bg-background text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+              title={projectMetricsError ? `Metrics error: ${projectMetricsError}` : "Refresh project metrics"}
+            >
+              <RefreshCw className={`w-3 h-3 ${projectMetricsLoading ? "animate-spin" : ""}`} />
+            </button>
+            <button
+              onClick={() => {
+                setProjectMetricsBoardOpen(true);
+                refreshProjectMetricsBoard().catch(() => {});
+              }}
+              className="h-6 px-2 inline-flex items-center justify-center rounded border border-border/60 bg-background text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              title="Open cross-project KPI board"
+            >
+              Board
+            </button>
+            <button
+              onClick={() => {
+                setProjectRetentionOpen(true);
+                setProjectRetentionRunResult(null);
+                refreshProjectRetention().catch(() => {});
+              }}
+              className="h-6 px-2 inline-flex items-center justify-center rounded border border-border/60 bg-background text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              title="Open project retention and archive controls"
+            >
+              Retention
+            </button>
+            <button
+              onClick={() => {
+                setProjectExecutionOpen(true);
+                refreshProjectExecutionTemplate().catch(() => {});
+              }}
+              className="h-6 px-2 inline-flex items-center justify-center rounded border border-border/60 bg-background text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              title="Open project execution template and policy binding"
+            >
+              Flow
+            </button>
+            <button
+              onClick={() => {
+                setProjectToolchainOpen(true);
+                setProjectToolchainInstructions(null);
+                refreshProjectToolchainProfile().catch(() => {});
+              }}
+              className="h-6 px-2 inline-flex items-center justify-center rounded border border-border/60 bg-background text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              title="Plan and approve project toolchain profile"
+            >
+              Toolchain
+            </button>
+            <button
+              onClick={() => {
+                setProjectAutonomousOpen(true);
+                refreshProjectAutonomous().catch(() => {});
+              }}
+              className="h-6 px-2 inline-flex items-center justify-center rounded border border-border/60 bg-background text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              title="Open autonomous backlog and pipeline"
+            >
+              Auto
+            </button>
+          </div>
+        </div>
+        <div className="hidden xl:flex items-center gap-1">
+          <button
+            onClick={() => {
+              setCredentialReadinessShowAllProviders(false);
+              setCredentialReadinessOpen(true);
+            }}
+            className={`px-1.5 py-1 rounded border text-[10px] ${readinessBadgeTone}`}
+            title={readinessTitle}
+          >
+            Cred {readinessSummary?.required_available ?? "--"}/{readinessSummary?.required_total ?? "--"}
+          </button>
+          <button
+            onClick={() => refreshCredentialReadiness().catch(() => {})}
+            disabled={credentialReadinessLoading}
+            className="h-6 w-6 inline-flex items-center justify-center rounded border border-border/60 bg-background text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+            title={credentialReadinessError ? `Readiness error: ${credentialReadinessError}` : "Refresh credentials readiness"}
+          >
+            <RefreshCw className={`w-3 h-3 ${credentialReadinessLoading ? "animate-spin" : ""}`} />
+          </button>
+        </div>
         <button
           onClick={() => setCredentialsOpen(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border border-transparent hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0 ${credentialsButtonTone}`}
+          title={readinessTitle}
         >
           <KeyRound className="w-3.5 h-3.5" />
           Credentials
+          {readinessMissingRequiredCount > 0 && (
+            <span className="inline-flex h-4 min-w-4 items-center justify-center rounded-full border border-amber-500/40 bg-amber-500/20 px-1 text-[10px] leading-none text-amber-200">
+              {readinessMissingRequiredCount}
+            </span>
+          )}
         </button>
         {activeAgentState?.sessionId && (
-          <button
-            onClick={() => sessionsApi.revealFolder(activeAgentState.sessionId!).catch(() => {})}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
-            title="Open session data folder"
-          >
-            <FolderOpen className="w-3.5 h-3.5" />
-            Data
-          </button>
+          <>
+            <button
+              onClick={async () => {
+                const sessionId = activeAgentState.sessionId;
+                if (!sessionId) return;
+                try {
+                  const result = await sessionsApi.revealFolder(sessionId);
+                  if (result.opened === false) {
+                    let copied = false;
+                    if (navigator.clipboard?.writeText) {
+                      await navigator.clipboard.writeText(result.path).then(() => {
+                        copied = true;
+                      }).catch(() => {});
+                    }
+                    const details = result.error ? `\nReason: ${result.error}` : "";
+                    const hint = result.hint ? `\nHint: ${result.hint}` : "";
+                    const copyLine = copied ? "\nPath copied to clipboard." : "";
+                    window.alert(`Could not open folder automatically.\nPath: ${result.path}${details}${hint}${copyLine}`);
+                  }
+                } catch (e) {
+                  const msg = e instanceof Error ? e.message : String(e);
+                  window.alert(`Failed to open session folder: ${msg}`);
+                }
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
+              title="Open session data folder"
+            >
+              <FolderOpen className="w-3.5 h-3.5" />
+              Data
+            </button>
+            <button
+              onClick={async () => {
+                const sessionId = activeAgentState.sessionId;
+                if (!sessionId) return;
+                try {
+                  const { blob, filename } = await sessionsApi.exportArchive(sessionId);
+                  const url = URL.createObjectURL(blob);
+                  const anchor = document.createElement("a");
+                  anchor.href = url;
+                  anchor.download = filename;
+                  document.body.appendChild(anchor);
+                  anchor.click();
+                  anchor.remove();
+                  window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+                } catch (e) {
+                  const msg = e instanceof Error ? e.message : String(e);
+                  window.alert(`Failed to export session folder: ${msg}`);
+                }
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
+              title="Download session data archive (.zip)"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Export
+            </button>
+          </>
         )}
       </TopBar>
 
+      {credentialReadinessOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div className="w-full max-w-2xl rounded-xl border border-border/60 bg-card shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border/50">
+              <h3 className="text-sm font-semibold text-foreground">Credential Readiness</h3>
+              <button
+                onClick={() => setCredentialReadinessOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 space-y-4">
+              <div className={`rounded-md border px-3 py-2 text-xs ${readinessBadgeTone}`}>
+                <div className="font-medium">
+                  Required: {readinessSummary?.required_available ?? "--"}/{readinessSummary?.required_total ?? "--"}
+                  {readinessMissingRequiredCount > 0 ? ` (missing ${readinessMissingRequiredCount})` : " (ready)"}
+                </div>
+                <div className="mt-1 opacity-90">
+                  Optional: {readinessSummary?.optional_available ?? "--"}/{readinessSummary?.optional_total ?? "--"}
+                </div>
+              </div>
+              {credentialReadinessError ? (
+                <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  {credentialReadinessError}
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+                  <div className="rounded-md border border-border/60 bg-background/40 p-3">
+                    <div className="text-xs font-semibold text-foreground mb-2">Required</div>
+                    <div className="space-y-1 max-h-44 overflow-y-auto">
+                      {readinessRequiredRows.map((row) => (
+                        <div key={`required-${row.env_var}`} className="flex items-center justify-between text-[11px]">
+                          <span className="text-muted-foreground">{row.env_var}</span>
+                          <span className={row.available ? "text-emerald-400" : "text-amber-300"}>
+                            {row.available ? "ok" : "missing"}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-border/60 bg-background/40 p-3">
+                    <div className="text-xs font-semibold text-foreground mb-2">Optional</div>
+                    <div className="space-y-1 max-h-44 overflow-y-auto">
+                      {readinessOptionalRows.map((row) => (
+                        <div key={`optional-${row.env_var}`} className="flex items-center justify-between text-[11px]">
+                          <span className="text-muted-foreground">{row.env_var}</span>
+                          <span className={row.available ? "text-emerald-400" : "text-muted-foreground/70"}>
+                            {row.available ? "ok" : "not set"}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {!credentialReadinessError && (
+                <div className="rounded-md border border-border/60 bg-background/40 p-3">
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <div className="text-xs font-semibold text-foreground">
+                      Provider Gaps ({readinessProvidersVisible.length})
+                    </div>
+                    {readinessProvidersMissing.length > readinessProvidersBundleScoped.length && (
+                      <button
+                        onClick={() =>
+                          setCredentialReadinessShowAllProviders((prev) => !prev)
+                        }
+                        className="text-[10px] px-2 py-1 rounded border border-border/60 bg-background text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                        title="Toggle between bundle-scoped and all provider gaps"
+                      >
+                        {credentialReadinessShowAllProviders
+                          ? "Show bundle-only"
+                          : `Show all (+${readinessHiddenProviderCount})`}
+                      </button>
+                    )}
+                  </div>
+                  {readinessProvidersVisible.length === 0 ? (
+                    <div className="text-[11px] text-muted-foreground">
+                      No provider gaps for this bundle.
+                    </div>
+                  ) : (
+                    <div className="space-y-1 max-h-40 overflow-y-auto">
+                      {readinessProvidersVisible.map((row) => (
+                        <div key={row.provider} className="text-[11px] text-muted-foreground">
+                          {row.provider}: {row.credentials_available}/{row.credentials_total}
+                          {`, missing ${row.missing_env_vars.join(", ")}`}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border/50">
+              <button
+                onClick={() => refreshCredentialReadiness().catch(() => {})}
+                disabled={credentialReadinessLoading}
+                className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+              >
+                {credentialReadinessLoading ? "Refreshing..." : "Refresh"}
+              </button>
+              <button
+                onClick={() => {
+                  setCredentialReadinessOpen(false);
+                  setCredentialsOpen(true);
+                }}
+                className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90"
+              >
+                Open Credentials
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {projectModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div className="w-full max-w-md rounded-xl border border-border/60 bg-card shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border/50">
+              <h3 className="text-sm font-semibold text-foreground">Create Project</h3>
+              <button
+                onClick={() => setProjectModalOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              <div>
+                <label className="block text-[11px] text-muted-foreground mb-1">Name</label>
+                <input
+                  autoFocus
+                  value={projectNameDraft}
+                  onChange={(e) => setProjectNameDraft(e.target.value)}
+                  className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                  placeholder="Payments Platform"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] text-muted-foreground mb-1">Repository (optional)</label>
+                <input
+                  value={projectRepositoryDraft}
+                  onChange={(e) => setProjectRepositoryDraft(e.target.value)}
+                  className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                  placeholder="github.com/org/repo"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] text-muted-foreground mb-1">Description (optional)</label>
+                <textarea
+                  value={projectDescriptionDraft}
+                  onChange={(e) => setProjectDescriptionDraft(e.target.value)}
+                  className="w-full min-h-[72px] rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40 resize-y"
+                  placeholder="Core backend services and APIs"
+                />
+              </div>
+              <div className="rounded-md border border-border/60 bg-background/50 p-3 space-y-2">
+                <label className="flex items-center gap-2 text-[11px] text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={projectOnboardEnabled}
+                    onChange={(e) => setProjectOnboardEnabled(e.target.checked)}
+                    className="h-3.5 w-3.5 rounded border-border/70 bg-background"
+                  />
+                  Run project onboarding after create
+                </label>
+                {projectOnboardEnabled && (
+                  <>
+                    <div>
+                      <label className="block text-[11px] text-muted-foreground mb-1">Template profile</label>
+                      <select
+                        value={projectTemplateIdDraft}
+                        onChange={(e) => {
+                          const nextId = e.target.value;
+                          setProjectTemplateIdDraft(nextId);
+                          const nextTemplate = projectTemplates.find((t) => t.id === nextId);
+                          if (nextTemplate) {
+                            setProjectStackDraft(nextTemplate.stack);
+                          }
+                        }}
+                        className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                      >
+                        {projectTemplates.length === 0 ? (
+                          <option value={projectTemplateIdDraft}>custom</option>
+                        ) : (
+                          projectTemplates.map((tpl) => (
+                            <option key={tpl.id} value={tpl.id}>
+                              {tpl.name}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                      {selectedProjectTemplate && (
+                        <div className="mt-1 text-[10px] text-muted-foreground">
+                          {selectedProjectTemplate.description}
+                        </div>
+                      )}
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-muted-foreground mb-1">Workspace path</label>
+                      <input
+                        value={projectWorkspacePathDraft}
+                        onChange={(e) => setProjectWorkspacePathDraft(e.target.value)}
+                        className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                        placeholder="/absolute/path/to/repository"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-muted-foreground mb-1">Stack</label>
+                      <select
+                        value={projectStackDraft}
+                        onChange={(e) => setProjectStackDraft(e.target.value as "node" | "python" | "go" | "jvm" | "rust" | "fullstack")}
+                        className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                      >
+                        <option value="node">node</option>
+                        <option value="python">python</option>
+                        <option value="go">go</option>
+                        <option value="jvm">jvm</option>
+                        <option value="rust">rust</option>
+                        <option value="fullstack">fullstack</option>
+                      </select>
+                    </div>
+                  </>
+                )}
+              </div>
+              {projectCreateError && (
+                <div className="text-xs text-destructive">{projectCreateError}</div>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-border/50">
+              <button
+                onClick={() => setProjectModalOpen(false)}
+                className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { createProjectFromForm().catch((e) => setProjectCreateError(String(e))); }}
+                disabled={projectBusy}
+                className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
+              >
+                {projectBusy ? "Creating..." : "Create"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {projectMetricsBoardOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div className="w-full max-w-5xl rounded-xl border border-border/60 bg-card shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border/50">
+              <h3 className="text-sm font-semibold text-foreground">Project KPI Board</h3>
+              <button
+                onClick={() => setProjectMetricsBoardOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="px-4 py-3 border-b border-border/50 flex items-center gap-2">
+              <label className="text-[11px] text-muted-foreground">Sort by</label>
+              <select
+                value={projectMetricsSortBy}
+                onChange={(e) => setProjectMetricsSortBy(e.target.value as "success_rate" | "executions_total" | "cycle_time_p50" | "intervention_ratio")}
+                className="h-7 rounded-md border border-border/60 bg-background px-2 text-[11px] text-foreground"
+              >
+                <option value="success_rate">Success rate (desc)</option>
+                <option value="executions_total">Executions (desc)</option>
+                <option value="cycle_time_p50">P50 cycle (asc)</option>
+                <option value="intervention_ratio">Intervention ratio (desc)</option>
+              </select>
+              <button
+                onClick={() => refreshProjectMetricsBoard().catch(() => {})}
+                disabled={projectMetricsBoardLoading}
+                className="h-7 px-2 inline-flex items-center gap-1 rounded border border-border/60 bg-background text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${projectMetricsBoardLoading ? "animate-spin" : ""}`} />
+                Refresh
+              </button>
+              {projectMetricsBoardError && (
+                <span className="text-[11px] text-destructive">{projectMetricsBoardError}</span>
+              )}
+            </div>
+            <div className="max-h-[60vh] overflow-auto">
+              <table className="w-full text-[11px]">
+                <thead className="sticky top-0 bg-card border-b border-border/50">
+                  <tr className="text-left text-muted-foreground">
+                    <th className="px-3 py-2 font-medium">Project</th>
+                    <th className="px-3 py-2 font-medium">Repo</th>
+                    <th className="px-3 py-2 font-medium">Exec</th>
+                    <th className="px-3 py-2 font-medium">Success</th>
+                    <th className="px-3 py-2 font-medium">P50 Cycle</th>
+                    <th className="px-3 py-2 font-medium">HITL</th>
+                    <th className="px-3 py-2 font-medium">Sessions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedProjectMetricsRows.map((row) => (
+                    <tr key={row.project.id} className="border-b border-border/30 hover:bg-muted/20">
+                      <td className="px-3 py-2 text-foreground font-medium">{row.project.name}</td>
+                      <td className="px-3 py-2 text-muted-foreground">{row.project.repository || "--"}</td>
+                      <td className="px-3 py-2 text-foreground">{row.summary.executions_total}</td>
+                      <td className="px-3 py-2 text-foreground">{formatPct(row.kpis.success_rate)}</td>
+                      <td className="px-3 py-2 text-foreground">{formatSeconds(row.kpis.cycle_time_seconds_p50)}</td>
+                      <td className="px-3 py-2 text-foreground">{formatPct(row.kpis.intervention_ratio)}</td>
+                      <td className="px-3 py-2 text-muted-foreground">
+                        {row.summary.active_sessions}/{row.summary.historical_sessions}
+                      </td>
+                    </tr>
+                  ))}
+                  {sortedProjectMetricsRows.length === 0 && (
+                    <tr>
+                      <td colSpan={7} className="px-3 py-6 text-center text-muted-foreground">
+                        No project metrics yet.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {projectRetentionOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div className="w-full max-w-3xl rounded-xl border border-border/60 bg-card shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border/50">
+              <h3 className="text-sm font-semibold text-foreground">Project Retention</h3>
+              <button
+                onClick={() => setProjectRetentionOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">History Days</label>
+                  <input
+                    value={projectRetentionHistoryDaysDraft}
+                    onChange={(e) => setProjectRetentionHistoryDaysDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="30"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Min Sessions Keep</label>
+                  <input
+                    value={projectRetentionMinKeepDraft}
+                    onChange={(e) => setProjectRetentionMinKeepDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="20"
+                  />
+                </div>
+                <div className="flex items-end">
+                  <label className="flex items-center gap-2 text-xs text-foreground h-9">
+                    <input
+                      type="checkbox"
+                      checked={projectRetentionArchiveEnabledDraft}
+                      onChange={(e) => setProjectRetentionArchiveEnabledDraft(e.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-border/70 bg-background"
+                    />
+                    Archive enabled
+                  </label>
+                </div>
+              </div>
+              <div>
+                <label className="block text-[11px] text-muted-foreground mb-1">Archive Root</label>
+                <input
+                  value={projectRetentionArchiveRootDraft}
+                  onChange={(e) => setProjectRetentionArchiveRootDraft(e.target.value)}
+                  className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                  placeholder="~/.hive/queen/archive"
+                />
+              </div>
+              <div className="rounded-md border border-border/60 bg-background/40 p-3 text-xs text-muted-foreground">
+                <div>Historical sessions: {projectRetentionData?.plan.historical_sessions ?? "--"}</div>
+                <div>Eligible now: {projectRetentionData?.plan.eligible_count ?? "--"}</div>
+                <div>Candidates shown: {Math.min(projectRetentionData?.plan.candidates.length ?? 0, 10)}</div>
+              </div>
+              {projectRetentionData?.plan.candidates && projectRetentionData.plan.candidates.length > 0 && (
+                <div className="rounded-md border border-border/60 bg-background/20 p-2 max-h-36 overflow-auto">
+                  {projectRetentionData.plan.candidates.slice(0, 10).map((c) => (
+                    <div key={c.session_id} className="text-[11px] text-muted-foreground py-0.5">
+                      {c.session_id} ({Math.round(c.age_days)}d)
+                    </div>
+                  ))}
+                </div>
+              )}
+              {projectRetentionRunResult && (
+                <div className="rounded-md border border-border/60 bg-background/40 p-3 text-[11px] text-muted-foreground">
+                  <pre className="whitespace-pre-wrap break-words">
+                    {JSON.stringify(projectRetentionRunResult, null, 2)}
+                  </pre>
+                </div>
+              )}
+              {projectRetentionError && (
+                <div className="text-xs text-destructive">{projectRetentionError}</div>
+              )}
+            </div>
+            <div className="flex items-center justify-between px-4 py-3 border-t border-border/50">
+              <button
+                onClick={() => refreshProjectRetention().catch(() => {})}
+                disabled={projectRetentionLoading}
+                className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+              >
+                {projectRetentionLoading ? "Refreshing..." : "Refresh"}
+              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => saveProjectRetentionPolicy().catch(() => {})}
+                  disabled={projectRetentionSaving || projectRetentionApplying}
+                  className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                >
+                  {projectRetentionSaving ? "Saving..." : "Save Policy"}
+                </button>
+                <button
+                  onClick={() => runProjectRetention(true).catch(() => {})}
+                  disabled={projectRetentionSaving || projectRetentionApplying}
+                  className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                >
+                  Dry Run
+                </button>
+                <button
+                  onClick={() => runProjectRetention(false).catch(() => {})}
+                  disabled={projectRetentionSaving || projectRetentionApplying}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                >
+                  {projectRetentionApplying ? "Applying..." : "Apply"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {projectExecutionOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div className="w-full max-w-3xl rounded-xl border border-border/60 bg-card shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border/50">
+              <h3 className="text-sm font-semibold text-foreground">Project Execution Template</h3>
+              <button
+                onClick={() => setProjectExecutionOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Design Profile</label>
+                  <input
+                    value={projectExecutionDesignProfileDraft}
+                    onChange={(e) => setProjectExecutionDesignProfileDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="strategy_heavy"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Implement Profile</label>
+                  <input
+                    value={projectExecutionImplementProfileDraft}
+                    onChange={(e) => setProjectExecutionImplementProfileDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="implementation"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Review Profile</label>
+                  <input
+                    value={projectExecutionReviewProfileDraft}
+                    onChange={(e) => setProjectExecutionReviewProfileDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="review_validation"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Validate Profile</label>
+                  <input
+                    value={projectExecutionValidateProfileDraft}
+                    onChange={(e) => setProjectExecutionValidateProfileDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="review_validation"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Max Retries Per Stage</label>
+                  <input
+                    value={projectExecutionRetryDraft}
+                    onChange={(e) => setProjectExecutionRetryDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="1"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Escalate On (comma)</label>
+                  <input
+                    value={projectExecutionEscalateOnDraft}
+                    onChange={(e) => setProjectExecutionEscalateOnDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="review,validate"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">GitHub Default Ref</label>
+                  <input
+                    value={projectExecutionGithubDefaultRefDraft}
+                    onChange={(e) => setProjectExecutionGithubDefaultRefDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="main"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">GitHub No-Checks Policy</label>
+                  <select
+                    value={projectExecutionNoChecksPolicyDraft}
+                    onChange={(e) => setProjectExecutionNoChecksPolicyDraft(e.target.value as ProjectNoChecksPolicy)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                  >
+                    <option value="error">error (strict)</option>
+                    <option value="manual_pending">manual_pending</option>
+                    <option value="success">success (allow)</option>
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Policy Risk Tier</label>
+                  <select
+                    value={projectExecutionRiskTierDraft}
+                    onChange={(e) => setProjectExecutionRiskTierDraft(e.target.value as "low" | "medium" | "high" | "critical")}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                  >
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="critical">critical</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Policy Retry Limit</label>
+                  <input
+                    value={projectExecutionPolicyRetryDraft}
+                    onChange={(e) => setProjectExecutionPolicyRetryDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="2"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Policy Monthly Budget (USD)</label>
+                  <input
+                    value={projectExecutionBudgetDraft}
+                    onChange={(e) => setProjectExecutionBudgetDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="optional"
+                  />
+                </div>
+              </div>
+              <div className="rounded-md border border-border/60 bg-background/40 p-3 text-xs text-muted-foreground">
+                <div>Effective risk tier: {projectExecutionData?.effective.policy.risk_tier ?? "--"}</div>
+                <div>Effective retry limit: {projectExecutionData?.effective.policy.retry_limit_per_stage ?? "--"}</div>
+                <div>
+                  Effective GitHub ref: {projectExecutionData?.effective.execution_template.github?.default_ref
+                    || projectExecutionData?.effective.execution_template.github?.default_branch
+                    || projectExecutionData?.effective.execution_template.default_ref
+                    || projectExecutionData?.effective.execution_template.default_branch
+                    || "--"}
+                </div>
+                <div>
+                  Effective no-checks policy: {projectExecutionData?.effective.execution_template.github?.no_checks_policy
+                    || projectExecutionData?.effective.execution_template.no_checks_policy
+                    || "--"}
+                </div>
+                <div>
+                  Effective stages: {(projectExecutionData?.effective.execution_template.default_flow || []).map((s) => s.stage).join(" -> ") || "--"}
+                </div>
+              </div>
+              {projectExecutionError && (
+                <div className="text-xs text-destructive">{projectExecutionError}</div>
+              )}
+            </div>
+            <div className="flex items-center justify-between px-4 py-3 border-t border-border/50">
+              <button
+                onClick={() => refreshProjectExecutionTemplate().catch(() => {})}
+                disabled={projectExecutionLoading}
+                className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+              >
+                {projectExecutionLoading ? "Refreshing..." : "Refresh"}
+              </button>
+              <button
+                onClick={() => saveProjectExecutionTemplate().catch(() => {})}
+                disabled={projectExecutionSaving}
+                className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
+              >
+                {projectExecutionSaving ? "Saving..." : "Save Template"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {projectToolchainOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div className="w-full max-w-3xl rounded-xl border border-border/60 bg-card shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border/50">
+              <h3 className="text-sm font-semibold text-foreground">Project Toolchain Profile</h3>
+              <button
+                onClick={() => setProjectToolchainOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Workspace Path (optional)</label>
+                  <input
+                    value={projectToolchainWorkspaceDraft}
+                    onChange={(e) => setProjectToolchainWorkspaceDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="/workspace/repo"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-muted-foreground mb-1">Repository URL (optional)</label>
+                  <input
+                    value={projectToolchainRepositoryDraft}
+                    onChange={(e) => setProjectToolchainRepositoryDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    placeholder="https://github.com/owner/repo"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-[11px] text-muted-foreground mb-1">Confirm Token</label>
+                <input
+                  value={projectToolchainConfirmDraft}
+                  onChange={(e) => setProjectToolchainConfirmDraft(e.target.value)}
+                  className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
+                  placeholder="APPLY_NODE_XXXXXXXX"
+                />
+              </div>
+              <div className="rounded-md border border-border/60 bg-background/40 p-3 text-xs text-muted-foreground space-y-1">
+                <div>
+                  Pending fingerprint:{" "}
+                  {projectToolchainData?.toolchain_profile?.pending_plan?.plan?.plan_fingerprint || "--"}
+                </div>
+                <div>
+                  Pending stack:{" "}
+                  {projectToolchainData?.toolchain_profile?.pending_plan?.plan?.recommended_stack || "--"}
+                </div>
+                <div>
+                  Pending toolchains:{" "}
+                  {(projectToolchainData?.toolchain_profile?.pending_plan?.plan?.toolchains || []).join(", ") || "--"}
+                </div>
+                {projectToolchainInstructions?.env_exports && projectToolchainInstructions.env_exports.length > 0 && (
+                  <div>
+                    env exports: {projectToolchainInstructions.env_exports.join(" ; ")}
+                  </div>
+                )}
+                {projectToolchainInstructions?.preview_command && (
+                  <div>preview: {projectToolchainInstructions.preview_command}</div>
+                )}
+                {projectToolchainInstructions?.apply_command && (
+                  <div>apply: {projectToolchainInstructions.apply_command}</div>
+                )}
+              </div>
+              {projectToolchainError && (
+                <div className="text-xs text-destructive">{projectToolchainError}</div>
+              )}
+            </div>
+            <div className="flex items-center justify-between px-4 py-3 border-t border-border/50">
+              <button
+                onClick={() => refreshProjectToolchainProfile().catch(() => {})}
+                disabled={projectToolchainLoading}
+                className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+              >
+                {projectToolchainLoading ? "Refreshing..." : "Refresh"}
+              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => planProjectToolchainProfile().catch(() => {})}
+                  disabled={projectToolchainPlanning || projectToolchainApproving}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium bg-muted text-foreground hover:bg-muted/80 disabled:opacity-50"
+                >
+                  {projectToolchainPlanning ? "Planning..." : "Plan"}
+                </button>
+                <button
+                  onClick={() => approveProjectToolchainProfile().catch(() => {})}
+                  disabled={projectToolchainPlanning || projectToolchainApproving}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                >
+                  {projectToolchainApproving ? "Approving..." : "Approve"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {projectAutonomousOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div className="w-full max-w-6xl rounded-xl border border-border/60 bg-card shadow-2xl">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border/50">
+              <h3 className="text-sm font-semibold text-foreground">Autonomous Pipeline Control</h3>
+              <button
+                onClick={() => setProjectAutonomousOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-4 grid grid-cols-1 lg:grid-cols-2 gap-4 max-h-[70vh] overflow-auto">
+              <div className="space-y-3">
+                <h4 className="text-xs font-semibold text-foreground uppercase tracking-wider">Backlog</h4>
+                <div className="rounded-md border border-border/60 bg-background/30 p-3">
+                  <label className="block text-[11px] text-muted-foreground mb-1">Execution Session (optional)</label>
+                  <select
+                    value={projectAutonomousRunSessionIdDraft}
+                    onChange={(e) => setProjectAutonomousRunSessionIdDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                  >
+                    <option value="">No live session (state-only run)</option>
+                    {projectAutonomousLiveSessions.map((s) => (
+                      <option key={s.session_id} value={s.session_id}>
+                        {s.session_id} ({s.graph_id || "graph-?"})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="rounded-md border border-border/60 bg-background/30 p-3 space-y-2">
+                  <input
+                    value={projectAutonomousTaskTitleDraft}
+                    onChange={(e) => setProjectAutonomousTaskTitleDraft(e.target.value)}
+                    className="w-full h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                    placeholder="Task title"
+                  />
+                  <textarea
+                    value={projectAutonomousTaskGoalDraft}
+                    onChange={(e) => setProjectAutonomousTaskGoalDraft(e.target.value)}
+                    className="w-full min-h-[72px] rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground resize-y"
+                    placeholder="Goal / expected outcome"
+                  />
+                  <textarea
+                    value={projectAutonomousTaskCriteriaDraft}
+                    onChange={(e) => setProjectAutonomousTaskCriteriaDraft(e.target.value)}
+                    className="w-full min-h-[72px] rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground resize-y"
+                    placeholder={"Acceptance criteria (one per line)\n- tests pass\n- no regressions"}
+                  />
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                    <select
+                      value={projectAutonomousTaskPriorityDraft}
+                      onChange={(e) => setProjectAutonomousTaskPriorityDraft(e.target.value as "low" | "medium" | "high" | "critical")}
+                      className="h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                    >
+                      <option value="low">low</option>
+                      <option value="medium">medium</option>
+                      <option value="high">high</option>
+                      <option value="critical">critical</option>
+                    </select>
+                    <input
+                      value={projectAutonomousTaskRepositoryDraft}
+                      onChange={(e) => setProjectAutonomousTaskRepositoryDraft(e.target.value)}
+                      className="h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                      placeholder="repo (optional)"
+                    />
+                    <input
+                      value={projectAutonomousTaskBranchDraft}
+                      onChange={(e) => setProjectAutonomousTaskBranchDraft(e.target.value)}
+                      className="h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                      placeholder="branch (optional)"
+                    />
+                  </div>
+                  <button
+                    onClick={() => createProjectAutonomousTask().catch(() => {})}
+                    disabled={projectAutonomousCreating}
+                    className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                  >
+                    {projectAutonomousCreating ? "Creating..." : "Add Task"}
+                  </button>
+                  <button
+                    onClick={() => dispatchNextProjectAutonomousRun().catch(() => {})}
+                    disabled={projectAutonomousActionBusy}
+                    className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                    title="Pick highest-priority todo task and start run"
+                  >
+                    Dispatch Next Todo
+                  </button>
+                  <button
+                    onClick={() => tickProjectAutonomousLoop().catch(() => {})}
+                    disabled={projectAutonomousActionBusy}
+                    className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                    title="Run one autonomous loop tick: dispatch or advance depending on current state"
+                  >
+                    Loop Tick
+                  </button>
+                  <button
+                    onClick={() => runCycleProjectAutonomous().catch(() => {})}
+                    disabled={projectAutonomousActionBusy}
+                    className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                    title="Run multi-step autonomous cycle for this project"
+                  >
+                    Run Cycle
+                  </button>
+                  <button
+                    onClick={() => executeNextProjectAutonomousRun().catch(() => {})}
+                    disabled={projectAutonomousActionBusy}
+                    className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                    title="Pick next backlog task and execute it server-side until terminal/wait"
+                  >
+                    Execute Next
+                  </button>
+                </div>
+                <div className="rounded-md border border-border/60 bg-background/20 max-h-[36vh] overflow-auto">
+                  {projectAutonomousBacklog.length === 0 ? (
+                    <div className="p-3 text-xs text-muted-foreground">No backlog tasks yet.</div>
+                  ) : (
+                    projectAutonomousBacklog.map((task) => (
+                      <div key={task.id} className="p-3 border-b border-border/40 last:border-b-0">
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="text-sm text-foreground font-medium">{task.title}</div>
+                            <div className="text-[11px] text-muted-foreground mt-0.5">
+                              {task.priority} · {task.status} · {task.id}
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => startProjectAutonomousRun(task.id).catch(() => {})}
+                            disabled={projectAutonomousActionBusy}
+                            className="px-2 py-1 rounded border border-border/60 text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                            title="Start autonomous pipeline run for this task"
+                          >
+                            Run
+                          </button>
+                        </div>
+                        <div className="text-[11px] text-muted-foreground mt-1 line-clamp-3">{task.goal}</div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                <h4 className="text-xs font-semibold text-foreground uppercase tracking-wider">Runs</h4>
+                <div className="rounded-md border border-border/60 bg-background/20 max-h-[40vh] overflow-auto">
+                  {projectAutonomousRuns.length === 0 ? (
+                    <div className="p-3 text-xs text-muted-foreground">No pipeline runs yet.</div>
+                  ) : (
+                    projectAutonomousRuns.map((run) => (
+                      <button
+                        key={run.id}
+                        onClick={() => setProjectAutonomousSelectedRunId(run.id)}
+                        className={`w-full text-left p-3 border-b border-border/40 last:border-b-0 hover:bg-muted/20 ${
+                          projectAutonomousSelectedRunId === run.id ? "bg-muted/30" : ""
+                        }`}
+                      >
+                        <div className="text-sm text-foreground font-medium">{run.id}</div>
+                        <div className="text-[11px] text-muted-foreground mt-0.5">
+                          task={run.task_id} · {run.status} · stage={run.current_stage}
+                        </div>
+                      </button>
+                    ))
+                  )}
+                </div>
+                {selectedAutonomousRun && (
+                  <div className="rounded-md border border-border/60 bg-background/30 p-3 space-y-2">
+                    <div className="text-xs text-muted-foreground">
+                      Current stage: <span className="text-foreground">{selectedAutonomousRun.current_stage}</span>
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      Stage states: {Object.entries(selectedAutonomousRun.stage_states).map(([k, v]) => `${k}:${v}`).join(" | ")}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      Attempts: {Object.entries(selectedAutonomousRun.attempts).map(([k, v]) => `${k}:${v}`).join(" | ")}
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                      <select
+                        value={projectAutonomousAdvanceResultDraft}
+                        onChange={(e) => setProjectAutonomousAdvanceResultDraft(e.target.value as "success" | "failed")}
+                        className="h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                      >
+                        <option value="success">success</option>
+                        <option value="failed">failed</option>
+                      </select>
+                      <input
+                        value={projectAutonomousAdvanceNotesDraft}
+                        onChange={(e) => setProjectAutonomousAdvanceNotesDraft(e.target.value)}
+                        className="h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground md:col-span-2"
+                        placeholder="Stage notes (optional)"
+                      />
+                    </div>
+                    <textarea
+                      value={projectAutonomousChecksDraft}
+                      onChange={(e) => setProjectAutonomousChecksDraft(e.target.value)}
+                      className="w-full min-h-[72px] rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground resize-y"
+                      placeholder={"Checks (one per line):\nreview_tests:pass\nlint:fail"}
+                    />
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      <input
+                        value={projectAutonomousGitHubRepoDraft}
+                        onChange={(e) => setProjectAutonomousGitHubRepoDraft(e.target.value)}
+                        className="h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                        placeholder="GitHub repo: owner/name"
+                      />
+                      <input
+                        value={projectAutonomousGitHubRefDraft}
+                        onChange={(e) => setProjectAutonomousGitHubRefDraft(e.target.value)}
+                        className="h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                        placeholder="Ref: branch or SHA"
+                      />
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      <input
+                        value={projectAutonomousGitHubPrUrlDraft}
+                        onChange={(e) => setProjectAutonomousGitHubPrUrlDraft(e.target.value)}
+                        className="h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                        placeholder="PR URL (optional fallback for ref)"
+                      />
+                      <input
+                        value={projectAutonomousGitHubRequiredChecksDraft}
+                        onChange={(e) => setProjectAutonomousGitHubRequiredChecksDraft(e.target.value)}
+                        className="h-9 rounded-md border border-border/60 bg-background px-3 text-sm text-foreground"
+                        placeholder="Required checks (comma)"
+                      />
+                    </div>
+                    <button
+                      onClick={() => advanceProjectAutonomousRun().catch(() => {})}
+                      disabled={projectAutonomousActionBusy}
+                      className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                    >
+                      Advance Current Stage
+                    </button>
+                    <button
+                      onClick={() => evaluateProjectAutonomousRun().catch(() => {})}
+                      disabled={projectAutonomousActionBusy}
+                      className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                    >
+                      Evaluate By Checks
+                    </button>
+                    <button
+                      onClick={() => evaluateProjectAutonomousRunFromGitHub().catch(() => {})}
+                      disabled={projectAutonomousActionBusy}
+                      className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                    >
+                      Evaluate via GitHub
+                    </button>
+                    <button
+                      onClick={() => autoNextProjectAutonomousRun().catch(() => {})}
+                      disabled={projectAutonomousActionBusy}
+                      className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                    >
+                      Auto Next
+                    </button>
+                    <button
+                      onClick={() => runUntilTerminalProjectAutonomousRun().catch(() => {})}
+                      disabled={projectAutonomousActionBusy}
+                      className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                    >
+                      Run Until Terminal
+                    </button>
+                    {(projectAutonomousCycleSummary || projectAutonomousCycleResult) && (
+                      <div className="rounded-md border border-border/50 bg-background/30 p-2 text-[11px] text-muted-foreground space-y-1">
+                        <div className="text-foreground">Run Cycle Summary</div>
+                        {projectAutonomousCycleSummary && (
+                          <div>
+                            projects={String(projectAutonomousCycleSummary.projects_total ?? "--")} · ok={String(projectAutonomousCycleSummary.ok ?? "--")} · failed={String(projectAutonomousCycleSummary.failed ?? "--")} · max_steps={String(projectAutonomousCycleSummary.max_steps_per_project ?? "--")}
+                          </div>
+                        )}
+                        {projectAutonomousCycleOutcomes.length > 0 && (
+                          <div>
+                            outcomes: {projectAutonomousCycleOutcomes.map(([k, v]) => `${k}:${v}`).join(" | ")}
+                          </div>
+                        )}
+                        {projectAutonomousCycleResult && (
+                          <div>
+                            last: outcome={String(projectAutonomousCycleResult.outcome ?? "--")} · terminal={String(projectAutonomousCycleResult.terminal ?? false)} · terminal_status={String(projectAutonomousCycleResult.terminal_status ?? "--")} · pr_ready={String(projectAutonomousCycleResult.pr_ready ?? false)} · steps={String(projectAutonomousCycleResult.steps_executed ?? "--")}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {projectAutonomousLastExecutionSnapshot && (
+                      <div className="rounded-md border border-border/50 bg-background/30 p-2 text-[11px] text-muted-foreground space-y-1">
+                        <div className="text-foreground">Execution Snapshot</div>
+                        <div>
+                          source={String(projectAutonomousLastExecutionSnapshot.source ?? "--")} · action={String(projectAutonomousLastExecutionSnapshot.action ?? "--")}
+                        </div>
+                        <div>
+                          terminal={String(projectAutonomousLastExecutionSnapshot.terminal ?? false)} · terminal_status={String(projectAutonomousLastExecutionSnapshot.terminal_status ?? "--")} · steps={String(projectAutonomousLastExecutionSnapshot.steps_executed ?? "--")}
+                        </div>
+                        <div>
+                          run_id={String(projectAutonomousLastExecutionSnapshot.run_id ?? "--")} · updated_at={new Date(Number(projectAutonomousLastExecutionSnapshot.updated_at || 0)).toLocaleTimeString()}
+                        </div>
+                        {projectAutonomousLastExecutionSnapshot.last_error ? (
+                          <div className="text-destructive">last_error={String(projectAutonomousLastExecutionSnapshot.last_error)}</div>
+                        ) : null}
+                      </div>
+                    )}
+                    {projectAutonomousOpsStatus && (
+                      <div className="rounded-md border border-border/50 bg-background/30 p-2 text-[11px] text-muted-foreground space-y-1">
+                        <div className="text-foreground">Ops / Loop Health</div>
+                        <div>
+                          runs={String(projectAutonomousOpsStatus.summary.runs_total ?? 0)} · in_progress={String(projectAutonomousOpsStatus.summary.runs_by_status?.in_progress ?? 0)} · queued={String(projectAutonomousOpsStatus.summary.runs_by_status?.queued ?? 0)}
+                        </div>
+                        <div>
+                          stuck_runs={String(projectAutonomousOpsStatus.alerts.stuck_runs_total ?? 0)} · no_progress_projects={String(projectAutonomousOpsStatus.alerts.no_progress_projects_total ?? 0)}
+                        </div>
+                        <div>
+                          loop_stale=
+                          <span className={projectAutonomousOpsStatus.alerts.loop_stale ? "text-amber-400" : "text-emerald-400"}>
+                            {String(Boolean(projectAutonomousOpsStatus.alerts.loop_stale))}
+                          </span>
+                          {" · "}
+                          stale_s={String(Math.round(Number(projectAutonomousOpsStatus.alerts.loop_stale_seconds ?? 0)))}
+                        </div>
+                        <div>
+                          active_runs_visible={String(Array.isArray(projectAutonomousOpsStatus.active_runs) ? projectAutonomousOpsStatus.active_runs.length : 0)}
+                        </div>
+                        <div>
+                          docker_lane=
+                          <span
+                            className={
+                              projectAutonomousOpsStatus.runtime?.docker_lane?.ready
+                                ? "text-emerald-400"
+                                : projectAutonomousOpsStatus.runtime?.docker_lane?.enabled
+                                  ? "text-amber-300"
+                                  : "text-muted-foreground"
+                            }
+                          >
+                            {String(projectAutonomousOpsStatus.runtime?.docker_lane?.status ?? "disabled")}
+                          </span>
+                          {" · "}
+                          enabled={String(Boolean(projectAutonomousOpsStatus.runtime?.docker_lane?.enabled))}
+                          {" · "}
+                          ready={String(Boolean(projectAutonomousOpsStatus.runtime?.docker_lane?.ready))}
+                        </div>
+                        {projectAutonomousOpsStatus.runtime?.docker_lane?.reason && (
+                          <div>
+                            docker_lane_reason={String(projectAutonomousOpsStatus.runtime?.docker_lane?.reason)}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    <div className="rounded-md border border-border/50 bg-background/30 p-2 text-[11px] text-muted-foreground space-y-2">
+                      <div className="text-foreground">Stale Remediation</div>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                        <select
+                          value={projectAutonomousRemediateActionDraft}
+                          onChange={(e) => setProjectAutonomousRemediateActionDraft(e.target.value as "failed" | "escalated")}
+                          className="h-8 rounded-md border border-border/60 bg-background px-2 text-[11px] text-foreground"
+                        >
+                          <option value="escalated">escalated</option>
+                          <option value="failed">failed</option>
+                        </select>
+                        <input
+                          value={projectAutonomousRemediateOlderThanDraft}
+                          onChange={(e) => setProjectAutonomousRemediateOlderThanDraft(e.target.value)}
+                          className="h-8 rounded-md border border-border/60 bg-background px-2 text-[11px] text-foreground"
+                          placeholder="older_than_s"
+                        />
+                        <input
+                          value={projectAutonomousRemediateMaxRunsDraft}
+                          onChange={(e) => setProjectAutonomousRemediateMaxRunsDraft(e.target.value)}
+                          className="h-8 rounded-md border border-border/60 bg-background px-2 text-[11px] text-foreground"
+                          placeholder="max_runs"
+                        />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => remediateProjectAutonomousStaleRuns(true).catch(() => {})}
+                          disabled={projectAutonomousRemediateBusy}
+                          className="px-2 py-1 rounded border border-border/60 text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                        >
+                          {projectAutonomousRemediateBusy ? "Working..." : "Preview"}
+                        </button>
+                        <button
+                          onClick={() => remediateProjectAutonomousStaleRuns(false).catch(() => {})}
+                          disabled={projectAutonomousRemediateBusy}
+                          className="px-2 py-1 rounded border border-amber-500/60 text-[11px] text-amber-300 hover:text-amber-100 hover:bg-amber-900/20 disabled:opacity-50"
+                        >
+                          Apply
+                        </button>
+                      </div>
+                      {projectAutonomousRemediateResult && (
+                        <div>
+                          dry_run={String(projectAutonomousRemediateResult.dry_run)} · selected={String(projectAutonomousRemediateResult.selected_total)} · remediated={String(projectAutonomousRemediateResult.remediated_total)}
+                        </div>
+                      )}
+                    </div>
+                    <div className="rounded-md border border-border/50 bg-background/30 p-2 text-[11px] text-muted-foreground max-h-28 overflow-auto">
+                      <pre className="whitespace-pre-wrap break-words">
+                        {JSON.stringify(projectAutonomousReportData || selectedAutonomousRun.artifacts?.report || {}, null, 2)}
+                      </pre>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center justify-between px-4 py-3 border-t border-border/50">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => refreshProjectAutonomous().catch(() => {})}
+                  disabled={projectAutonomousLoading}
+                  className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                >
+                  {projectAutonomousLoading ? "Refreshing..." : "Refresh"}
+                </button>
+                <button
+                  onClick={() => refreshProjectAutonomousOpsStatus().catch(() => {})}
+                  disabled={projectAutonomousOpsLoading}
+                  className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                >
+                  {projectAutonomousOpsLoading ? "Ops..." : "Refresh Ops"}
+                </button>
+                <button
+                  onClick={() => refreshProjectAutonomousReport().catch(() => {})}
+                  disabled={!projectAutonomousSelectedRunId}
+                  className="px-3 py-1.5 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 disabled:opacity-50"
+                >
+                  Report
+                </button>
+              </div>
+              <div className="text-[11px] text-muted-foreground">
+                {projectAutonomousError ? (
+                  <span className="text-destructive">{projectAutonomousError}</span>
+                ) : (
+                  <span>
+                    Backlog {projectAutonomousBacklog.length} · Runs {projectAutonomousRuns.length}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Main content area */}
       <div className="flex flex-1 min-h-0">
+        <HistorySidebar
+          onOpen={handleHistoryOpen}
+          openSessionIds={openHistorySessionIds}
+          activeSessionId={activeSession?.backendSessionId ?? null}
+          activeHistorySourceId={activeSession?.historySourceId ?? null}
+          projectId={activeProjectId}
+        />
 
         {/* ── Draft flowchart + chat ─────────────────────────────────── */}
         <div
@@ -3279,6 +6108,7 @@ export default function Workspace() {
           if (agentStates[activeWorker]?.error === "credentials_required") {
             updateAgentState(activeWorker, { error: null });
           }
+          refreshCredentialReadiness().catch(() => {});
           if (!activeSession) return;
           setSessionsByAgent(prev => ({
             ...prev,

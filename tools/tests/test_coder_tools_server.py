@@ -164,3 +164,178 @@ def test_list_agent_tools_provider_filter_and_legacy_prefix_filter(monkeypatch, 
     legacy_data = json.loads(legacy_raw)
     assert list(legacy_data["tools_by_provider"].keys()) == ["google"]
     assert legacy_data["all_tool_names"] == ["gmail_list_messages"]
+
+
+def test_list_agent_tools_summary_all_reports_credentials_status(monkeypatch, tmp_path):
+    _install_fake_framework(
+        monkeypatch,
+        tools_by_server={
+            "fake-server": [
+                {"name": "gmail_list_messages", "description": "Read Gmail"},
+                {"name": "send_email", "description": "Send email"},
+                {"name": "slack_send_message", "description": "Send Slack message"},
+            ]
+        },
+    )
+    mod = _load_coder_tools_server()
+    mod.PROJECT_ROOT = str(tmp_path)
+
+    config_path = tmp_path / "mcp_servers.json"
+    config_path.write_text(
+        json.dumps({"fake-server": {"transport": "stdio", "command": "noop", "args": []}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "test-google")
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+
+    raw = _call_list_agent_tools(
+        mod,
+        server_config_path="mcp_servers.json",
+        output_schema="summary",
+        group="all",
+    )
+    data = json.loads(raw)
+    providers = data["providers"]
+
+    assert "google" in providers
+    assert providers["google"]["credentials_required"] == ["google"]
+    assert providers["google"]["credentials_available"] is True
+
+    assert "resend" in providers
+    assert providers["resend"]["credentials_required"] == ["resend"]
+    assert providers["resend"]["credentials_available"] is False
+
+    assert "slack" in providers
+    assert providers["slack"]["credentials_required"] == ["slack"]
+    assert providers["slack"]["credentials_available"] is False
+
+
+def test_list_agent_tools_available_filter_supports_multi_provider_tools(monkeypatch, tmp_path):
+    _install_fake_framework(
+        monkeypatch,
+        tools_by_server={
+            "fake-server": [
+                {"name": "send_email", "description": "Send email"},
+                {"name": "web_scrape", "description": "Scrape a page"},
+            ]
+        },
+    )
+    mod = _load_coder_tools_server()
+    mod.PROJECT_ROOT = str(tmp_path)
+
+    config_path = tmp_path / "mcp_servers.json"
+    config_path.write_text(
+        json.dumps({"fake-server": {"transport": "stdio", "command": "noop", "args": []}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "test-google")
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+
+    available_raw = _call_list_agent_tools(
+        mod,
+        server_config_path="mcp_servers.json",
+        output_schema="names",
+        credentials="available",
+    )
+    available = json.loads(available_raw)
+    available_names = set()
+    for provider in available["tools_by_provider"].values():
+        available_names.update(provider["tool_names"])
+    assert "send_email" in available_names
+
+    unavailable_raw = _call_list_agent_tools(
+        mod,
+        server_config_path="mcp_servers.json",
+        output_schema="names",
+        credentials="unavailable",
+    )
+    unavailable = json.loads(unavailable_raw)
+    unavailable_names = set()
+    for provider in unavailable["tools_by_provider"].values():
+        unavailable_names.update(provider["tool_names"])
+    assert "send_email" not in unavailable_names
+
+
+def test_list_agent_tools_multi_provider_tool_unavailable_when_no_provider_creds(
+    monkeypatch, tmp_path
+):
+    _install_fake_framework(
+        monkeypatch,
+        tools_by_server={
+            "fake-server": [
+                {"name": "send_email", "description": "Send email"},
+            ]
+        },
+    )
+    mod = _load_coder_tools_server()
+    mod.PROJECT_ROOT = str(tmp_path)
+
+    config_path = tmp_path / "mcp_servers.json"
+    config_path.write_text(
+        json.dumps({"fake-server": {"transport": "stdio", "command": "noop", "args": []}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("GOOGLE_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+
+    available_raw = _call_list_agent_tools(
+        mod,
+        server_config_path="mcp_servers.json",
+        output_schema="names",
+        credentials="available",
+    )
+    available = json.loads(available_raw)
+    available_names = set()
+    for provider in available["tools_by_provider"].values():
+        available_names.update(provider["tool_names"])
+    assert "send_email" not in available_names
+
+    unavailable_raw = _call_list_agent_tools(
+        mod,
+        server_config_path="mcp_servers.json",
+        output_schema="names",
+        credentials="unavailable",
+    )
+    unavailable = json.loads(unavailable_raw)
+    unavailable_names = set()
+    for provider in unavailable["tools_by_provider"].values():
+        unavailable_names.update(provider["tool_names"])
+    assert "send_email" in unavailable_names
+
+
+def test_resolve_path_allows_extra_roots_from_env(monkeypatch, tmp_path):
+    mod = _load_coder_tools_server()
+    project_root = tmp_path / "project-root"
+    project_root.mkdir(parents=True, exist_ok=True)
+    extra_root = tmp_path / "extra-root"
+    extra_root.mkdir(parents=True, exist_ok=True)
+    target = extra_root / "repo"
+    target.mkdir(parents=True, exist_ok=True)
+
+    mod.PROJECT_ROOT = str(project_root)
+    monkeypatch.setenv("CODER_TOOLS_ALLOWED_PATHS", str(extra_root))
+
+    resolved = mod._resolve_path(str(target))
+    assert resolved == str(target.resolve())
+
+
+def test_resolve_path_denies_outside_roots_without_env(monkeypatch, tmp_path):
+    mod = _load_coder_tools_server()
+    project_root = tmp_path / "project-root"
+    project_root.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+
+    mod.PROJECT_ROOT = str(project_root)
+    monkeypatch.delenv("CODER_TOOLS_ALLOWED_PATHS", raising=False)
+
+    try:
+        mod._resolve_path(str(outside))
+    except ValueError as e:
+        assert "outside allowed roots" in str(e)
+    else:
+        raise AssertionError("expected ValueError for path outside allowed roots")

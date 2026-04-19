@@ -1,0 +1,42 @@
+{
+  "generated_at": "2026-04-17T21:15:37+00:00",
+  "source": "scripts/backlog_status.py",
+  "status": {
+    "tasks_total": 240,
+    "status_counts": {
+      "todo": 8,
+      "in_progress": 1,
+      "blocked": 0,
+      "done": 231,
+      "unknown": 0
+    },
+    "in_progress": [
+      232
+    ],
+    "focus_refs": [
+      232,
+      233,
+      234
+    ],
+    "focus_items": [
+      {
+        "id": 232,
+        "priority": "P0",
+        "status": "in_progress",
+        "title": "Upstream Migration Wave 3 - Freeze and Evidence Baseline"
+      },
+      {
+        "id": 233,
+        "priority": "P0",
+        "status": "todo",
+        "title": "Upstream Wave 3 - Unclassified Decision Registry Refresh"
+      },
+      {
+        "id": 234,
+        "priority": "P0",
+        "status": "todo",
+        "title": "Upstream Wave 3 - Clean Landing Branch Bootstrap"
+      }
+    ]
+  }
+}

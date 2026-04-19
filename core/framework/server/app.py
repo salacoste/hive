@@ -3,12 +3,17 @@
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 
 from framework.server.session_manager import Session, SessionManager
 
 logger = logging.getLogger(__name__)
+
+APP_KEY_MANAGER: web.AppKey[SessionManager] = web.AppKey("manager", SessionManager)
+APP_KEY_CREDENTIAL_STORE: web.AppKey[Any] = web.AppKey("credential_store", object)
+APP_KEY_TELEGRAM_BRIDGE: web.AppKey[Any] = web.AppKey("telegram_bridge", object)
 
 
 # Anchor to the repository root so allowed roots are independent of CWD.
@@ -74,7 +79,7 @@ def resolve_session(request: web.Request):
 
     Returns (session, None) on success or (None, error_response) on failure.
     """
-    manager: SessionManager = request.app["manager"]
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
     sid = request.match_info["session_id"]
     session = manager.get_session(sid)
     if not session:
@@ -120,7 +125,14 @@ async def cors_middleware(request: web.Request, handler):
         try:
             response = await handler(request)
         except web.HTTPException as exc:
-            response = exc
+            # aiohttp deprecates returning HTTPException objects directly from
+            # middleware; convert to a concrete Response to preserve semantics.
+            response = web.Response(
+                status=exc.status,
+                reason=exc.reason,
+                text=exc.text,
+                headers=exc.headers,
+            )
 
     if _is_cors_allowed(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
@@ -153,21 +165,60 @@ async def error_middleware(request: web.Request, handler):
 
 async def _on_shutdown(app: web.Application) -> None:
     """Gracefully unload all agents on server shutdown."""
-    manager: SessionManager = app["manager"]
+    bridge = app.get(APP_KEY_TELEGRAM_BRIDGE)
+    if bridge is not None:
+        try:
+            await bridge.stop()
+        except Exception:
+            logger.exception("Failed to stop Telegram bridge cleanly")
+
+    manager: SessionManager = app[APP_KEY_MANAGER]
     await manager.shutdown_all()
+
+
+async def _on_startup(app: web.Application) -> None:
+    """Start optional background integrations."""
+    try:
+        from framework.server.telegram_bridge import TelegramBridge
+
+        bridge = TelegramBridge(app[APP_KEY_MANAGER])
+        app[APP_KEY_TELEGRAM_BRIDGE] = bridge
+        await bridge.start()
+    except Exception:
+        logger.exception("Failed to start Telegram bridge")
 
 
 async def handle_health(request: web.Request) -> web.Response:
     """GET /api/health — simple health check."""
-    manager: SessionManager = request.app["manager"]
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
     sessions = manager.list_sessions()
+    bridge = request.app.get(APP_KEY_TELEGRAM_BRIDGE)
+    bridge_status = bridge.status() if bridge is not None and hasattr(bridge, "status") else None
     return web.json_response(
         {
             "status": "ok",
             "sessions": len(sessions),
             "agents_loaded": sum(1 for s in sessions if s.graph_runtime is not None),
+            "telegram_bridge": bridge_status,
         }
     )
+
+
+async def handle_telegram_bridge_status(request: web.Request) -> web.Response:
+    """GET /api/telegram/bridge/status — status of Telegram polling bridge."""
+    bridge = request.app.get(APP_KEY_TELEGRAM_BRIDGE)
+    if bridge is None or not hasattr(bridge, "status"):
+        return web.json_response(
+            {
+                "status": "disabled",
+                "bridge": {
+                    "enabled": False,
+                    "running": False,
+                    "startup_status": "not_initialized",
+                },
+            }
+        )
+    return web.json_response({"status": "ok", "bridge": bridge.status()})
 
 
 async def handle_browser_status(request: web.Request) -> web.Response:
@@ -202,7 +253,7 @@ async def handle_browser_status(request: web.Request) -> web.Response:
     return web.json_response({"bridge": False, "connected": False})
 
 
-def create_app(model: str | None = None) -> web.Application:
+def create_app(model: str | None = None, model_profile: str | None = None) -> web.Application:
     """Create and configure the aiohttp Application.
 
     Args:
@@ -239,27 +290,37 @@ def create_app(model: str | None = None) -> web.Application:
         logger.debug("Encrypted credential store unavailable, using in-memory fallback")
         credential_store = CredentialStore.for_testing({})
 
-    app["credential_store"] = credential_store
-    app["manager"] = SessionManager(model=model, credential_store=credential_store)
+    app[APP_KEY_CREDENTIAL_STORE] = credential_store
+    app[APP_KEY_MANAGER] = SessionManager(
+        model=model,
+        model_profile=model_profile,
+        credential_store=credential_store,
+    )
 
-    # Register shutdown hook
+    # Register lifecycle hooks
+    app.on_startup.append(_on_startup)
     app.on_shutdown.append(_on_shutdown)
 
     # Health check
     app.router.add_get("/api/health", handle_health)
+    app.router.add_get("/api/telegram/bridge/status", handle_telegram_bridge_status)
     app.router.add_get("/api/browser/status", handle_browser_status)
 
     # Register route modules
     from framework.server.routes_credentials import register_routes as register_credential_routes
+    from framework.server.routes_autonomous import register_routes as register_autonomous_routes
     from framework.server.routes_events import register_routes as register_event_routes
     from framework.server.routes_execution import register_routes as register_execution_routes
     from framework.server.routes_graphs import register_routes as register_graph_routes
     from framework.server.routes_logs import register_routes as register_log_routes
+    from framework.server.routes_projects import register_routes as register_project_routes
     from framework.server.routes_sessions import register_routes as register_session_routes
 
     register_credential_routes(app)
+    register_autonomous_routes(app)
     register_execution_routes(app)
     register_event_routes(app)
+    register_project_routes(app)
     register_session_routes(app)
     register_graph_routes(app)
     register_log_routes(app)

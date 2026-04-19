@@ -198,6 +198,30 @@ class TestGitHubClient:
         assert result["data"]["state"] == "closed"
 
     @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+    def test_list_issue_comments(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [{"id": 1, "body": "Comment"}]
+        mock_get.return_value = mock_response
+
+        result = self.client.list_issue_comments("owner", "repo", 1)
+
+        assert result["success"] is True
+        assert len(result["data"]) == 1
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+    def test_create_issue_comment(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"id": 11, "body": "New comment"}
+        mock_post.return_value = mock_response
+
+        result = self.client.create_issue_comment("owner", "repo", 1, "New comment")
+
+        assert result["success"] is True
+        assert result["data"]["id"] == 11
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
     def test_list_pull_requests(self, mock_get):
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -245,6 +269,68 @@ class TestGitHubClient:
 
         assert result["success"] is True
         assert result["data"]["number"] == 10
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+    def test_list_pull_request_reviews(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [{"id": 1, "state": "COMMENTED"}]
+        mock_get.return_value = mock_response
+
+        result = self.client.list_pull_request_reviews("owner", "repo", 10)
+
+        assert result["success"] is True
+        assert len(result["data"]) == 1
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+    def test_list_pull_request_review_comments(self, mock_get):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [{"id": 2, "path": "src/a.ts"}]
+        mock_get.return_value = mock_response
+
+        result = self.client.list_pull_request_review_comments("owner", "repo", 10)
+
+        assert result["success"] is True
+        assert len(result["data"]) == 1
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+    def test_create_pull_request_review(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"id": 99, "state": "COMMENTED"}
+        mock_post.return_value = mock_response
+
+        result = self.client.create_pull_request_review(
+            "owner",
+            "repo",
+            10,
+            body="Looks good",
+            event="COMMENT",
+        )
+
+        assert result["success"] is True
+        assert result["data"]["id"] == 99
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+    def test_create_pull_request_review_comment(self, mock_post):
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"id": 101, "path": "src/main.ts"}
+        mock_post.return_value = mock_response
+
+        result = self.client.create_pull_request_review_comment(
+            "owner",
+            "repo",
+            10,
+            body="Please fix this",
+            commit_id="abc123",
+            path="src/main.ts",
+            line=12,
+        )
+
+        assert result["success"] is True
+        assert result["data"]["id"] == 101
 
     @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
     def test_search_code(self, mock_get):
@@ -350,6 +436,26 @@ class TestCredentialRetrieval:
             mock_credentials.get.assert_called_with("github")
             call_headers = mock_get.call_args.kwargs["headers"]
             assert call_headers["Authorization"] == "Bearer ghp_store_token"
+
+    def test_credential_decrypt_failure_falls_back_to_env(self, mcp):
+        """If credential decryption fails, fallback to GITHUB_TOKEN env."""
+        mock_credentials = MagicMock()
+        mock_credentials.get.side_effect = ValueError("Failed to decrypt credential")
+
+        with patch("os.getenv", return_value="ghp_env_fallback"):
+            with patch("aden_tools.tools.github_tool.github_tool.httpx.get") as mock_get:
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_response.json.return_value = []
+                mock_get.return_value = mock_response
+
+                register_tools(mcp, credentials=mock_credentials)
+                list_repos = mcp._tool_manager._tools["github_list_repos"].fn
+
+                list_repos()
+
+                call_headers = mock_get.call_args.kwargs["headers"]
+                assert call_headers["Authorization"] == "Bearer ghp_env_fallback"
 
 
 # --- MCP Tool function tests ---
@@ -509,6 +615,36 @@ class TestGitHubIssues:
 
             assert result["success"] is True
 
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+    def test_list_issue_comments_success(self, mock_get, mcp):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [{"id": 1, "body": "comment"}]
+        mock_get.return_value = mock_response
+
+        with patch("os.getenv", return_value="ghp_test"):
+            register_tools(mcp, credentials=None)
+            list_comments = mcp._tool_manager._tools["github_list_issue_comments"].fn
+
+            result = list_comments(owner="owner", repo="repo", issue_number=1)
+
+            assert result["success"] is True
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+    def test_create_issue_comment_success(self, mock_post, mcp):
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"id": 1, "body": "comment"}
+        mock_post.return_value = mock_response
+
+        with patch("os.getenv", return_value="ghp_test"):
+            register_tools(mcp, credentials=None)
+            create_comment = mcp._tool_manager._tools["github_create_issue_comment"].fn
+
+            result = create_comment(owner="owner", repo="repo", issue_number=1, body="comment")
+
+            assert result["success"] is True
+
 
 class TestGitHubPullRequests:
     @pytest.fixture
@@ -562,6 +698,84 @@ class TestGitHubPullRequests:
                 title="New PR",
                 head="feature",
                 base="main",
+            )
+
+            assert result["success"] is True
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+    def test_list_pull_request_reviews_success(self, mock_get, mcp):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [{"id": 1, "state": "COMMENTED"}]
+        mock_get.return_value = mock_response
+
+        with patch("os.getenv", return_value="ghp_test"):
+            register_tools(mcp, credentials=None)
+            list_reviews = mcp._tool_manager._tools["github_list_pull_request_reviews"].fn
+
+            result = list_reviews(owner="owner", repo="repo", pull_number=1)
+
+            assert result["success"] is True
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+    def test_list_pull_request_review_comments_success(self, mock_get, mcp):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [{"id": 2, "path": "src/main.ts"}]
+        mock_get.return_value = mock_response
+
+        with patch("os.getenv", return_value="ghp_test"):
+            register_tools(mcp, credentials=None)
+            list_review_comments = mcp._tool_manager._tools[
+                "github_list_pull_request_review_comments"
+            ].fn
+
+            result = list_review_comments(owner="owner", repo="repo", pull_number=1)
+
+            assert result["success"] is True
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+    def test_create_pull_request_review_success(self, mock_post, mcp):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"id": 9, "state": "COMMENTED"}
+        mock_post.return_value = mock_response
+
+        with patch("os.getenv", return_value="ghp_test"):
+            register_tools(mcp, credentials=None)
+            create_review = mcp._tool_manager._tools["github_create_pull_request_review"].fn
+
+            result = create_review(
+                owner="owner",
+                repo="repo",
+                pull_number=1,
+                body="Looks good",
+                event="COMMENT",
+            )
+
+            assert result["success"] is True
+
+    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+    def test_create_pull_request_review_comment_success(self, mock_post, mcp):
+        mock_response = MagicMock()
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"id": 12, "path": "src/main.ts"}
+        mock_post.return_value = mock_response
+
+        with patch("os.getenv", return_value="ghp_test"):
+            register_tools(mcp, credentials=None)
+            create_review_comment = mcp._tool_manager._tools[
+                "github_create_pull_request_review_comment"
+            ].fn
+
+            result = create_review_comment(
+                owner="owner",
+                repo="repo",
+                pull_number=1,
+                body="Please update",
+                commit_id="abc123",
+                path="src/main.ts",
+                line=12,
             )
 
             assert result["success"] is True

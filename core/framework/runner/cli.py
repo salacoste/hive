@@ -6,6 +6,22 @@ import json
 import sys
 from pathlib import Path
 
+from framework.model_routing import resolve_model_chain, resolve_profile_for_command
+
+
+def _resolve_model_and_profile(
+    *,
+    command: str,
+    explicit_model: str | None,
+    explicit_profile: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve model/profile with command-aware defaults."""
+    profile = resolve_profile_for_command(command, explicit_profile)
+    if explicit_model:
+        return explicit_model, profile
+    chain = resolve_model_chain(profile=profile)
+    return (chain[0] if chain else None), profile
+
 
 def register_commands(subparsers: argparse._SubParsersAction) -> None:
     """Register runner commands with the main CLI."""
@@ -65,6 +81,12 @@ def register_commands(subparsers: argparse._SubParsersAction) -> None:
         help="LLM model to use (any LiteLLM-compatible name)",
     )
     run_parser.add_argument(
+        "--model-profile",
+        type=str,
+        default=None,
+        help="Model routing profile (heavy, implementation, documentation, review_validation)",
+    )
+    run_parser.add_argument(
         "--resume-session",
         type=str,
         default=None,
@@ -107,6 +129,19 @@ def register_commands(subparsers: argparse._SubParsersAction) -> None:
         type=str,
         help="Path to agent folder (containing agent.json)",
     )
+    validate_parser.add_argument(
+        "--model",
+        "-m",
+        type=str,
+        default=None,
+        help="LLM model override for validation",
+    )
+    validate_parser.add_argument(
+        "--model-profile",
+        type=str,
+        default=None,
+        help="Model routing profile override for validation",
+    )
     validate_parser.set_defaults(func=cmd_validate)
 
     # list command
@@ -146,6 +181,19 @@ def register_commands(subparsers: argparse._SubParsersAction) -> None:
         "--no-approve",
         action="store_true",
         help="Disable human-in-the-loop approval (auto-approve all steps)",
+    )
+    shell_parser.add_argument(
+        "--model",
+        "-m",
+        type=str,
+        default=None,
+        help="LLM model override for shell",
+    )
+    shell_parser.add_argument(
+        "--model-profile",
+        type=str,
+        default=None,
+        help="Model routing profile override for shell",
     )
     shell_parser.set_defaults(func=cmd_shell)
 
@@ -199,6 +247,12 @@ def register_commands(subparsers: argparse._SubParsersAction) -> None:
         help="LLM model for preloaded agents",
     )
     serve_parser.add_argument(
+        "--model-profile",
+        type=str,
+        default=None,
+        help="Model routing profile for server sessions",
+    )
+    serve_parser.add_argument(
         "--open",
         action="store_true",
         help="Open dashboard in browser after server starts",
@@ -241,6 +295,12 @@ def register_commands(subparsers: argparse._SubParsersAction) -> None:
         type=str,
         default=None,
         help="LLM model for preloaded agents",
+    )
+    open_parser.add_argument(
+        "--model-profile",
+        type=str,
+        default=None,
+        help="Model routing profile for server sessions",
     )
     open_parser.add_argument("--verbose", "-v", action="store_true", help="Enable INFO log level")
     open_parser.add_argument("--debug", action="store_true", help="Enable DEBUG log level")
@@ -387,12 +447,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
             return 1
 
+    resolved_model, resolved_profile = _resolve_model_and_profile(
+        command="run",
+        explicit_model=args.model,
+        explicit_profile=getattr(args, "model_profile", None),
+    )
+
     # Standard execution
     # AgentRunner handles credential setup interactively when stdin is a TTY.
     try:
         runner = AgentRunner.load(
             args.agent_path,
-            model=args.model,
+            model=resolved_model,
+            task_profile=resolved_profile,
         )
     except CredentialError as e:
         print(f"\n{e}", file=sys.stderr)
@@ -403,7 +470,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Prompt before starting (allows credential updates)
     if sys.stdin.isatty() and not args.quiet:
-        runner = _prompt_before_start(args.agent_path, runner, args.model)
+        runner = _prompt_before_start(args.agent_path, runner, resolved_model)
         if runner is None:
             return 1
 
@@ -597,8 +664,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
     from framework.credentials.models import CredentialError
     from framework.runner import AgentRunner
 
+    resolved_model, resolved_profile = _resolve_model_and_profile(
+        command="validate",
+        explicit_model=getattr(args, "model", None),
+        explicit_profile=getattr(args, "model_profile", None),
+    )
+
     try:
-        runner = AgentRunner.load(args.agent_path)
+        runner = AgentRunner.load(
+            args.agent_path,
+            model=resolved_model,
+            task_profile=resolved_profile,
+        )
     except CredentialError as e:
         print(f"\n{e}", file=sys.stderr)
         return 1
@@ -778,6 +855,11 @@ def cmd_shell(args: argparse.Namespace) -> int:
     from framework.runner import AgentRunner
 
     configure_logging(level="INFO")
+    resolved_model, resolved_profile = _resolve_model_and_profile(
+        command="shell",
+        explicit_model=getattr(args, "model", None),
+        explicit_profile=getattr(args, "model_profile", None),
+    )
 
     agents_dir = Path(args.agents_dir)
 
@@ -789,7 +871,11 @@ def cmd_shell(args: argparse.Namespace) -> int:
             return 1
 
     try:
-        runner = AgentRunner.load(agent_path)
+        runner = AgentRunner.load(
+            agent_path,
+            model=resolved_model,
+            task_profile=resolved_profile,
+        )
     except CredentialError as e:
         print(f"\n{e}", file=sys.stderr)
         return 1
@@ -1468,15 +1554,22 @@ def cmd_serve(args: argparse.Namespace) -> int:
         configure_logging(level="INFO")
 
     model = getattr(args, "model", None)
-    app = create_app(model=model)
+    model_profile = getattr(args, "model_profile", None)
+    app = create_app(model=model, model_profile=model_profile)
 
     async def run_server():
-        manager = app["manager"]
+        from framework.server.app import APP_KEY_MANAGER
+
+        manager = app[APP_KEY_MANAGER]
 
         # Preload agents specified via --agent
         for agent_path in args.agent:
             try:
-                session = await manager.create_session_with_worker_graph(agent_path, model=model)
+                session = await manager.create_session_with_worker_graph(
+                    agent_path,
+                    model=model,
+                    model_profile=model_profile,
+                )
                 info = session.worker_info
                 name = info.name if info else session.graph_id
                 print(f"Loaded agent: {session.graph_id} ({name})")
@@ -1532,3 +1625,8 @@ def cmd_open(args: argparse.Namespace) -> int:
     _ping_hive_gateway_availability("hive-open")
     args.open = True
     return cmd_serve(args)
+    resolved_model, resolved_profile = _resolve_model_and_profile(
+        command="shell",
+        explicit_model=getattr(args, "model", None),
+        explicit_profile=getattr(args, "model_profile", None),
+    )

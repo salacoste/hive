@@ -22,12 +22,15 @@ import logging
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 from aiohttp import web
 
 from framework.server.app import (
+    APP_KEY_MANAGER,
     resolve_session,
     validate_agent_path,
 )
@@ -37,7 +40,31 @@ logger = logging.getLogger(__name__)
 
 
 def _get_manager(request: web.Request) -> SessionManager:
-    return request.app["manager"]
+    return request.app[APP_KEY_MANAGER]
+
+
+def _resolve_session_storage_folder(
+    manager: SessionManager,
+    session_id: str,
+    *,
+    create: bool = False,
+) -> Path:
+    """Resolve effective queen storage folder for a session id.
+
+    Live sessions may persist into ``queen_resume_from``. For cold sessions
+    we use the requested id directly.
+    """
+    session = manager.get_session(session_id)
+    storage_session_id = (session.queen_resume_from or session.id) if session else session_id
+    root = (Path.home() / ".hive" / "queen" / "session").resolve()
+    folder = (root / storage_session_id).resolve()
+    try:
+        folder.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Invalid session storage path") from exc
+    if create:
+        folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def _session_to_live_dict(session) -> dict:
@@ -49,6 +76,7 @@ def _session_to_live_dict(session) -> dict:
     queen_model: str = getattr(getattr(session, "runner", None), "model", "") or ""
     return {
         "session_id": session.id,
+        "project_id": getattr(session, "project_id", "default"),
         "graph_id": session.graph_id,
         "graph_name": info.name if info else session.graph_id,
         "has_worker": session.graph_runtime is not None,
@@ -111,6 +139,7 @@ async def handle_create_session(request: web.Request) -> web.Response:
         "agent_id": "..." (optional — graph ID override),
         "session_id": "..." (optional — custom session ID),
         "model": "..." (optional),
+        "model_profile": "..." (optional),
         "initial_prompt": "..." (optional — first user message for the queen),
     }
 
@@ -124,7 +153,9 @@ async def handle_create_session(request: web.Request) -> web.Response:
     agent_id = body.get("agent_id")
     session_id = body.get("session_id")
     model = body.get("model")
+    model_profile = body.get("model_profile")
     initial_prompt = body.get("initial_prompt")
+    project_id = body.get("project_id")
     # When set, the queen writes conversations to this existing session's directory
     # so the full history accumulates in one place across server restarts.
     queen_resume_from = body.get("queen_resume_from")
@@ -143,16 +174,20 @@ async def handle_create_session(request: web.Request) -> web.Response:
                 agent_id=agent_id,
                 session_id=session_id,
                 model=model,
+                model_profile=model_profile,
                 initial_prompt=initial_prompt,
                 queen_resume_from=queen_resume_from,
+                project_id=project_id,
             )
         else:
             # Queen-only session
             session = await manager.create_session(
                 session_id=session_id,
                 model=model,
+                model_profile=model_profile,
                 initial_prompt=initial_prompt,
                 queen_resume_from=queen_resume_from,
+                project_id=project_id,
             )
     except ValueError as e:
         msg = str(e)
@@ -160,6 +195,21 @@ async def handle_create_session(request: web.Request) -> web.Response:
             resolved_id = agent_id or (Path(agent_path).name if agent_path else "")
             return web.json_response(
                 {"error": msg, "graph_id": resolved_id, "loading": True},
+                status=409,
+            )
+        if msg.startswith("Project '") and msg.endswith("' not found"):
+            available = [
+                str(p.get("id"))
+                for p in manager.list_projects()
+                if isinstance(p, dict) and p.get("id")
+            ]
+            return web.json_response(
+                {
+                    "error": msg,
+                    "hint": "Use an existing project_id from /api/projects or omit project_id to use the default.",
+                    "default_project_id": manager.default_project_id(),
+                    "available_project_ids": available,
+                },
                 status=409,
             )
         return web.json_response({"error": msg}, status=409)
@@ -181,7 +231,8 @@ async def handle_create_session(request: web.Request) -> web.Response:
 async def handle_list_live_sessions(request: web.Request) -> web.Response:
     """GET /api/sessions — list all active sessions."""
     manager = _get_manager(request)
-    sessions = [_session_to_live_dict(s) for s in manager.list_sessions()]
+    project_id = request.query.get("project_id")
+    sessions = [_session_to_live_dict(s) for s in manager.list_sessions(project_id=project_id)]
     return web.json_response({"sessions": sessions})
 
 
@@ -274,7 +325,12 @@ async def handle_stop_session(request: web.Request) -> web.Response:
 async def handle_load_graph(request: web.Request) -> web.Response:
     """POST /api/sessions/{session_id}/graph — load a graph into a session.
 
-    Body: {"agent_path": "...", "graph_id": "..." (optional), "model": "..." (optional)}
+    Body: {
+      "agent_path": "...",
+      "graph_id": "..." (optional),
+      "model": "..." (optional),
+      "model_profile": "..." (optional)
+    }
     """
     manager = _get_manager(request)
     session_id = request.match_info["session_id"]
@@ -291,6 +347,7 @@ async def handle_load_graph(request: web.Request) -> web.Response:
 
     graph_id = body.get("graph_id")
     model = body.get("model")
+    model_profile = body.get("model_profile")
 
     try:
         session = await manager.load_graph(
@@ -298,6 +355,7 @@ async def handle_load_graph(request: web.Request) -> web.Response:
             agent_path,
             graph_id=graph_id,
             model=model,
+            model_profile=model_profile,
         )
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=409)
@@ -613,6 +671,7 @@ async def handle_session_history(request: web.Request) -> web.Response:
     server restart have ``live: false, cold: true``.
     """
     manager = _get_manager(request)
+    project_id = request.query.get("project_id")
     live_sessions = {s.id: s for s in manager.list_sessions()}
 
     disk_sessions = SessionManager.list_cold_sessions()
@@ -626,6 +685,11 @@ async def handle_session_history(request: web.Request) -> web.Response:
                 s["agent_name"] = live.worker_info.name
             if not s.get("agent_path") and live.worker_path:
                 s["agent_path"] = str(live.worker_path)
+            if not s.get("project_id"):
+                s["project_id"] = getattr(live, "project_id", None)
+
+    if project_id:
+        disk_sessions = [s for s in disk_sessions if s.get("project_id") == project_id]
 
     return web.json_response({"sessions": disk_sessions})
 
@@ -692,25 +756,113 @@ async def handle_discover(request: web.Request) -> web.Response:
 
 async def handle_reveal_session_folder(request: web.Request) -> web.Response:
     """POST /api/sessions/{session_id}/reveal — open session data folder in the OS file manager."""
-    manager: SessionManager = request.app["manager"]
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
     session_id = request.match_info["session_id"]
 
-    session = manager.get_session(session_id)
-    storage_session_id = (session.queen_resume_from or session.id) if session else session_id
-    folder = Path.home() / ".hive" / "queen" / "session" / storage_session_id
-    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        folder = _resolve_session_storage_folder(manager, session_id, create=True)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"error": f"Failed to prepare session folder: {exc}"}, status=500)
+
+    if sys.platform == "darwin":
+        cmd = ["open", str(folder)]
+    elif sys.platform == "win32":
+        cmd = ["explorer", str(folder)]
+    else:
+        cmd = ["xdg-open", str(folder)]
 
     try:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", str(folder)])
-        elif sys.platform == "win32":
-            subprocess.Popen(["explorer", str(folder)])
-        else:
-            subprocess.Popen(["xdg-open", str(folder)])
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=5)
+        if proc.returncode != 0:
+            details = (proc.stderr or proc.stdout or "").strip() or f"launcher exited with code {proc.returncode}"
+            return web.json_response(
+                {
+                    "path": str(folder),
+                    "opened": False,
+                    "error": details,
+                    "launcher": cmd[0],
+                }
+            )
+    except FileNotFoundError:
+        return web.json_response(
+            {
+                "path": str(folder),
+                "opened": False,
+                "error": f"Launcher '{cmd[0]}' is unavailable in this environment",
+                "hint": "Use Export to download the session archive (.zip).",
+                "launcher": cmd[0],
+            }
+        )
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(
+            {
+                "path": str(folder),
+                "opened": False,
+                "error": str(exc),
+                "launcher": cmd[0],
+            }
+        )
 
-    return web.json_response({"path": str(folder)})
+    return web.json_response({"path": str(folder), "opened": True, "launcher": cmd[0]})
+
+
+async def handle_export_session_folder(request: web.Request) -> web.StreamResponse:
+    """GET /api/sessions/{session_id}/export — download session data as .zip."""
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
+    session_id = request.match_info["session_id"]
+
+    try:
+        folder = _resolve_session_storage_folder(manager, session_id)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    if not folder.exists() or not folder.is_dir():
+        return web.json_response({"error": f"Session folder not found: {folder}"}, status=404)
+
+    safe_session_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in folder.name)
+    if not safe_session_id:
+        safe_session_id = "session"
+    archive_name = f"{safe_session_id}.zip"
+    archive_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=f"hive-session-{safe_session_id}-",
+            suffix=".zip",
+            delete=False,
+        ) as tmp:
+            archive_path = Path(tmp.name)
+
+        with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for entry in sorted(folder.rglob("*")):
+                if entry.is_file():
+                    zf.write(entry, arcname=str(entry.relative_to(folder)))
+
+        size = archive_path.stat().st_size
+        headers = {
+            "Content-Type": "application/zip",
+            "Content-Disposition": f'attachment; filename="{archive_name}"',
+            "Content-Length": str(size),
+        }
+        response = web.StreamResponse(status=200, headers=headers)
+        await response.prepare(request)
+        with archive_path.open("rb") as f:
+            while True:
+                chunk = f.read(256 * 1024)
+                if not chunk:
+                    break
+                await response.write(chunk)
+        await response.write_eof()
+        return response
+    except Exception as exc:
+        logger.exception("Failed to export session folder '%s': %s", folder, exc)
+        return web.json_response({"error": f"Failed to export session folder: {exc}"}, status=500)
+    finally:
+        if archive_path is not None:
+            with contextlib.suppress(OSError):
+                archive_path.unlink()
 
 
 # ------------------------------------------------------------------
@@ -738,6 +890,7 @@ def register_routes(app: web.Application) -> None:
 
     # Session info
     app.router.add_post("/api/sessions/{session_id}/reveal", handle_reveal_session_folder)
+    app.router.add_get("/api/sessions/{session_id}/export", handle_export_session_folder)
     app.router.add_get("/api/sessions/{session_id}/stats", handle_session_stats)
     app.router.add_get("/api/sessions/{session_id}/entry-points", handle_session_entry_points)
     app.router.add_patch(

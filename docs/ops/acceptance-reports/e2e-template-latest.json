@@ -1,0 +1,59 @@
+{
+  "status": "ok",
+  "started_at": 1776388766.545978,
+  "finished_at": 1776388766.7140632,
+  "duration_seconds": 0.168,
+  "base_url": "http://localhost:8787",
+  "strict_onboarding": false,
+  "scenarios_total": 1,
+  "scenarios_ok": 1,
+  "scenarios_failed": 0,
+  "scenarios_skipped": 0,
+  "results": [
+    {
+      "project_id": "e2e-template-1776388766-88766",
+      "repository": "https://github.com/aden-hive/hive",
+      "steps": [
+        {
+          "name": "onboarding",
+          "status": 202
+        },
+        {
+          "name": "backlog_create",
+          "status": 201
+        },
+        {
+          "name": "execute_next",
+          "status": 200
+        },
+        {
+          "name": "run_report",
+          "status": 200
+        }
+      ],
+      "trace": {
+        "onboarding_ready": false,
+        "workspace_path": "",
+        "onboarding_failed_checks": [],
+        "onboarding_deferred": true,
+        "deferred_reason": "onboarding_not_ready",
+        "task_id": "task_b5cc665b90",
+        "run_id": "run_7f572183f5",
+        "terminal": false,
+        "terminal_status": null,
+        "selected_task_id": "task_b5cc665b90",
+        "report_endpoint": "/api/projects/e2e-template-1776388766-88766/autonomous/runs/run_7f572183f5/report",
+        "terminal_state": "manual_deferred_onboarding",
+        "template_repository_source": "default_fallback"
+      },
+      "scenario": "template_repo",
+      "ok": true,
+      "project_created": "e2e-template-1776388766-88766",
+      "cleanup": {
+        "status": 200,
+        "ok": true,
+        "error": null
+      }
+    }
+  ]
+}

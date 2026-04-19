@@ -23,6 +23,7 @@ from framework.graph.edge import (
 from framework.graph.executor import ExecutionResult
 from framework.graph.node import NodeSpec
 from framework.llm.provider import LLMProvider, Tool
+from framework.model_routing import resolve_model_chain, resolve_model_connection
 from framework.runner.preload_validation import run_preload_validation
 from framework.runner.tool_registry import ToolRegistry
 from framework.runtime.agent_runtime import AgentRuntime, AgentRuntimeConfig, create_agent_runtime
@@ -1005,8 +1006,11 @@ class AgentRunner:
     """
 
     @staticmethod
-    def _resolve_default_model() -> str:
-        """Resolve the default model from ~/.hive/configuration.json."""
+    def _resolve_default_model(task_profile: str | None = None) -> str:
+        """Resolve default model from profile routing first, then global config."""
+        chain = resolve_model_chain(profile=task_profile)
+        if chain:
+            return chain[0]
         return get_preferred_model()
 
     def __init__(
@@ -1017,6 +1021,7 @@ class AgentRunner:
         mock_mode: bool = False,
         storage_path: Path | None = None,
         model: str | None = None,
+        task_profile: str | None = None,
         intro_message: str = "",
         runtime_config: "AgentRuntimeConfig | None" = None,
         interactive: bool = True,
@@ -1050,7 +1055,8 @@ class AgentRunner:
         self.graph = graph
         self.goal = goal
         self.mock_mode = mock_mode
-        self.model = model or self._resolve_default_model()
+        self.task_profile = task_profile
+        self.model = model or self._resolve_default_model(task_profile)
         self.intro_message = intro_message
         self.runtime_config = runtime_config
         self._interactive = interactive
@@ -1155,6 +1161,7 @@ class AgentRunner:
         mock_mode: bool = False,
         storage_path: Path | None = None,
         model: str | None = None,
+        task_profile: str | None = None,
         interactive: bool = True,
         skip_credential_validation: bool | None = None,
         credential_store: Any | None = None,
@@ -1171,6 +1178,8 @@ class AgentRunner:
             mock_mode: If True, use mock LLM responses
             storage_path: Path for runtime storage (defaults to ~/.hive/agents/{name})
             model: LLM model to use (reads from agent's default_config if None)
+            task_profile: Optional model routing profile (heavy, implementation,
+                documentation, review_validation). Applied only when model is None.
             interactive: If True (default), offer interactive credential setup.
                 Set to False from TUI callers that handle setup via their own UI.
             skip_credential_validation: If True, skip credential checks at load time.
@@ -1285,6 +1294,7 @@ class AgentRunner:
                 mock_mode=mock_mode,
                 storage_path=storage_path,
                 model=model,
+                task_profile=task_profile,
                 intro_message=intro_message,
                 runtime_config=agent_runtime_config,
                 interactive=interactive,
@@ -1325,6 +1335,7 @@ class AgentRunner:
             mock_mode=mock_mode,
             storage_path=storage_path,
             model=model,
+            task_profile=task_profile,
             interactive=interactive,
             skip_credential_validation=skip_credential_validation or False,
             credential_store=credential_store,
@@ -1633,6 +1644,8 @@ class AgentRunner:
                     )
                     raise CredentialError(f"LLM API key not found for model '{self.model}'. {hint}")
 
+            self._apply_model_fallback_chain()
+
         # For GCU nodes: auto-register GCU MCP server if needed, then expand tool lists
         has_gcu_nodes = any(node.node_type == "gcu" for node in self.graph.nodes)
         if has_gcu_nodes:
@@ -1757,6 +1770,12 @@ class AgentRunner:
             return "REPLICATE_API_KEY"
         elif model_lower.startswith("together/"):
             return "TOGETHER_API_KEY"
+        elif (
+            model_lower.startswith("glm-")
+            or model_lower.startswith("zai-glm")
+            or model_lower.startswith("z-ai/")
+        ):
+            return "ZAI_API_KEY"
         elif model_lower.startswith("minimax/") or model_lower.startswith("minimax-"):
             return "MINIMAX_API_KEY"
         elif model_lower.startswith("kimi/"):
@@ -1817,6 +1836,51 @@ class AgentRunner:
             "llamacpp/",
         )
         return model.lower().startswith(LOCAL_PREFIXES)
+
+    def _apply_model_fallback_chain(self) -> None:
+        """Wrap current provider with fallback providers from task profile routing."""
+        if self._llm is None:
+            return
+        if not self.task_profile:
+            return
+        from framework.llm.fallback import FallbackLLMProvider
+        from framework.llm.litellm import LiteLLMProvider
+
+        chain = resolve_model_chain(explicit_model=self.model, profile=self.task_profile)
+        # Need at least one fallback beyond the primary.
+        if len(chain) <= 1:
+            return
+
+        providers = [self._llm]
+        seen_provider_signatures: set[tuple[str, str]] = {
+            (
+                str(getattr(self._llm, "model", "")).strip().lower(),
+                str(getattr(self._llm, "api_base", "") or "").strip().rstrip("/"),
+            )
+        }
+        cfg = get_hive_config()
+        for backup_model in chain[1:]:
+            conn = resolve_model_connection(backup_model, cfg)
+            api_key_env = conn.get("api_key_env_var")
+            api_base = conn.get("api_base")
+            api_base_env = conn.get("api_base_env_var")
+            if api_base_env and not api_base:
+                api_base = os.environ.get(api_base_env)
+            api_key = os.environ.get(str(api_key_env)) if api_key_env else None
+            candidate = LiteLLMProvider(
+                model=backup_model,
+                api_key=api_key,
+                api_base=api_base,
+            )
+            signature = (
+                str(getattr(candidate, "model", "")).strip().lower(),
+                str(getattr(candidate, "api_base", "") or "").strip().rstrip("/"),
+            )
+            if signature in seen_provider_signatures:
+                continue
+            seen_provider_signatures.add(signature)
+            providers.append(candidate)
+        self._llm = FallbackLLMProvider(providers)
 
     def _setup_agent_runtime(
         self,

@@ -13,6 +13,11 @@ out/
 .env
 .env.local
 .env.*.local
+.env.*
+.env-*
+!.env.mcp.example
+!.env.example
+!.env.*.example
 .venv
 /venv
 tools/src/uv.lock
@@ -62,6 +67,11 @@ __pycache__/
 
 # Generated runtime data
 core/data/
+.hive/
+projects/
+workspaces/
+.claude/sessions/
+.claude/state/
 
 # Misc
 *.local
@@ -82,3 +92,10 @@ screenshots/*
 
 .gemini/*
 .coverage
+
+# Local operational artifacts (keep local, don't publish)
+docs/ops/acceptance-reports/*.json
+docs/ops/backlog-status/*.json
+docs/ops/google-canary/*.json
+docs/ops/telegram-signoff/*.json
+docs/ops/upstream-migration/replay-bundles/*.tar.gz

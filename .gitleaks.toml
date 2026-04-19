@@ -1,0 +1,14 @@
+title = "Hive local baseline gitleaks config"
+
+[allowlist]
+description = "Allow known test/example token-like strings"
+paths = [
+  '''^tools/tests/''',
+  '''^examples/templates/''',
+  '''^tools/src/aden_tools/tools/.*/README\.md$'''
+]
+regexes = [
+  '''xox[baprs]-test-token''',
+  '''xoxp-your-user-token-here''',
+  '''xoxb-your-bot-token-here'''
+]

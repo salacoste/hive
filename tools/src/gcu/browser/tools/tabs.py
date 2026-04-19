@@ -87,9 +87,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_tabs", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_tabs", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
@@ -128,9 +126,18 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
 
         try:
-            # Create tab in the group
-            result = await bridge.create_tab(url=url, group_id=ctx.get("groupId"))
-            tab_id = result.get("tabId")
+            # Reuse the seed about:blank tab from context.create on first open
+            seed_tab = ctx.pop("_seedTabId", None)
+            if seed_tab is not None:
+                tab_id = seed_tab
+            else:
+                result = await bridge.create_tab(url=url, group_id=ctx.get("groupId"))
+                tab_id = result.get("tabId")
+
+            # Track tab_ids so browser_stop can clear per-tab caches
+            # for every tab in this profile at once.
+            if tab_id is not None:
+                ctx.setdefault("tabs", set()).add(tab_id)
 
             # Update active tab if not background
             if not background and tab_id is not None:
@@ -156,9 +163,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_open", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_open", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
@@ -201,6 +206,12 @@ def register_tab_tools(mcp: FastMCP) -> None:
         try:
             await bridge.close_tab(target_tab)
 
+            # Forget the closed tab so ctx["tabs"] only reflects tabs
+            # that could still get per-tab cache activity.
+            tabs_set = ctx.get("tabs")
+            if isinstance(tabs_set, set):
+                tabs_set.discard(target_tab)
+
             # Update active tab if we closed it
             if ctx.get("activeTabId") == target_tab:
                 result = await bridge.list_tabs(ctx.get("groupId"))
@@ -217,9 +228,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_close", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_close", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
@@ -262,9 +271,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             return result
         except Exception as e:
             result = {"ok": False, "error": str(e)}
-            log_tool_call(
-                "browser_focus", params, error=e, duration_ms=(time.perf_counter() - start) * 1000
-            )
+            log_tool_call("browser_focus", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
             return result
 
     @mcp.tool()
@@ -304,6 +311,7 @@ def register_tab_tools(mcp: FastMCP) -> None:
             active_tab_id = ctx.get("activeTabId")
 
             closed = 0
+            tabs_set = ctx.get("tabs") if isinstance(ctx.get("tabs"), set) else None
             for tab in tabs:
                 tid = tab.get("id")
                 if keep_active and tid == active_tab_id:
@@ -311,6 +319,8 @@ def register_tab_tools(mcp: FastMCP) -> None:
                 try:
                     await bridge.close_tab(tid)
                     closed += 1
+                    if tabs_set is not None and tid is not None:
+                        tabs_set.discard(tid)
                 except Exception:
                     pass
 

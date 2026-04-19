@@ -391,9 +391,7 @@ def register_tools(
                 )
             token = credentials.get("google")
             if token is not None and not isinstance(token, str):
-                raise TypeError(
-                    f"Expected string from credentials.get('google'), got {type(token).__name__}"
-                )
+                raise TypeError(f"Expected string from credentials.get('google'), got {type(token).__name__}")
             return token
         return get_google_access_token_from_env_or_file()
 
@@ -403,10 +401,7 @@ def register_tools(
         if not token:
             return {
                 "error": "Google Docs credentials not configured",
-                "help": (
-                    "Set GOOGLE_ACCESS_TOKEN environment variable "
-                    "or configure 'google' via credential store"
-                ),
+                "help": ("Set GOOGLE_ACCESS_TOKEN environment variable or configure 'google' via credential store"),
             }
         return _GoogleDocsClient(token)
 
@@ -608,10 +603,7 @@ def register_tools(
             return client
 
         foreground_color = None
-        if any(
-            c is not None
-            for c in [foreground_color_red, foreground_color_green, foreground_color_blue]
-        ):
+        if any(c is not None for c in [foreground_color_red, foreground_color_green, foreground_color_blue]):
             foreground_color = {
                 "red": foreground_color_red or 0.0,
                 "green": foreground_color_green or 0.0,

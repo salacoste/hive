@@ -9,8 +9,8 @@ AST nodes, disallowed function calls).
 
 import pytest
 
-import framework.orchestrator.safe_eval as safe_eval_module
-from framework.orchestrator.safe_eval import safe_eval
+import framework.graph.safe_eval as safe_eval_module
+from framework.graph.safe_eval import safe_eval
 
 # ---------------------------------------------------------------------------
 # Literals and constants
@@ -113,10 +113,7 @@ class TestArithmetic:
 
 class TestExecutionTimeout:
     def test_default_timeout(self):
-        import signal
-
-        expected = 100 if hasattr(signal, "SIGALRM") else 500
-        assert safe_eval_module.DEFAULT_TIMEOUT_MS == expected
+        assert safe_eval_module.DEFAULT_TIMEOUT_MS == 100
 
     def test_timeout_must_be_positive(self):
         with pytest.raises(ValueError, match="timeout_ms"):

@@ -24,6 +24,7 @@ from framework.llm.litellm import (
     OPENROUTER_TOOL_COMPAT_MODEL_CACHE,
     LiteLLMProvider,
     _compute_retry_delay,
+    _dump_failed_request,
     _ensure_ollama_chat_prefix,
     _is_ollama_model,
     _summarize_request_for_log,
@@ -433,6 +434,53 @@ class TestJsonMode:
         assert messages[0]["content"] == "You are helpful."
 
     @patch("litellm.completion")
+    def test_response_format_json_object_adds_json_hint_when_missing(self, mock_completion):
+        """json_object response format should ensure prompt includes 'json' keyword."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"ok": true}'
+        mock_response.choices[0].finish_reason = "stop"
+        mock_response.model = "gpt-5.4"
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 5
+        mock_completion.return_value = mock_response
+
+        provider = LiteLLMProvider(model="gpt-5.4", api_key="test-key")
+        provider.complete(
+            messages=[{"role": "user", "content": "Return structured output"}],
+            response_format={"type": "json_object"},
+        )
+
+        call_kwargs = mock_completion.call_args[1]
+        messages = call_kwargs["messages"]
+        assert any("json" in str(msg.get("content", "")).lower() for msg in messages)
+        assert messages[-1]["role"] == "user"
+        assert "json" in messages[-1]["content"].lower()
+        assert call_kwargs["response_format"] == {"type": "json_object"}
+
+    @patch("litellm.completion")
+    def test_response_format_json_object_keeps_existing_json_hint(self, mock_completion):
+        """When input already mentions JSON, provider should not inject extra system hint."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"ok": true}'
+        mock_response.choices[0].finish_reason = "stop"
+        mock_response.model = "gpt-5.4"
+        mock_response.usage.prompt_tokens = 10
+        mock_response.usage.completion_tokens = 5
+        mock_completion.return_value = mock_response
+
+        provider = LiteLLMProvider(model="gpt-5.4", api_key="test-key")
+        provider.complete(
+            messages=[{"role": "user", "content": "Return JSON object only"}],
+            response_format={"type": "json_object"},
+        )
+
+        call_kwargs = mock_completion.call_args[1]
+        messages = call_kwargs["messages"]
+        assert messages[0]["role"] == "user"
+
+    @patch("litellm.completion")
     def test_anthropic_provider_passes_json_mode(self, mock_completion):
         """Test that AnthropicProvider passes json_mode through (prompt engineering)."""
         mock_response = MagicMock()
@@ -564,6 +612,40 @@ class TestComputeRetryDelay:
         """Server-provided ms delay should be capped at max_delay."""
         exc = _make_exception_with_headers({"retry-after-ms": "300000"})  # 300s
         assert _compute_retry_delay(0, exception=exc) == 120  # capped
+
+
+class TestDumpFailedRequest:
+    def test_dump_failed_request_success(self, tmp_path, monkeypatch):
+        failed_dir = tmp_path / "failed_requests"
+        monkeypatch.setattr("framework.llm.litellm.FAILED_REQUESTS_DIR", failed_dir)
+
+        dump_path = _dump_failed_request(
+            model="openai/gpt-4o-mini",
+            kwargs={"messages": [{"role": "user", "content": "hello"}]},
+            error_type="rate_limit",
+            attempt=1,
+        )
+
+        assert dump_path.endswith(".json")
+        assert os.path.exists(dump_path)
+
+    def test_dump_failed_request_oserror_returns_marker(self, tmp_path, monkeypatch):
+        failed_dir = tmp_path / "failed_requests"
+        monkeypatch.setattr("framework.llm.litellm.FAILED_REQUESTS_DIR", failed_dir)
+
+        def _raise_oserror(*args, **kwargs):
+            raise OSError("Read-only file system")
+
+        monkeypatch.setattr("builtins.open", _raise_oserror)
+
+        dump_path = _dump_failed_request(
+            model="openai/gpt-4o-mini",
+            kwargs={"messages": [{"role": "user", "content": "hello"}]},
+            error_type="rate_limit",
+            attempt=1,
+        )
+
+        assert dump_path == "log_write_failed"
 
 
 def _make_exception_with_headers(headers: dict[str, str]) -> BaseException:

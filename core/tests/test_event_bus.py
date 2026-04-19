@@ -11,7 +11,7 @@ from datetime import datetime
 
 import pytest
 
-from framework.host.event_bus import (
+from framework.runtime.event_bus import (
     AgentEvent,
     EventBus,
     EventType,
@@ -67,12 +67,11 @@ class TestAgentEvent:
             execution_id="exec_1",
             data={"output": "result"},
             correlation_id="corr_1",
-            colony_id="colony_1",
+            graph_id="graph_1",
         )
         d = event.to_dict()
         assert d["type"] == "execution_completed"
         assert d["stream_id"] == "stream_1"
-        assert d["colony_id"] == "colony_1"
 
     def test_to_dict_includes_run_id(self):
         """run_id is included in to_dict() when set."""
@@ -274,8 +273,12 @@ class TestEventFiltering:
             filter_node="node_x",
         )
 
-        await bus.publish(AgentEvent(type=EventType.NODE_LOOP_STARTED, stream_id="s", node_id="node_x"))
-        await bus.publish(AgentEvent(type=EventType.NODE_LOOP_STARTED, stream_id="s", node_id="node_y"))
+        await bus.publish(
+            AgentEvent(type=EventType.NODE_LOOP_STARTED, stream_id="s", node_id="node_x")
+        )
+        await bus.publish(
+            AgentEvent(type=EventType.NODE_LOOP_STARTED, stream_id="s", node_id="node_y")
+        )
 
         assert received == ["node_x"]
 
@@ -294,8 +297,12 @@ class TestEventFiltering:
             filter_execution="exec_1",
         )
 
-        await bus.publish(AgentEvent(type=EventType.EXECUTION_COMPLETED, stream_id="s", execution_id="exec_1"))
-        await bus.publish(AgentEvent(type=EventType.EXECUTION_COMPLETED, stream_id="s", execution_id="exec_2"))
+        await bus.publish(
+            AgentEvent(type=EventType.EXECUTION_COMPLETED, stream_id="s", execution_id="exec_1")
+        )
+        await bus.publish(
+            AgentEvent(type=EventType.EXECUTION_COMPLETED, stream_id="s", execution_id="exec_2")
+        )
 
         assert received == ["exec_1"]
 
@@ -343,24 +350,28 @@ class TestEventFiltering:
         assert len(received) == 1
 
     @pytest.mark.asyncio
-    async def test_filter_by_colony(self):
-        """filter_colony only receives events from that colony."""
+    async def test_filter_by_graph(self):
+        """filter_graph only receives events from that graph."""
         bus = EventBus()
         received = []
 
         async def handler(event: AgentEvent) -> None:
-            received.append(event.colony_id)
+            received.append(event.graph_id)
 
         bus.subscribe(
             event_types=[EventType.EXECUTION_STARTED],
             handler=handler,
-            filter_colony="colony_a",
+            filter_graph="graph_a",
         )
 
-        await bus.publish(AgentEvent(type=EventType.EXECUTION_STARTED, stream_id="s", colony_id="colony_a"))
-        await bus.publish(AgentEvent(type=EventType.EXECUTION_STARTED, stream_id="s", colony_id="colony_b"))
+        await bus.publish(
+            AgentEvent(type=EventType.EXECUTION_STARTED, stream_id="s", graph_id="graph_a")
+        )
+        await bus.publish(
+            AgentEvent(type=EventType.EXECUTION_STARTED, stream_id="s", graph_id="graph_b")
+        )
 
-        assert received == ["colony_a"]
+        assert received == ["graph_a"]
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +855,9 @@ class TestConveniencePublishers:
 
         assert len(received) == 1
         assert received[0].type == EventType.NODE_ACTION_PLAN
-        assert received[0].data["plan"] == "1. Search for data\n2. Analyze results\n3. Generate report"
+        assert (
+            received[0].data["plan"] == "1. Search for data\n2. Analyze results\n3. Generate report"
+        )
 
     @pytest.mark.asyncio
     async def test_emit_subagent_report(self):
@@ -902,10 +915,13 @@ class TestEventType:
         assert EventType.ESCALATION_REQUESTED
         assert EventType.LLM_TURN_COMPLETE
         assert EventType.NODE_ACTION_PLAN
-        assert EventType.WORKER_COLONY_LOADED
+        assert EventType.WORKER_GRAPH_LOADED
         assert EventType.CREDENTIALS_REQUIRED
         assert EventType.EXECUTION_RESURRECTED
+        assert EventType.DRAFT_GRAPH_UPDATED
+        assert EventType.FLOWCHART_MAP_UPDATED
         assert EventType.QUEEN_PHASE_CHANGED
+        assert EventType.QUEEN_PERSONA_SELECTED
         assert EventType.SUBAGENT_REPORT
         assert EventType.TRIGGER_AVAILABLE
         assert EventType.TRIGGER_FIRED

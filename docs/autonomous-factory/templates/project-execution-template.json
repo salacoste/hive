@@ -1,0 +1,33 @@
+{
+  "execution_template": {
+    "default_flow": [
+      {
+        "stage": "design",
+        "mode": "queen_plan",
+        "model_profile": "strategy_heavy"
+      },
+      {
+        "stage": "implement",
+        "mode": "worker_execute",
+        "model_profile": "implementation"
+      },
+      {
+        "stage": "review",
+        "mode": "worker_review",
+        "model_profile": "review_validation"
+      },
+      {
+        "stage": "validate",
+        "mode": "worker_validate",
+        "model_profile": "review_validation"
+      }
+    ],
+    "retry_policy": {
+      "max_retries_per_stage": 1,
+      "escalate_on": [
+        "review",
+        "validate"
+      ]
+    }
+  }
+}

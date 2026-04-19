@@ -1,0 +1,83 @@
+# Hive repository automation manifest template
+# Save as: automation/hive.manifest.yaml
+
+schema_version: "1.0"
+
+repository:
+  name: "example-repo"
+  stack: "node" # node | python | go | jvm | rust | fullstack
+  repo_type: "single" # single | monorepo
+
+workspace:
+  default_workdir: "."
+  workdirs:
+    - "."
+
+automation:
+  install:
+    - "npm ci"
+  lint:
+    - "npm run lint"
+  typecheck:
+    - "npm run typecheck"
+  test:
+    - "npm test -- --runInBand"
+  build:
+    - "npm run build"
+  smoke:
+    - "npm run smoke"
+
+execution:
+  default_flow:
+    - stage: "design"
+      mode: "queen_plan"
+      model_profile: "strategy_heavy"
+    - stage: "implement"
+      mode: "worker_execute"
+      model_profile: "implementation"
+    - stage: "review"
+      mode: "worker_review"
+      model_profile: "review_validation"
+    - stage: "validate"
+      mode: "worker_validate"
+      model_profile: "review_validation"
+  retry_policy:
+    max_retries_per_stage: 1
+    escalate_on:
+      - "review"
+      - "validate"
+
+policies:
+  require_approval:
+    - "database_write"
+    - "schema_migration"
+    - "infra_change"
+    - "production_config_change"
+  blocked_actions:
+    - "force_push_main"
+    - "direct_prod_db_write"
+
+github:
+  branch_prefix: "hive/task"
+  pr_title_prefix: "[Hive]"
+  required_checks:
+    - "lint"
+    - "test"
+    - "build"
+
+secrets:
+  required:
+    - "GITHUB_APP_TOKEN"
+  optional:
+    - "SENTRY_AUTH_TOKEN"
+
+database:
+  mode: "readonly" # readonly | approval_write
+  migration_command: ""
+
+service_access:
+  outbound_allowlist:
+    - "api.github.com"
+  internal_services:
+    - "ci"
+    - "artifact-store"

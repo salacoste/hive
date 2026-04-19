@@ -7,242 +7,109 @@ and queen orchestration concerns separate.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import time as _time_mod
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from framework.agent_loop.internals.types import HookContext, HookResult
-    from framework.loader.tool_registry import ToolRegistry
     from framework.server.session_manager import Session
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of unanswered worker escalations the queen's inbox will
-# buffer before auto-replying queue_full to new ones.
-MAX_PENDING_ESCALATIONS = 32
 
-
-def install_worker_escalation_routing(
-    session: Session,
-    *,
-    colony_runtime: Any | None = None,
-) -> str | None:
-    """Install the colony-scoped worker escalation handler on the queen bus.
-
-    Every worker ``escalate()`` call emits ESCALATION_REQUESTED stamped with
-    colony_id (by StreamEventBus) and a request_id (by AgentLoop). This
-    handler records the escalation in ``session.pending_escalations`` so the
-    queen can look it up by request_id later, and surfaces it to the queen
-    loop as an addressed [WORKER_ESCALATION] inject.
-
-    When ``colony_runtime`` is provided the subscription is scoped with
-    ``filter_colony`` so only escalations from workers in *this* queen's
-    colony are delivered — cross-colony leakage is structurally impossible.
-    Falls back to the raw session bus when no colony is attached.
-
-    Returns the subscription id (for unsubscribe) or ``None`` on failure.
-    """
-    from framework.host.event_bus import EventType
-
-    async def _on_worker_escalation(event):
-        stream_id = event.stream_id or ""
-        # Defensive: ignore any stray non-worker origin (e.g. queen).
-        if not stream_id.startswith("worker:"):
-            return
-        worker_id = stream_id[len("worker:") :]
-        data = event.data or {}
-        request_id = data.get("request_id")
-        reason = str(data.get("reason", "")).strip()
-        context_text = str(data.get("context", "")).strip()
-        node_label = event.node_id or "unknown_node"
-
-        # Back-pressure: if the queen's inbox is full, auto-reply to the
-        # worker so it unblocks instead of wedging forever.
-        if len(session.pending_escalations) >= MAX_PENDING_ESCALATIONS:
-            runtime = session.colony_runtime
-            if runtime is not None and worker_id:
-                try:
-                    await runtime.inject_input(
-                        worker_id,
-                        "[QUEEN_REPLY] queue_full — queen inbox saturated; proceed with best judgment or retry later.",
-                    )
-                except Exception:
-                    logger.warning(
-                        "Failed to send queue_full reply to worker %s",
-                        worker_id,
-                        exc_info=True,
-                    )
-            return
-
-        # Record the pending entry so reply_to_worker can address it.
-        if request_id:
-            session.pending_escalations[request_id] = {
-                "request_id": request_id,
-                "worker_id": worker_id,
-                "colony_id": event.colony_id,
-                "node_id": node_label,
-                "reason": reason,
-                "context": context_text,
-                "opened_at": _time_mod.time(),
-            }
-
-        # Surface the escalation to the queen as an addressed
-        # [WORKER_ESCALATION] message.
-        lines = ["[WORKER_ESCALATION]"]
-        if request_id:
-            lines.append(f"request_id: {request_id}")
-        lines.append(f"worker_id: {worker_id or 'unknown'}")
-        lines.append(f"node_id: {node_label}")
-        lines.append(f"reason: {reason or 'unspecified'}")
-        if context_text:
-            lines.append("context:")
-            lines.append(context_text)
-        if request_id:
-            lines.append(
-                "Use reply_to_worker(request_id, reply) to unblock, or list_worker_questions() to see all pending."
-            )
-        else:
-            lines.append("No request_id — use inject_message(content=...) to relay guidance manually.")
-        handoff = "\n".join(lines)
-
-        # Fallback: if the queen loop has gone away, publish a
-        # CLIENT_INPUT_REQUESTED so the human sees the question and the
-        # worker does not wedge.
-        queen_node = session.queen_executor.node_registry.get("queen") if session.queen_executor is not None else None
-        if queen_node is None or not hasattr(queen_node, "inject_event"):
-            if session.event_bus is not None:
-                await session.event_bus.emit_client_input_requested(
-                    stream_id="queen",
-                    node_id="queen",
-                    prompt=handoff,
-                    execution_id=session.id,
-                )
-            return
-
-        await queen_node.inject_event(handoff, is_client_input=False)
-
-    # Prefer colony-scoped subscription when a colony is loaded so
-    # filter_colony does the isolation work for us.
-    runtime = colony_runtime if colony_runtime is not None else session.colony_runtime
-    if runtime is not None:
-        try:
-            return runtime.subscribe_to_events(
-                [EventType.ESCALATION_REQUESTED],
-                _on_worker_escalation,
-                filter_colony=runtime.colony_id,
-            )
-        except Exception:
-            logger.warning("Failed to install colony-scoped escalation sub", exc_info=True)
-            # fall through to session bus
-    if session.event_bus is None:
+def _project_workspace_from_metadata(project: dict[str, Any] | None) -> str | None:
+    """Resolve preferred workspace path from project metadata."""
+    if not isinstance(project, dict):
         return None
-    return session.event_bus.subscribe(
-        event_types=[EventType.ESCALATION_REQUESTED],
-        handler=_on_worker_escalation,
-    )
+
+    def _norm(path: object) -> str | None:
+        raw = str(path or "").strip()
+        if not raw:
+            return None
+        resolved = Path(raw).expanduser().resolve()
+        return str(resolved) if resolved.exists() else None
+
+    direct = _norm(project.get("workspace_path"))
+    if direct:
+        return direct
+
+    profile = project.get("toolchain_profile")
+    if isinstance(profile, dict):
+        approved = profile.get("approved_plan")
+        if isinstance(approved, dict):
+            source = approved.get("source")
+            if isinstance(source, dict):
+                approved_ws = _norm(source.get("workspace_path"))
+                if approved_ws:
+                    return approved_ws
+    return None
 
 
-# Cache TTL for the ambient credentials block. The block is rebuilt at most
-# once per this interval; routes_credentials.invalidate_credentials_cache()
-# forces an immediate rebuild on save/delete.
-_CREDENTIALS_BLOCK_TTL_SECONDS = 30.0
-
-
-def _build_credentials_provider() -> Any:
-    """Return a closure that renders the ambient credentials block.
-
-    The closure snapshots connected accounts via CredentialStoreAdapter and
-    feeds them to build_accounts_prompt(). Output is connectivity-only —
-    provider, alias, identity. No status / valid / expires_at fields, since
-    those mislead the Queen the moment they go stale (liveness is enforced
-    at tool-call time via CredentialExpiredError instead).
-    """
-    import time
-
-    state: dict[str, Any] = {"cached": "", "cached_at": 0.0}
-
-    def _provider() -> str:
-        now = time.monotonic()
-        if state["cached"] and (now - state["cached_at"]) < _CREDENTIALS_BLOCK_TTL_SECONDS:
-            return state["cached"]
-
-        try:
-            from aden_tools.credentials.store_adapter import CredentialStoreAdapter
-
-            from framework.orchestrator.prompting import build_accounts_prompt
-
-            adapter = CredentialStoreAdapter.default()
-            accounts = adapter.get_all_account_info()
-            # Compact form (no tool_provider_map) — tool schemas already
-            # surface function names; baking the full per-provider list
-            # into the system prompt on every turn was ~2 KB of redundancy.
-            rendered = build_accounts_prompt(accounts)
-        except Exception:
-            logger.debug("Failed to render ambient credentials block", exc_info=True)
-            rendered = ""
-
-        state["cached"] = rendered
-        state["cached_at"] = now
-        return rendered
-
-    def _invalidate() -> None:
-        state["cached_at"] = 0.0
-
-    _provider.invalidate = _invalidate  # type: ignore[attr-defined]
-    return _provider
-
-
-def initialize_memory_scopes(session: Session, phase_state: Any) -> tuple[Path, Path]:
-    """Create and cache the global and queen-scoped memory directories."""
-    from framework.agents.queen.queen_memory_v2 import (
-        global_memory_dir,
-        init_memory_dir,
-        queen_memory_dir,
-    )
-
-    global_dir = global_memory_dir()
-    queen_dir = queen_memory_dir(session.queen_name)
-    init_memory_dir(global_dir)
-    init_memory_dir(queen_dir)
-    phase_state.global_memory_dir = global_dir
-    phase_state.queen_memory_dir = queen_dir
-    return global_dir, queen_dir
-
-
-async def materialize_queen_identity(
+def _workspace_allow_paths_for_session(
+    *,
     session: Session,
-    phase_state: Any,
-    queen_profile: dict,
-    event_bus: Any,
-) -> None:
-    """Format the queen identity prompt and set phase state.
+    session_manager: Any,
+) -> list[str]:
+    """Collect allowed workspace roots for coder-tools in this session."""
+    paths: list[str] = []
+    try:
+        project = session_manager.get_project(session.project_id)
+    except Exception:
+        project = None
 
-    Called after SessionManager has resolved and loaded the profile.
-    This function does no I/O — it only formats and caches.
-    """
-    from framework.agents.queen.queen_profiles import format_queen_identity_prompt
-    from framework.host.event_bus import AgentEvent, EventType
+    project_workspace = _project_workspace_from_metadata(project)
+    if project_workspace:
+        paths.append(project_workspace)
 
-    queen_id = session.queen_name
+    env_workspace_root = str(os.environ.get("HIVE_WORKSPACE_ROOT", "")).strip()
+    if env_workspace_root:
+        resolved = Path(env_workspace_root).expanduser().resolve()
+        if resolved.exists():
+            paths.append(str(resolved))
 
-    phase_state.queen_id = queen_id
-    phase_state.queen_profile = queen_profile
-    phase_state.queen_identity_prompt = format_queen_identity_prompt(queen_profile, max_examples=1)
+    extra = str(os.environ.get("HIVE_CODER_TOOLS_ALLOWED_PATHS", "")).strip()
+    if extra:
+        for part in extra.split(os.pathsep):
+            raw = part.strip()
+            if not raw:
+                continue
+            resolved = Path(raw).expanduser().resolve()
+            if resolved.exists():
+                paths.append(str(resolved))
 
-    if event_bus is not None:
-        await event_bus.publish(
-            AgentEvent(
-                type=EventType.QUEEN_IDENTITY_SELECTED,
-                stream_id="queen",
-                data={
-                    "queen_id": queen_id,
-                    "name": queen_profile.get("name", ""),
-                    "title": queen_profile.get("title", ""),
-                },
-            )
-        )
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in paths:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _patch_mcp_server_list_for_workspace(
+    *,
+    server_list: list[dict[str, Any]],
+    allow_paths: list[str],
+) -> list[dict[str, Any]]:
+    if not allow_paths:
+        return server_list
+    patched: list[dict[str, Any]] = []
+    joined = os.pathsep.join(allow_paths)
+    for server in server_list:
+        current = dict(server)
+        if str(current.get("name") or "") == "coder-tools":
+            env = dict(current.get("env") or {})
+            existing = str(env.get("CODER_TOOLS_ALLOWED_PATHS") or "").strip()
+            if existing:
+                env["CODER_TOOLS_ALLOWED_PATHS"] = os.pathsep.join([existing, joined])
+            else:
+                env["CODER_TOOLS_ALLOWED_PATHS"] = joined
+            current["env"] = env
+        patched.append(current)
+    return patched
 
 
 async def create_queen(
@@ -250,97 +117,146 @@ async def create_queen(
     session_manager: Any,
     worker_identity: str | None,
     queen_dir: Path,
-    queen_profile: dict,
     initial_prompt: str | None = None,
-    initial_phase: str | None = None,
-    tool_registry: ToolRegistry | None = None,
 ) -> asyncio.Task:
     """Build the queen executor and return the running asyncio task.
 
     Handles tool registration, phase-state initialization, prompt
-    composition, queen identity materialization, colony preparation, and the queen
+    composition, persona hook setup, graph preparation, and the queen
     event loop.
     """
     from framework.agents.queen.agent import (
         queen_goal,
-        queen_loop_config as _base_loop_config,
+        queen_graph as _queen_graph,
     )
     from framework.agents.queen.nodes import (
-        _QUEEN_INDEPENDENT_TOOLS,
-        _QUEEN_REVIEWING_TOOLS,
-        _QUEEN_WORKING_TOOLS,
+        _QUEEN_BUILDING_TOOLS,
+        _QUEEN_EDITING_TOOLS,
+        _QUEEN_PLANNING_TOOLS,
+        _QUEEN_RUNNING_TOOLS,
+        _QUEEN_STAGING_TOOLS,
+        _appendices,
+        _building_knowledge,
+        _planning_knowledge,
         _queen_behavior_always,
-        _queen_behavior_independent,
+        _queen_behavior_building,
+        _queen_behavior_editing,
+        _queen_behavior_planning,
+        _queen_behavior_running,
+        _queen_behavior_staging,
         _queen_character_core,
-        _queen_role_independent,
-        _queen_role_reviewing,
-        _queen_role_working,
+        _queen_identity_editing,
+        _queen_phase_7,
+        _queen_role_building,
+        _queen_role_planning,
+        _queen_role_running,
+        _queen_role_staging,
         _queen_style,
-        _queen_tools_independent,
-        _queen_tools_reviewing,
-        _queen_tools_working,
-        finalize_queen_prompt,
+        _queen_tools_building,
+        _queen_tools_editing,
+        _queen_tools_planning,
+        _queen_tools_running,
+        _queen_tools_staging,
+        _shared_building_knowledge,
     )
-    from framework.host.event_bus import AgentEvent, EventType
-    from framework.llm.capabilities import supports_image_tool_results
-    from framework.loader.mcp_registry import MCPRegistry
-    from framework.loader.tool_registry import ToolRegistry
+    from framework.agents.queen.nodes.thinking_hook import select_expert_persona
+    from framework.graph.event_loop_node import HookContext, HookResult
+    from framework.graph.executor import GraphExecutor
+    from framework.runner.mcp_registry import MCPRegistry
+    from framework.runner.tool_registry import ToolRegistry
+    from framework.runtime.core import Runtime
+    from framework.runtime.event_bus import AgentEvent, EventType
     from framework.tools.queen_lifecycle_tools import (
         QueenPhaseState,
         register_queen_lifecycle_tools,
     )
 
+    hive_home = Path.home() / ".hive"
+
     # ---- Tool registry ------------------------------------------------
-    # Use pre-loaded cached registry if available (fast path)
-    if tool_registry is not None:
-        queen_registry = tool_registry
-        logger.info("Queen: using pre-loaded tool registry with %d tools", len(queen_registry.get_tools()))
-    else:
-        # Build fresh (slow path - for backwards compatibility)
-        queen_registry = ToolRegistry()
-        import framework.agents.queen as _queen_pkg
+    queen_registry = ToolRegistry()
+    import framework.agents.queen as _queen_pkg
 
-        queen_pkg_dir = Path(_queen_pkg.__file__).parent
-        mcp_config = queen_pkg_dir / "mcp_servers.json"
-        if mcp_config.exists():
-            try:
-                queen_registry.load_mcp_config(mcp_config)
-                logger.info("Queen: loaded MCP tools from %s", mcp_config)
-            except Exception:
-                logger.warning("Queen: MCP config failed to load", exc_info=True)
-
+    queen_pkg_dir = Path(_queen_pkg.__file__).parent
+    mcp_config = queen_pkg_dir / "mcp_servers.json"
+    if mcp_config.exists():
         try:
-            registry = MCPRegistry()
-            registry.initialize()
-            if (queen_pkg_dir / "mcp_registry.json").is_file():
-                queen_registry.set_mcp_registry_agent_path(queen_pkg_dir)
-            registry_configs, selection_max_tools = registry.load_agent_selection(queen_pkg_dir)
-            if registry_configs:
-                results = queen_registry.load_registry_servers(
-                    registry_configs,
-                    preserve_existing_tools=True,
-                    log_collisions=True,
-                    max_tools=selection_max_tools,
+            with open(mcp_config, encoding="utf-8") as f:
+                config = json.load(f)
+            server_list = config.get("servers", [])
+            if not server_list and "servers" not in config:
+                server_list = [{"name": name, **cfg} for name, cfg in config.items()]
+            allow_paths = _workspace_allow_paths_for_session(
+                session=session,
+                session_manager=session_manager,
+            )
+            if allow_paths:
+                server_list = _patch_mcp_server_list_for_workspace(
+                    server_list=server_list,
+                    allow_paths=allow_paths,
                 )
-                logger.info("Queen: loaded MCP registry servers: %s", results)
+                logger.info(
+                    "Queen: coder-tools extra allowed roots for project '%s': %s",
+                    session.project_id,
+                    allow_paths,
+                )
+            resolved_server_list = [
+                queen_registry._resolve_mcp_server_config(server_config, mcp_config.parent)
+                for server_config in server_list
+            ]
+            queen_registry.load_registry_servers(
+                resolved_server_list,
+                log_summary=False,
+                preserve_existing_tools=True,
+                log_collisions=False,
+            )
+            logger.info("Queen: loaded MCP tools from %s", mcp_config)
         except Exception:
-            logger.warning("Queen: MCP registry config failed to load", exc_info=True)
+            logger.warning("Queen: MCP config failed to load", exc_info=True)
+
+    try:
+        registry = MCPRegistry()
+        registry.initialize()
+        if (queen_pkg_dir / "mcp_registry.json").is_file():
+            queen_registry.set_mcp_registry_agent_path(queen_pkg_dir)
+        registry_configs, selection_max_tools = registry.load_agent_selection(queen_pkg_dir)
+        if registry_configs:
+            results = queen_registry.load_registry_servers(
+                registry_configs,
+                preserve_existing_tools=True,
+                log_collisions=True,
+                max_tools=selection_max_tools,
+            )
+            logger.info("Queen: loaded MCP registry servers: %s", results)
+    except Exception:
+        logger.warning("Queen: MCP registry config failed to load", exc_info=True)
 
     # ---- Phase state --------------------------------------------------
-    # 3-phase model: caller supplies the phase directly (DM → independent,
-    # colony bootstrap → working). Fall back to independent when nothing
-    # is specified — there is no "staging"/"planning" bootstrap anymore.
-    effective_phase = initial_phase or ("working" if worker_identity else "independent")
-    phase_state = QueenPhaseState(phase=effective_phase, event_bus=session.event_bus)
+    initial_phase = "staging" if worker_identity else "planning"
+    phase_state = QueenPhaseState(phase=initial_phase, event_bus=session.event_bus)
     session.phase_state = phase_state
 
-    # ---- Ambient credentials provider --------------------------------
-    # Renders the "Connected integrations" block injected into every Queen
-    # phase prompt so the Queen always knows which credentials are connected
-    # without having to call list_credentials. Cached briefly to keep the
-    # per-iteration prompt rebuild cheap; invalidated by routes_credentials
-    # when the user adds/removes an integration.
-    phase_state.credentials_prompt_provider = _build_credentials_provider()
+    # ---- Track ask rounds during planning ----------------------------
+    # Increment planning_ask_rounds each time the queen requests user
+    # input (ask_user or ask_user_multiple) while in the planning phase.
+    async def _track_planning_asks(event: AgentEvent) -> None:
+        if phase_state.phase != "planning":
+            return
+        # Only count explicit ask_user / ask_user_multiple calls, not
+        # auto-block (text-only turns emit CLIENT_INPUT_REQUESTED with
+        # an empty prompt and no options/questions).
+        data = event.data or {}
+        has_prompt = bool(data.get("prompt"))
+        has_questions = bool(data.get("questions"))
+        has_options = bool(data.get("options"))
+        if has_prompt or has_questions or has_options:
+            phase_state.planning_ask_rounds += 1
+
+    session.event_bus.subscribe(
+        [EventType.CLIENT_INPUT_REQUESTED],
+        _track_planning_asks,
+        filter_stream="queen",
+    )
 
     # ---- Lifecycle tools (always registered) --------------------------
     register_queen_lifecycle_tools(
@@ -352,95 +268,146 @@ async def create_queen(
         phase_state=phase_state,
     )
 
-    # ---- Colony runtime check (only when worker is loaded) ----------------
-    if session.colony_runtime:
+    # ---- Monitoring tools (only when worker is loaded) ----------------
+    if session.graph_runtime:
         from framework.tools.worker_monitoring_tools import register_worker_monitoring_tools
 
         register_worker_monitoring_tools(
             queen_registry,
             session.worker_path,
-            worker_graph_id=getattr(session.colony_runtime, "_graph_id", None)
-            or getattr(session.colony_runtime, "graph", None)
-            and session.colony_runtime.graph.id,
+            worker_graph_id=session.graph_runtime._graph_id,
             default_session_id=session.id,
         )
 
     queen_tools = list(queen_registry.get_tools().values())
     queen_tool_executor = queen_registry.get_executor()
 
-    # Phase 2 wiring: stash the resolved tool list + executor on the
-    # session so SessionManager._start_queen can build a real
-    # ColonyRuntime sharing the queen's tools, llm, and event bus.
-    # The unified runtime is what run_parallel_workers (Phase 4) will
-    # call into to fan out parallel workers from the queen.
-    session._queen_tools = queen_tools  # type: ignore[attr-defined]
-    session._queen_tool_executor = queen_tool_executor  # type: ignore[attr-defined]
-
     # ---- Partition tools by phase ------------------------------------
-    independent_names = set(_QUEEN_INDEPENDENT_TOOLS)
-    working_names = set(_QUEEN_WORKING_TOOLS)
-    reviewing_names = set(_QUEEN_REVIEWING_TOOLS)
+    planning_names = set(_QUEEN_PLANNING_TOOLS)
+    building_names = set(_QUEEN_BUILDING_TOOLS)
+    staging_names = set(_QUEEN_STAGING_TOOLS)
+    running_names = set(_QUEEN_RUNNING_TOOLS)
+    editing_names = set(_QUEEN_EDITING_TOOLS)
 
     registered_names = {t.name for t in queen_tools}
+    missing_building = building_names - registered_names
+    if missing_building:
+        logger.warning(
+            "Queen: %d/%d building tools NOT registered: %s",
+            len(missing_building),
+            len(building_names),
+            sorted(missing_building),
+        )
     logger.info("Queen: registered tools: %s", sorted(registered_names))
 
-    phase_state.working_tools = [t for t in queen_tools if t.name in working_names]
-    phase_state.reviewing_tools = [t for t in queen_tools if t.name in reviewing_names]
+    phase_state.planning_tools = [t for t in queen_tools if t.name in planning_names]
+    phase_state.building_tools = [t for t in queen_tools if t.name in building_names]
+    phase_state.staging_tools = [t for t in queen_tools if t.name in staging_names]
+    phase_state.running_tools = [t for t in queen_tools if t.name in running_names]
+    phase_state.editing_tools = [t for t in queen_tools if t.name in editing_names]
 
-    # Independent phase gets core tools + all MCP tools not claimed by any
-    # other phase (coder-tools file I/O, gcu-tools browser, etc.).
-    all_phase_names = independent_names | working_names | reviewing_names
-    mcp_tools = [t for t in queen_tools if t.name not in all_phase_names]
-    phase_state.independent_tools = [t for t in queen_tools if t.name in independent_names] + mcp_tools
-    logger.info(
-        "Queen: independent tools: %s",
-        sorted(t.name for t in phase_state.independent_tools),
+    # ---- Cross-session memory ----------------------------------------
+    from framework.agents.queen.queen_memory_v2 import (
+        colony_memory_dir,
+        global_memory_dir,
+        init_memory_dir,
     )
 
-    # ---- Global + queen-scoped memory ----------------------------------
-    global_dir, queen_mem_dir = initialize_memory_scopes(session, phase_state)
+    colony_dir = colony_memory_dir(session.id)
+    global_dir = global_memory_dir()
+    init_memory_dir(colony_dir, migrate_legacy=True)
+    init_memory_dir(global_dir)
+    phase_state.global_memory_dir = global_dir
 
-    # Materialize the selected queen identity before building the initial
-    # system prompt so the first turn includes the profile's core identity.
-    await materialize_queen_identity(
-        session=session,
-        phase_state=phase_state,
-        queen_profile=queen_profile,
-        event_bus=session.event_bus,
+    # Keep global recall cache fresh on real user input events.
+    async def _recall_on_user_input(event: AgentEvent) -> None:
+        content = (event.data or {}).get("content", "")
+        if not content or not isinstance(content, str):
+            return
+        try:
+            from framework.agents.queen.recall_selector import (
+                format_recall_injection,
+                select_memories,
+            )
+
+            selected = await select_memories(content, session.llm, global_dir)
+            phase_state._cached_global_recall_block = format_recall_injection(
+                selected,
+                global_dir,
+                heading="Global Memories",
+            )
+        except Exception:
+            logger.debug("recall: user-turn cache update failed", exc_info=True)
+
+    session.event_bus.subscribe(
+        [EventType.CLIENT_INPUT_RECEIVED],
+        _recall_on_user_input,
+        filter_stream="queen",
     )
 
     # ---- Compose phase-specific prompts ------------------------------
-    from framework.agents.queen.nodes import queen_node as _orig_node
+    _orig_node = _queen_graph.nodes[0]
 
-    # Resolve vision-only prompt sections based on the session's LLM.
-    # session.llm is immutable for the session's lifetime, so this check
-    # is stable — prompts never need to be recomposed mid-session.
-    _has_vision = bool(session.llm and supports_image_tool_results(getattr(session.llm, "model", "")))
+    if worker_identity is None:
+        worker_identity = (
+            "\n\n# Worker Profile\n"
+            "No worker agent loaded. You are operating independently.\n"
+            "Design or build the agent to solve the user's problem "
+            "according to your current phase."
+        )
 
-    phase_state.prompt_independent = finalize_queen_prompt(
-        (
-            _queen_character_core
-            + _queen_role_independent
-            + _queen_style
-            + _queen_tools_independent
-            + _queen_behavior_always
-            + _queen_behavior_independent
-        ),
-        _has_vision,
+    _planning_body = (
+        _queen_character_core
+        + _queen_role_planning
+        + _queen_style
+        + _shared_building_knowledge
+        + _queen_tools_planning
+        + _queen_behavior_always
+        + _queen_behavior_planning
+        + _planning_knowledge
+        + worker_identity
     )
-    phase_state.prompt_working = finalize_queen_prompt(
-        (_queen_character_core + _queen_role_working + _queen_style + _queen_tools_working + _queen_behavior_always),
-        _has_vision,
+    phase_state.prompt_planning = _planning_body
+
+    _building_body = (
+        _queen_character_core
+        + _queen_role_building
+        + _queen_style
+        + _shared_building_knowledge
+        + _queen_tools_building
+        + _queen_behavior_always
+        + _queen_behavior_building
+        + _building_knowledge
+        + _queen_phase_7
+        + _appendices
+        + worker_identity
     )
-    phase_state.prompt_reviewing = finalize_queen_prompt(
-        (
-            _queen_character_core
-            + _queen_role_reviewing
-            + _queen_style
-            + _queen_tools_reviewing
-            + _queen_behavior_always
-        ),
-        _has_vision,
+    phase_state.prompt_building = _building_body
+    phase_state.prompt_staging = (
+        _queen_character_core
+        + _queen_role_staging
+        + _queen_style
+        + _queen_tools_staging
+        + _queen_behavior_always
+        + _queen_behavior_staging
+        + worker_identity
+    )
+    phase_state.prompt_running = (
+        _queen_character_core
+        + _queen_role_running
+        + _queen_style
+        + _queen_tools_running
+        + _queen_behavior_always
+        + _queen_behavior_running
+        + worker_identity
+    )
+    phase_state.prompt_editing = (
+        _queen_identity_editing
+        + _queen_style
+        + _queen_tools_editing
+        + _queen_behavior_always
+        + _queen_behavior_editing
+        + worker_identity
     )
 
     # ---- Default skill protocols -------------------------------------
@@ -455,155 +422,56 @@ async def create_queen(
         _queen_skills_mgr.load()
         phase_state.protocols_prompt = _queen_skills_mgr.protocols_prompt
         phase_state.skills_catalog_prompt = _queen_skills_mgr.skills_catalog_prompt
-        # Also store the manager so get_current_prompt() can render a
-        # phase-filtered catalog on each turn (skills with a `visibility`
-        # frontmatter that excludes the current phase are dropped).
-        phase_state.skills_manager = _queen_skills_mgr
         _queen_skill_dirs = _queen_skills_mgr.allowlisted_dirs
     except Exception:
         logger.debug("Queen skill loading failed (non-fatal)", exc_info=True)
 
-    # ---- Queen identity + recall -------------------------------------
+    # ---- Persona hook ------------------------------------------------
     _session_llm = session.llm
     _session_event_bus = session.event_bus
 
-    async def _refresh_recall_cache(query: str) -> None:
-        """Populate the cached recall block for the next queen prompt."""
-        if not query or not isinstance(query, str):
-            return
-        try:
-            from framework.agents.queen.recall_selector import (
-                build_scoped_recall_blocks,
-            )
+    async def _persona_hook(ctx: HookContext) -> HookResult | None:
+        from framework.agents.queen.queen_memory import format_for_injection
 
-            global_block, queen_block = await build_scoped_recall_blocks(
-                query,
-                _session_llm,
-                global_memory_dir=phase_state.global_memory_dir,
-                queen_memory_dir=phase_state.queen_memory_dir,
-                queen_id=phase_state.queen_id or session.queen_name,
-            )
-            phase_state._cached_global_recall_block = global_block
-            phase_state._cached_queen_recall_block = queen_block
-        except Exception:
-            logger.debug("recall: cache update failed", exc_info=True)
-
-    # ---- Recall on each real user turn --------------------------------
-    async def _recall_on_user_input(event: AgentEvent) -> None:
-        """Re-select memories when real user input arrives."""
-        await _refresh_recall_cache((event.data or {}).get("content", ""))
-
-    session.event_bus.subscribe(
-        [EventType.CLIENT_INPUT_RECEIVED],
-        _recall_on_user_input,
-        filter_stream="queen",
-    )
-
-    async def _queen_identity_hook(ctx: HookContext) -> HookResult | None:
-        from framework.agent_loop.internals.types import HookResult
-        from framework.agents.queen.queen_profiles import (
-            ensure_default_queens,
-            format_queen_identity_prompt,
-            load_queen_profile,
-            select_queen,
+        memory_context = format_for_injection()
+        result = await select_expert_persona(
+            ctx.trigger or "", _session_llm, memory_context=memory_context
         )
-
-        ensure_default_queens()
-        trigger = ctx.trigger or ""
-        # If the session was pre-bound to a queen (user clicked a specific
-        # queen in the UI), use that identity instead of LLM auto-selection.
-        # Also skip LLM auto-selection if queen was already selected during
-        # session creation (e.g., from home screen classification).
-        if session.queen_name and session.queen_name != "default":
-            queen_id = session.queen_name
-            logger.info("Using pre-selected queen: %s", queen_id)
-        else:
-            # This should rarely happen now - queen is selected at session creation
-            logger.warning("No pre-selected queen, falling back to LLM classification")
-            queen_id = await select_queen(trigger, _session_llm)
-        try:
-            profile = load_queen_profile(queen_id)
-        except FileNotFoundError:
-            logger.warning("Queen profile %s not found after selection", queen_id)
+        if not result:
             return None
-        identity_prompt = format_queen_identity_prompt(profile, max_examples=1)
-        # Store on phase_state so identity persists across dynamic prompt refreshes
-        phase_state.queen_id = queen_id
-        phase_state.queen_profile = profile
-        phase_state.queen_identity_prompt = identity_prompt
-        # Route session storage to ~/.hive/agents/queens/{queen_id}/sessions/
-        session.queen_name = queen_id
-
-        # Relocate session dir from default/ to the selected queen's dir
-        # so all writes (conversations, events) go to the correct queen.
-        if queen_id != "default" and session.queen_dir:
-            import json as _json
-            import shutil as _shutil
-
-            _old_dir = session.queen_dir
-            if _old_dir.exists() and _old_dir.parent.parent.name == "default":
-                from framework.config import QUEENS_DIR as _QD
-
-                _new_dir = _QD / queen_id / "sessions" / _old_dir.name
-                _new_dir.parent.mkdir(parents=True, exist_ok=True)
-                _shutil.move(str(_old_dir), str(_new_dir))
-                session.queen_dir = _new_dir
-                logger.info(
-                    "Relocated queen session dir: %s -> %s",
-                    _old_dir,
-                    _new_dir,
-                )
-                # Update meta.json queen_id
-                _meta_path = _new_dir / "meta.json"
-                if _meta_path.exists():
-                    try:
-                        _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
-                        _meta["queen_id"] = queen_id
-                        _meta_path.write_text(_json.dumps(_meta, ensure_ascii=False), encoding="utf-8")
-                    except (OSError, _json.JSONDecodeError):
-                        pass
-                # Re-point event bus log to new location, preserving offset
-                _offset = getattr(session.event_bus, "_session_log_iteration_offset", 0)
-                session.event_bus.set_session_log(_new_dir / "events.jsonl", iteration_offset=_offset)
-
+        # Store on phase_state so persona/style persist across dynamic prompt refreshes
+        phase_state.persona_prefix = result.persona_prefix
+        phase_state.style_directive = result.style_directive
         if _session_event_bus is not None:
             await _session_event_bus.publish(
                 AgentEvent(
-                    type=EventType.QUEEN_IDENTITY_SELECTED,
+                    type=EventType.QUEEN_PERSONA_SELECTED,
                     stream_id="queen",
-                    data={
-                        "queen_id": queen_id,
-                        "name": profile.get("name", ""),
-                        "title": profile.get("title", ""),
-                    },
+                    data={"persona": result.persona_prefix},
                 )
             )
 
-        # Seed recall cache so the first turn has relevant memories.
-        # Use a short timeout to avoid blocking the first turn on slow models.
+        # Seed global recall block from the initial trigger so first turn starts
+        # with relevant global memory context.
+        trigger = ctx.trigger or ""
         if trigger:
             try:
-                import asyncio
-
                 from framework.agents.queen.recall_selector import (
                     format_recall_injection,
                     select_memories,
                 )
 
-                mem_dir = phase_state.global_memory_dir
-                selected = await asyncio.wait_for(
-                    select_memories(trigger, _session_llm, mem_dir),
-                    timeout=3.0,
+                selected = await select_memories(trigger, _session_llm, global_dir)
+                phase_state._cached_global_recall_block = format_recall_injection(
+                    selected,
+                    global_dir,
+                    heading="Global Memories",
                 )
-                phase_state._cached_global_recall_block = format_recall_injection(selected, mem_dir)
-            except TimeoutError:
-                logger.debug("recall: initial seeding timed out, will retry on first turn")
             except Exception:
                 logger.debug("recall: initial seeding failed", exc_info=True)
-
         return HookResult(system_prompt=phase_state.get_current_prompt())
 
-    # ---- Colony preparation -------------------------------------------
+    # ---- Graph preparation -------------------------------------------
     initial_prompt_text = phase_state.get_current_prompt()
 
     registered_tool_names = set(queen_registry.get_tools().keys())
@@ -614,241 +482,144 @@ async def create_queen(
         "system_prompt": initial_prompt_text,
     }
     if set(available_tools) != set(declared_tools):
-        missing = sorted(set(declared_tools) - registered_tool_names)
+        missing_set = set(declared_tools) - registered_tool_names
+        # Monitoring tools are phase-scoped: when no worker graph is loaded yet,
+        # they are expected to be absent and should not pollute startup logs.
+        if not session.graph_runtime:
+            missing_set -= {"get_worker_health_summary"}
+        missing = sorted(missing_set)
         if missing:
-            logger.debug("Queen: tools not yet available (registered on worker load): %s", missing)
+            logger.warning("Queen: tools not available: %s", missing)
         node_updates["tools"] = available_tools
 
-    _orig_node.model_copy(update=node_updates)
+    adjusted_node = _orig_node.model_copy(update=node_updates)
+    _queen_loop_config = {
+        **(_queen_graph.loop_config or {}),
+        "hooks": {"session_start": [_persona_hook]},
+    }
+    queen_graph = _queen_graph.model_copy(
+        update={"nodes": [adjusted_node], "loop_config": _queen_loop_config}
+    )
 
-    # Determine session mode:
-    # - RESTORE: Resume cold session with history, no initial prompt -> wait for user
-    # - FRESH:   New session OR explicit initial prompt -> greet immediately
-    _is_restore_mode = bool(session.queen_resume_from) and initial_prompt is None
-
-    _queen_loop_config = {**_base_loop_config}
-
-    # ---- Queen event loop (AgentLoop directly, no Orchestrator) -------
-    from types import SimpleNamespace
-
-    from framework.agent_loop.agent_loop import AgentLoop, LoopConfig
-    from framework.agent_loop.types import AgentContext, AgentSpec
-    from framework.storage.conversation_store import FileConversationStore
+    # ---- Queen event loop --------------------------------------------
+    queen_runtime = Runtime(hive_home / "queen")
 
     async def _queen_loop():
         logger.debug("[_queen_loop] Starting queen loop for session %s", session.id)
-        # Scope the browser profile to this session so parallel queens each
-        # drive their own Chrome tab group instead of fighting over "default".
-        # Browser tools run in a stdio MCP subprocess, so we can't set a
-        # contextvar across processes — instead we inject `profile` as a
-        # CONTEXT_PARAM that ToolRegistry passes into every MCP call. The
-        # token stays local to this task.
         try:
-            from framework.loader.tool_registry import ToolRegistry
-
-            ToolRegistry.set_execution_context(profile=session.id)
-        except Exception:
-            logger.debug("Queen: failed to set browser profile for session %s", session.id, exc_info=True)
-        try:
-            lc = _queen_loop_config
-            queen_loop_config = LoopConfig(
-                max_iterations=lc.get("max_iterations", 999_999),
-                max_tool_calls_per_turn=lc.get("max_tool_calls_per_turn", 30),
-                max_context_tokens=lc.get("max_context_tokens", 180_000),
-                max_tool_result_chars=lc.get("max_tool_result_chars", 30_000),
-                spillover_dir=str(queen_dir / "data"),
-                hooks=lc.get("hooks", {}),
-            )
-
-            conversation_store = FileConversationStore(queen_dir / "conversations")
-
-            agent_loop = AgentLoop(
-                event_bus=session.event_bus,
-                config=queen_loop_config,
-                tool_executor=queen_tool_executor,
-                conversation_store=conversation_store,
-            )
-
-            from framework.tracker.decision_tracker import DecisionTracker
-
-            queen_spec = AgentSpec(
-                id="queen",
-                name="Queen",
-                description="Queen agent — manages the colony and interacts with the user.",
-                system_prompt="",
-                tools=[t.name for t in queen_tools],
-                tool_access_policy="all",
-                # Queen is a forever-alive conversational agent: bypass
-                # the implicit judge entirely. Without this, a text-only
-                # turn (greeting, clarifying question, summary) falls
-                # through to the default ACCEPT verdict in
-                # judge_pipeline.py, which terminates the loop and
-                # leaves session.queen_executor=None until the user
-                # reloads. Mirrors the static queen_node NodeSpec in
-                # framework.agents.queen.nodes which already sets this.
-                skip_judge=True,
-            )
-
-            ctx = AgentContext(
-                runtime=DecisionTracker(queen_dir),
-                agent_id="queen",
-                agent_spec=queen_spec,
+            logger.debug("[_queen_loop] Creating GraphExecutor...")
+            executor = GraphExecutor(
+                runtime=queen_runtime,
                 llm=session.llm,
-                available_tools=queen_tools,
-                goal_context=queen_goal.to_prompt_context(),
-                max_tokens=lc.get("max_tokens", 8192),
+                tools=queen_tools,
+                tool_executor=queen_tool_executor,
+                event_bus=session.event_bus,
                 stream_id="queen",
+                storage_path=queen_dir,
+                loop_config=_queen_loop_config,
                 execution_id=session.id,
                 dynamic_tools_provider=phase_state.get_current_tools,
                 dynamic_prompt_provider=phase_state.get_current_prompt,
                 iteration_metadata_provider=lambda: {"phase": phase_state.phase},
-                skills_catalog_prompt=phase_state.skills_catalog_prompt,
-                protocols_prompt=phase_state.protocols_prompt,
                 skill_dirs=_queen_skill_dirs,
+                protocols_prompt=phase_state.protocols_prompt,
+                skills_catalog_prompt=phase_state.skills_catalog_prompt,
             )
+            session.queen_executor = executor
+            logger.debug("[_queen_loop] GraphExecutor created and stored in session.queen_executor")
 
-            session.queen_executor = SimpleNamespace(
-                node_registry={"queen": agent_loop},
-            )
-
+            # Wire inject_notification so phase switches notify the queen LLM
             async def _inject_phase_notification(content: str) -> None:
-                await agent_loop.inject_event(content)
+                node = executor.node_registry.get("queen")
+                if node is not None and hasattr(node, "inject_event"):
+                    await node.inject_event(content)
 
             phase_state.inject_notification = _inject_phase_notification
 
-            async def _on_worker_report(event):
-                """Inject [WORKER_REPORT] into queen as each worker finishes.
-
-                Subscribes to SUBAGENT_REPORT events which carry the worker's
-                real summary/data (preferring any explicit ``report_to_parent``
-                call). Every spawned worker emits exactly one — success,
-                partial, failed, timeout, or stopped. The queen sees the
-                report as the next user turn and can react (reply to user,
-                kick off follow-up work, etc.) without being blocked by the
-                spawn call itself.
-                """
+            # Auto-switch to editing when worker execution finishes.
+            # The worker stays loaded — queen can tweak config and re-run.
+            async def _on_worker_done(event):
                 if event.stream_id == "queen":
                     return
-                data = event.data or {}
-                worker_id = data.get("worker_id", event.node_id or "unknown")
-                status = data.get("status", "unknown")
-                summary = data.get("summary") or "(no summary)"
-                err = data.get("error")
-                payload_data = data.get("data") or {}
-                duration = data.get("duration_seconds")
-
-                lines = ["[WORKER_REPORT]", f"worker_id: {worker_id}", f"status: {status}"]
-                if duration is not None:
-                    try:
-                        lines.append(f"duration: {float(duration):.1f}s")
-                    except (TypeError, ValueError):
-                        pass
-                lines.append(f"summary: {summary}")
-                if err:
-                    lines.append(f"error: {err}")
-                if payload_data:
-                    # Compact JSON so the queen sees all keys without the
-                    # indentation blowing up the turn's token count.
-                    try:
-                        import json as _json
-
-                        lines.append("data: " + _json.dumps(payload_data, ensure_ascii=False, default=str))
-                    except Exception:
-                        lines.append(f"data: {payload_data!r}")
-                notification = "\n".join(lines)
-
-                await agent_loop.inject_event(notification)
-                session.worker_configured = True
-
-                # Only transition to reviewing once the batch has quieted —
-                # if other workers from a parallel spawn are still live, stay
-                # in working so the queen's tool access (run_parallel_workers,
-                # inject_message, stop_worker) remains available.
-                colony_runtime = getattr(session, "colony_runtime", None)
-                still_active = 0
-                if colony_runtime is not None:
-                    try:
-                        still_active = sum(
-                            1
-                            for w in colony_runtime._workers.values()  # type: ignore[attr-defined]
-                            if getattr(w, "is_active", False)
+                if phase_state.phase == "running":
+                    if event.type == EventType.EXECUTION_COMPLETED:
+                        # Mark worker as configured after first successful run
+                        session.worker_configured = True
+                        output = event.data.get("output", {})
+                        output_summary = ""
+                        if output:
+                            for key, value in output.items():
+                                val_str = str(value)
+                                if len(val_str) > 200:
+                                    val_str = val_str[:200] + "..."
+                                output_summary += f"\n  {key}: {val_str}"
+                        _out = output_summary or " (no output keys set)"
+                        notification = (
+                            "[WORKER_TERMINAL] Worker finished successfully.\n"
+                            f"Output:{_out}\n"
+                            "Report this to the user. "
+                            "Ask if they want to re-run with different input "
+                            "or tweak the configuration."
                         )
-                    except Exception:
-                        still_active = 0
-                if still_active == 0 and phase_state.phase in ("working", "running"):
-                    await phase_state.switch_to_reviewing(source="auto")
+                    else:  # EXECUTION_FAILED
+                        error = event.data.get("error", "Unknown error")
+                        notification = (
+                            "[WORKER_TERMINAL] Worker failed.\n"
+                            f"Error: {error}\n"
+                            "Report this to the user and help them troubleshoot. "
+                            "You can re-run with different input or escalate to "
+                            "building/planning if code changes are needed."
+                        )
+
+                    node = executor.node_registry.get("queen")
+                    if node is not None and hasattr(node, "inject_event"):
+                        await node.inject_event(notification)
+
+                    await phase_state.switch_to_editing(source="auto")
 
             session.event_bus.subscribe(
-                event_types=[EventType.SUBAGENT_REPORT],
-                handler=_on_worker_report,
+                event_types=[EventType.EXECUTION_COMPLETED, EventType.EXECUTION_FAILED],
+                handler=_on_worker_done,
             )
+            session_manager._subscribe_worker_handoffs(session, executor)
 
-            # ---- Colony-scoped worker escalation routing ----
-            # Replaces the legacy unfiltered SessionManager subscription.
-            # ``filter_colony`` (inside install_worker_escalation_routing)
-            # ensures only escalations from workers in THIS queen's colony
-            # reach THIS queen — cross-colony leakage is structurally
-            # impossible because StreamEventBus stamps colony_id on every
-            # published event before dispatch.
-            session.worker_handoff_sub = install_worker_escalation_routing(session)
-
+            # ---- Reflection + recall memory subscriptions ----------------
             from framework.agents.queen.reflection_agent import subscribe_reflection_triggers
 
             _reflection_subs = await subscribe_reflection_triggers(
                 session.event_bus,
                 queen_dir,
                 session.llm,
-                global_memory_dir=global_dir,
-                queen_memory_dir=queen_mem_dir,
-                queen_id=session.queen_name,
+                memory_dir=colony_dir,
+                phase_state=phase_state,
             )
+
+            # Store sub IDs on session for teardown.
             session.memory_reflection_subs = _reflection_subs
 
-            # Set initial user message based on mode:
-            # - RESTORE:              None -> AgentLoop restores from disk, waits for /chat
-            # - FRESH + initial_prompt:     -> queen responds to the real prompt immediately
-            # - FRESH + no initial_prompt:  -> None -> AgentLoop waits for the first /chat
-            #
-            # The third case matters for the classify→createNewSession→chat
-            # bootstrap: if the frontend doesn't pass initial_prompt, we must
-            # NOT invent a phantom "Hello" — that used to concatenate with the
-            # real first chat message and confuse the model.
-            ctx.input_data = {"user_request": None if _is_restore_mode else (initial_prompt or None)}
-
-            # Publish the initial prompt as a CLIENT_INPUT_RECEIVED event so
-            # it appears in the SSE stream and persists to events.jsonl for
-            # session resume.  The /chat endpoint does the same for injected
-            # messages; this covers the session-creation-with-prompt path.
-            if initial_prompt and not _is_restore_mode:
-                await session.event_bus.publish(
-                    AgentEvent(
-                        type=EventType.CLIENT_INPUT_RECEIVED,
-                        stream_id="queen",
-                        node_id="queen",
-                        execution_id=session.id,
-                        data={"content": initial_prompt},
-                    )
-                )
-
             logger.info(
-                "Queen %s in %s phase with %d tools: %s",
-                "restoring" if _is_restore_mode else "starting",
+                "Queen starting in %s phase with %d tools: %s",
                 phase_state.phase,
                 len(phase_state.get_current_tools()),
                 [t.name for t in phase_state.get_current_tools()],
             )
-
-            # Run the queen -- forever-alive conversation loop
-            result = await agent_loop.execute(ctx)
-
-            # AgentResult doesn't have stop_reason — check success/error.
-            # The queen is expected to be forever-alive; a clean return
-            # means the loop hit max_iterations or decided to exit.
+            logger.debug("[_queen_loop] Calling executor.execute()...")
+            result = await executor.execute(
+                graph=queen_graph,
+                goal=queen_goal,
+                input_data={"greeting": initial_prompt or "Session started."},
+                session_state={"resume_session_id": session.id},
+            )
+            logger.debug(
+                "[_queen_loop] executor.execute() returned with success=%s", result.success
+            )
             if result.success:
-                logger.warning("Queen returned (should be forever-alive)")
-            elif result.error:
-                logger.error("Queen failed: %s", result.error)
-
+                logger.warning("Queen executor returned (should be forever-alive)")
+            else:
+                logger.error(
+                    "Queen executor failed: %s",
+                    result.error or "(no error message)",
+                )
         except asyncio.CancelledError:
             logger.info("[_queen_loop] Queen loop cancelled (normal shutdown)")
             raise

@@ -1,0 +1,43 @@
+# Hive task brief template
+# Save as: automation/hive.task.yaml
+
+schema_version: "1.0"
+
+task:
+  id: "TASK-0001"
+  title: "Short task title"
+  objective: "What business/engineering outcome is expected"
+  risk_tier: "low" # low | medium | high | critical
+
+repository:
+  name: "org/repo"
+  default_branch: "main"
+  workdir: "."
+
+delivery:
+  branch_name: "hive/task/TASK-0001"
+  pr_title: "[Hive] TASK-0001: short title"
+
+acceptance_criteria:
+  - "Criterion 1: explicit and testable"
+  - "Criterion 2: explicit and testable"
+
+constraints:
+  - "Do not change public API contracts"
+  - "No dependency version upgrades"
+
+validation:
+  required:
+    - "lint"
+    - "test"
+  optional:
+    - "typecheck"
+    - "build"
+
+done_definition:
+  - "Code merged through PR flow"
+  - "Required checks are green"
+  - "Evidence bundle attached"
+
+notes: ""
+

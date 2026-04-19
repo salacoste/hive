@@ -1,17 +1,17 @@
 """Session lifecycle and session info routes.
 
 Session-primary routes:
-- POST   /api/sessions                                — create session (with or without worker)
-- GET    /api/sessions                                — list all active sessions
-- GET    /api/sessions/{session_id}                   — session detail
-- DELETE /api/sessions/{session_id}                   — stop session entirely
-- POST   /api/sessions/{session_id}/colony            — load a colony into session
-- DELETE /api/sessions/{session_id}/colony            — unload colony from session
-- GET    /api/sessions/{session_id}/stats             — runtime statistics
-- GET    /api/sessions/{session_id}/entry-points      — list entry points
-- PATCH  /api/sessions/{session_id}/triggers/{id}    — update trigger task
-- GET    /api/sessions/{session_id}/colonies          — list colony IDs
-- GET    /api/sessions/{session_id}/events/history   — persisted eventbus log (for replay)
+- POST   /api/sessions                               — create session (with or without worker)
+- GET    /api/sessions                               — list all active sessions
+- GET    /api/sessions/{session_id}                  — session detail
+- DELETE /api/sessions/{session_id}                  — stop session entirely
+- POST   /api/sessions/{session_id}/graph            — load a graph into session
+- DELETE /api/sessions/{session_id}/graph            — unload graph from session
+- GET    /api/sessions/{session_id}/stats            — runtime statistics
+- GET    /api/sessions/{session_id}/entry-points     — list entry points
+- PATCH  /api/sessions/{session_id}/triggers/{id}   — update trigger task
+- GET    /api/sessions/{session_id}/graphs           — list graph IDs
+- GET    /api/sessions/{session_id}/events/history  — persisted eventbus log (for replay)
 
 """
 
@@ -22,12 +22,15 @@ import logging
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 from aiohttp import web
 
 from framework.server.app import (
+    APP_KEY_MANAGER,
     resolve_session,
     validate_agent_path,
 )
@@ -37,7 +40,31 @@ logger = logging.getLogger(__name__)
 
 
 def _get_manager(request: web.Request) -> SessionManager:
-    return request.app["manager"]
+    return request.app[APP_KEY_MANAGER]
+
+
+def _resolve_session_storage_folder(
+    manager: SessionManager,
+    session_id: str,
+    *,
+    create: bool = False,
+) -> Path:
+    """Resolve effective queen storage folder for a session id.
+
+    Live sessions may persist into ``queen_resume_from``. For cold sessions
+    we use the requested id directly.
+    """
+    session = manager.get_session(session_id)
+    storage_session_id = (session.queen_resume_from or session.id) if session else session_id
+    root = (Path.home() / ".hive" / "queen" / "session").resolve()
+    folder = (root / storage_session_id).resolve()
+    try:
+        folder.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Invalid session storage path") from exc
+    if create:
+        folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def _session_to_live_dict(session) -> dict:
@@ -49,9 +76,10 @@ def _session_to_live_dict(session) -> dict:
     queen_model: str = getattr(getattr(session, "runner", None), "model", "") or ""
     return {
         "session_id": session.id,
-        "colony_id": session.colony_id,
-        "colony_name": info.name if info else session.colony_id,
-        "has_worker": session.colony_runtime is not None,
+        "project_id": getattr(session, "project_id", "default"),
+        "graph_id": session.graph_id,
+        "graph_name": info.name if info else session.graph_id,
+        "has_worker": session.graph_runtime is not None,
         "agent_path": str(session.worker_path) if session.worker_path else "",
         "description": info.description if info else "",
         "goal": info.goal_name if info else "",
@@ -59,10 +87,10 @@ def _session_to_live_dict(session) -> dict:
         "loaded_at": session.loaded_at,
         "uptime_seconds": round(time.time() - session.loaded_at, 1),
         "intro_message": getattr(session.runner, "intro_message", "") or "",
-        "queen_phase": phase_state.phase if phase_state else ("staging" if session.colony_runtime else "planning"),
+        "queen_phase": phase_state.phase
+        if phase_state
+        else ("staging" if session.graph_runtime else "planning"),
         "queen_supports_images": supports_image_tool_results(queen_model) if queen_model else True,
-        "queen_id": getattr(phase_state, "queen_id", None) if phase_state else None,
-        "queen_name": (phase_state.queen_profile or {}).get("name") if phase_state else None,
     }
 
 
@@ -107,17 +135,17 @@ async def handle_create_session(request: web.Request) -> web.Response:
     """POST /api/sessions — create a session.
 
     Body: {
-        "agent_path": "..." (optional — if provided, creates session with colony),
-        "agent_id": "..." (optional — colony ID override),
+        "agent_path": "..." (optional — if provided, creates session with graph),
+        "agent_id": "..." (optional — graph ID override),
         "session_id": "..." (optional — custom session ID),
         "model": "..." (optional),
+        "model_profile": "..." (optional),
         "initial_prompt": "..." (optional — first user message for the queen),
-        "initial_phase": "..." (optional — "independent" for standalone queen),
     }
 
-    When agent_path is provided, creates a session with a colony in one step
+    When agent_path is provided, creates a session with a graph in one step
     (equivalent to the old POST /api/agents). Otherwise creates a queen-only
-    session that can later have a colony loaded via POST /sessions/{id}/colony.
+    session that can later have a graph loaded via POST /sessions/{id}/graph.
     """
     manager = _get_manager(request)
     body = await request.json() if request.can_read_body else {}
@@ -125,11 +153,12 @@ async def handle_create_session(request: web.Request) -> web.Response:
     agent_id = body.get("agent_id")
     session_id = body.get("session_id")
     model = body.get("model")
+    model_profile = body.get("model_profile")
     initial_prompt = body.get("initial_prompt")
+    project_id = body.get("project_id")
+    # When set, the queen writes conversations to this existing session's directory
+    # so the full history accumulates in one place across server restarts.
     queen_resume_from = body.get("queen_resume_from")
-    queen_name = body.get("queen_name")
-    initial_phase = body.get("initial_phase")
-    worker_name = body.get("worker_name")
 
     if agent_path:
         try:
@@ -139,32 +168,48 @@ async def handle_create_session(request: web.Request) -> web.Response:
 
     try:
         if agent_path:
-            session = await manager.create_session_with_worker_colony(
+            # One-step: create session + load graph
+            session = await manager.create_session_with_worker_graph(
                 agent_path,
                 agent_id=agent_id,
                 session_id=session_id,
                 model=model,
+                model_profile=model_profile,
                 initial_prompt=initial_prompt,
                 queen_resume_from=queen_resume_from,
-                queen_name=queen_name,
-                initial_phase=initial_phase,
-                worker_name=worker_name,
+                project_id=project_id,
             )
         else:
             # Queen-only session
             session = await manager.create_session(
                 session_id=session_id,
                 model=model,
+                model_profile=model_profile,
                 initial_prompt=initial_prompt,
                 queen_resume_from=queen_resume_from,
-                initial_phase=initial_phase,
+                project_id=project_id,
             )
     except ValueError as e:
         msg = str(e)
         if "currently loading" in msg:
             resolved_id = agent_id or (Path(agent_path).name if agent_path else "")
             return web.json_response(
-                {"error": msg, "colony_id": resolved_id, "loading": True},
+                {"error": msg, "graph_id": resolved_id, "loading": True},
+                status=409,
+            )
+        if msg.startswith("Project '") and msg.endswith("' not found"):
+            available = [
+                str(p.get("id"))
+                for p in manager.list_projects()
+                if isinstance(p, dict) and p.get("id")
+            ]
+            return web.json_response(
+                {
+                    "error": msg,
+                    "hint": "Use an existing project_id from /api/projects or omit project_id to use the default.",
+                    "default_project_id": manager.default_project_id(),
+                    "available_project_ids": available,
+                },
                 status=409,
             )
         return web.json_response({"error": msg}, status=409)
@@ -186,7 +231,8 @@ async def handle_create_session(request: web.Request) -> web.Response:
 async def handle_list_live_sessions(request: web.Request) -> web.Response:
     """GET /api/sessions — list all active sessions."""
     manager = _get_manager(request)
-    sessions = [_session_to_live_dict(s) for s in manager.list_sessions()]
+    project_id = request.query.get("project_id")
+    sessions = [_session_to_live_dict(s) for s in manager.list_sessions(project_id=project_id)]
     return web.json_response({"sessions": sessions})
 
 
@@ -218,8 +264,8 @@ async def handle_get_live_session(request: web.Request) -> web.Response:
 
     data = _session_to_live_dict(session)
 
-    if session.colony_runtime:
-        rt = session.colony_runtime
+    if session.graph_runtime:
+        rt = session.graph_runtime
         data["entry_points"] = [
             {
                 "id": ep.id,
@@ -227,18 +273,22 @@ async def handle_get_live_session(request: web.Request) -> web.Response:
                 "entry_node": ep.entry_node,
                 "trigger_type": ep.trigger_type,
                 "trigger_config": ep.trigger_config,
-                **({"next_fire_in": nf} if (nf := rt.get_timer_next_fire_in(ep.id)) is not None else {}),
+                **(
+                    {"next_fire_in": nf}
+                    if (nf := rt.get_timer_next_fire_in(ep.id)) is not None
+                    else {}
+                ),
             }
             for ep in rt.get_entry_points()
         ]
         # Append triggers from triggers.json (stored on session)
         runner = getattr(session, "runner", None)
-        colony_entry = runner.graph.entry_node if runner else ""
+        graph_entry = runner.graph.entry_node if runner else ""
         for t in getattr(session, "available_triggers", {}).values():
             entry = {
                 "id": t.id,
                 "name": t.description or t.id,
-                "entry_node": colony_entry,
+                "entry_node": graph_entry,
                 "trigger_type": t.trigger_type,
                 "trigger_config": t.trigger_config,
                 "task": t.task,
@@ -247,7 +297,7 @@ async def handle_get_live_session(request: web.Request) -> web.Response:
             if mono is not None:
                 entry["next_fire_in"] = max(0.0, mono - time.monotonic())
             data["entry_points"].append(entry)
-        data["colonies"] = session.colony_runtime.list_graphs()
+        data["graphs"] = session.graph_runtime.list_graphs()
 
     return web.json_response(data)
 
@@ -268,14 +318,19 @@ async def handle_stop_session(request: web.Request) -> web.Response:
 
 
 # ------------------------------------------------------------------
-# Colony lifecycle
+# Graph lifecycle
 # ------------------------------------------------------------------
 
 
-async def handle_load_colony(request: web.Request) -> web.Response:
-    """POST /api/sessions/{session_id}/colony — load a colony into a session.
+async def handle_load_graph(request: web.Request) -> web.Response:
+    """POST /api/sessions/{session_id}/graph — load a graph into a session.
 
-    Body: {"agent_path": "...", "colony_id": "..." (optional), "model": "..." (optional)}
+    Body: {
+      "agent_path": "...",
+      "graph_id": "..." (optional),
+      "model": "..." (optional),
+      "model_profile": "..." (optional)
+    }
     """
     manager = _get_manager(request)
     session_id = request.match_info["session_id"]
@@ -290,15 +345,17 @@ async def handle_load_colony(request: web.Request) -> web.Response:
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
 
-    colony_id = body.get("colony_id")
+    graph_id = body.get("graph_id")
     model = body.get("model")
+    model_profile = body.get("model_profile")
 
     try:
-        session = await manager.load_colony(
+        session = await manager.load_graph(
             session_id,
             agent_path,
-            colony_id=colony_id,
+            graph_id=graph_id,
             model=model,
+            model_profile=model_profile,
         )
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=409)
@@ -308,18 +365,18 @@ async def handle_load_colony(request: web.Request) -> web.Response:
         resp = _credential_error_response(e, agent_path)
         if resp is not None:
             return resp
-        logger.exception("Error loading colony: %s", e)
+        logger.exception("Error loading graph: %s", e)
         return web.json_response({"error": "Internal server error"}, status=500)
 
     return web.json_response(_session_to_live_dict(session))
 
 
-async def handle_unload_colony(request: web.Request) -> web.Response:
-    """DELETE /api/sessions/{session_id}/colony — unload colony, keep queen alive."""
+async def handle_unload_graph(request: web.Request) -> web.Response:
+    """DELETE /api/sessions/{session_id}/graph — unload graph, keep queen alive."""
     manager = _get_manager(request)
     session_id = request.match_info["session_id"]
 
-    removed = await manager.unload_colony(session_id)
+    removed = await manager.unload_graph(session_id)
     if not removed:
         session = manager.get_session(session_id)
         if session is None:
@@ -328,11 +385,11 @@ async def handle_unload_colony(request: web.Request) -> web.Response:
                 status=404,
             )
         return web.json_response(
-            {"error": "No colony loaded in this session"},
+            {"error": "No graph loaded in this session"},
             status=409,
         )
 
-    return web.json_response({"session_id": session_id, "colony_unloaded": True})
+    return web.json_response({"session_id": session_id, "graph_unloaded": True})
 
 
 # ------------------------------------------------------------------
@@ -352,7 +409,7 @@ async def handle_session_stats(request: web.Request) -> web.Response:
             status=404,
         )
 
-    stats = session.colony_runtime.get_stats() if session.colony_runtime else {}
+    stats = session.graph_runtime.get_stats() if session.graph_runtime else {}
     return web.json_response(stats)
 
 
@@ -368,7 +425,7 @@ async def handle_session_entry_points(request: web.Request) -> web.Response:
             status=404,
         )
 
-    rt = session.colony_runtime
+    rt = session.graph_runtime
     eps = rt.get_entry_points() if rt else []
     entry_points = [
         {
@@ -377,18 +434,22 @@ async def handle_session_entry_points(request: web.Request) -> web.Response:
             "entry_node": ep.entry_node,
             "trigger_type": ep.trigger_type,
             "trigger_config": ep.trigger_config,
-            **({"next_fire_in": nf} if rt and (nf := rt.get_timer_next_fire_in(ep.id)) is not None else {}),
+            **(
+                {"next_fire_in": nf}
+                if rt and (nf := rt.get_timer_next_fire_in(ep.id)) is not None
+                else {}
+            ),
         }
         for ep in eps
     ]
     # Append triggers from triggers.json (stored on session)
     runner = getattr(session, "runner", None)
-    colony_entry = runner.graph.entry_node if runner else ""
+    graph_entry = runner.graph.entry_node if runner else ""
     for t in getattr(session, "available_triggers", {}).values():
         entry = {
             "id": t.id,
             "name": t.description or t.id,
-            "entry_node": colony_entry,
+            "entry_node": graph_entry,
             "trigger_type": t.trigger_type,
             "trigger_config": t.trigger_config,
             "task": t.task,
@@ -458,13 +519,21 @@ async def handle_update_trigger_task(request: web.Request) -> web.Response:
                         )
                 except ImportError:
                     return web.json_response(
-                        {"error": ("croniter package not installed — cannot validate cron expression.")},
+                        {
+                            "error": (
+                                "croniter package not installed — cannot validate cron expression."
+                            )
+                        },
                         status=500,
                     )
                 merged_trigger_config.pop("interval_minutes", None)
             elif interval is None:
                 return web.json_response(
-                    {"error": ("Timer trigger needs 'cron' or 'interval_minutes' in trigger_config.")},
+                    {
+                        "error": (
+                            "Timer trigger needs 'cron' or 'interval_minutes' in trigger_config."
+                        )
+                    },
                     status=400,
                 )
             elif not isinstance(interval, (int, float)) or interval <= 0:
@@ -513,10 +582,10 @@ async def handle_update_trigger_task(request: web.Request) -> web.Response:
 
     _save_trigger_to_agent(session, trigger_id, tdef)
 
-    # Emit SSE event so the frontend updates the colony and detail panel
+    # Emit SSE event so the frontend updates the graph and detail panel
     bus = getattr(session, "event_bus", None)
     if bus:
-        from framework.host.event_bus import AgentEvent, EventType
+        from framework.runtime.event_bus import AgentEvent, EventType
 
         await bus.publish(
             AgentEvent(
@@ -546,132 +615,8 @@ async def handle_update_trigger_task(request: web.Request) -> web.Response:
     )
 
 
-async def handle_activate_trigger(request: web.Request) -> web.Response:
-    """POST /api/sessions/{session_id}/triggers/{trigger_id}/activate — start a trigger."""
-    session, err = resolve_session(request)
-    if err:
-        return err
-
-    trigger_id = request.match_info["trigger_id"]
-    available = getattr(session, "available_triggers", {})
-    tdef = available.get(trigger_id)
-    if tdef is None:
-        return web.json_response(
-            {"error": f"Trigger '{trigger_id}' not found"},
-            status=404,
-        )
-
-    if trigger_id in getattr(session, "active_trigger_ids", set()):
-        return web.json_response({"status": "already_active", "trigger_id": trigger_id})
-
-    from framework.tools.queen_lifecycle_tools import (
-        _persist_active_triggers,
-        _start_trigger_timer,
-        _start_trigger_webhook,
-    )
-
-    try:
-        if tdef.trigger_type == "timer":
-            await _start_trigger_timer(session, trigger_id, tdef)
-        elif tdef.trigger_type == "webhook":
-            await _start_trigger_webhook(session, trigger_id, tdef)
-        else:
-            return web.json_response(
-                {"error": f"Unsupported trigger type: {tdef.trigger_type}"},
-                status=400,
-            )
-    except Exception as exc:  # noqa: BLE001
-        return web.json_response(
-            {"error": f"Failed to start trigger: {exc}"},
-            status=500,
-        )
-
-    tdef.active = True
-    session.active_trigger_ids.add(trigger_id)
-    session_id = request.match_info["session_id"]
-    await _persist_active_triggers(session, session_id)
-
-    bus = getattr(session, "event_bus", None)
-    if bus:
-        from framework.host.event_bus import AgentEvent, EventType
-
-        runner = getattr(session, "runner", None)
-        colony_entry = runner.graph.entry_node if runner else None
-        await bus.publish(
-            AgentEvent(
-                type=EventType.TRIGGER_ACTIVATED,
-                stream_id="queen",
-                data={
-                    "trigger_id": trigger_id,
-                    "trigger_type": tdef.trigger_type,
-                    "trigger_config": tdef.trigger_config,
-                    "name": tdef.description or trigger_id,
-                    **({"entry_node": colony_entry} if colony_entry else {}),
-                },
-            )
-        )
-
-    return web.json_response({"status": "activated", "trigger_id": trigger_id})
-
-
-async def handle_deactivate_trigger(request: web.Request) -> web.Response:
-    """POST /api/sessions/{session_id}/triggers/{trigger_id}/deactivate — stop a trigger.
-
-    Cancels the running timer / webhook subscription but KEEPS the trigger
-    definition in triggers.json so the user can re-activate later.
-    """
-    session, err = resolve_session(request)
-    if err:
-        return err
-
-    trigger_id = request.match_info["trigger_id"]
-    if trigger_id not in getattr(session, "active_trigger_ids", set()):
-        return web.json_response({"status": "already_inactive", "trigger_id": trigger_id})
-
-    task = session.active_timer_tasks.pop(trigger_id, None)
-    if task and not task.done():
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    getattr(session, "trigger_next_fire", {}).pop(trigger_id, None)
-
-    webhook_subs = getattr(session, "active_webhook_subs", {})
-    if sub_id := webhook_subs.pop(trigger_id, None):
-        with contextlib.suppress(Exception):
-            session.event_bus.unsubscribe(sub_id)
-
-    session.active_trigger_ids.discard(trigger_id)
-
-    available = getattr(session, "available_triggers", {})
-    tdef = available.get(trigger_id)
-    if tdef:
-        tdef.active = False
-
-    from framework.tools.queen_lifecycle_tools import _persist_active_triggers
-
-    session_id = request.match_info["session_id"]
-    await _persist_active_triggers(session, session_id)
-
-    bus = getattr(session, "event_bus", None)
-    if bus:
-        from framework.host.event_bus import AgentEvent, EventType
-
-        await bus.publish(
-            AgentEvent(
-                type=EventType.TRIGGER_DEACTIVATED,
-                stream_id="queen",
-                data={
-                    "trigger_id": trigger_id,
-                    "name": (tdef.description or trigger_id) if tdef else trigger_id,
-                },
-            )
-        )
-
-    return web.json_response({"status": "deactivated", "trigger_id": trigger_id})
-
-
-async def handle_session_colonies(request: web.Request) -> web.Response:
-    """GET /api/sessions/{session_id}/colonies — list loaded colonies."""
+async def handle_session_graphs(request: web.Request) -> web.Response:
+    """GET /api/sessions/{session_id}/graphs — list loaded graphs."""
     manager = _get_manager(request)
     session_id = request.match_info["session_id"]
     session = manager.get_session(session_id)
@@ -682,12 +627,8 @@ async def handle_session_colonies(request: web.Request) -> web.Response:
             status=404,
         )
 
-    colonies = session.colony_runtime.list_graphs() if session.colony_runtime else []
-    return web.json_response({"colonies": colonies})
-
-
-_EVENTS_HISTORY_DEFAULT_LIMIT = 2000
-_EVENTS_HISTORY_MAX_LIMIT = 10000
+    graphs = session.graph_runtime.list_graphs() if session.graph_runtime else []
+    return web.json_response({"graphs": graphs})
 
 
 async def handle_session_events_history(request: web.Request) -> web.Response:
@@ -697,58 +638,15 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
     both live sessions and cold (post-server-restart) sessions.  The frontend
     replays these events through ``sseEventToChatMessage`` to fully reconstruct
     the UI state on resume.
-
-    Query params:
-        limit: maximum number of events to return (default 2000, max 10000).
-            The TAIL of the file is returned — i.e. the most recent N events.
-            Older events are dropped and ``truncated`` is set to True.
-
-    Response shape::
-
-        {
-            "events": [...],          # up to ``limit`` events, oldest-first
-            "session_id": "...",
-            "total": 12345,           # total events in the file
-            "returned": 2000,         # len(events)
-            "truncated": true,        # total > returned
-            "limit": 2000,            # the effective limit used
-        }
-
-    ``events.jsonl`` is append-only chronological, so "last N lines" == "most
-    recent N events". Long-running colonies have produced files with 50k+
-    events; before this cap, restoring on page-mount shipped the whole thing
-    down the wire and blocked the UI for seconds.
     """
     session_id = request.match_info["session_id"]
 
-    try:
-        limit = int(request.query.get("limit", str(_EVENTS_HISTORY_DEFAULT_LIMIT)))
-    except ValueError:
-        limit = _EVENTS_HISTORY_DEFAULT_LIMIT
-    limit = max(1, min(limit, _EVENTS_HISTORY_MAX_LIMIT))
-
-    from framework.server.session_manager import _find_queen_session_dir
-
-    queen_dir = _find_queen_session_dir(session_id)
+    queen_dir = Path.home() / ".hive" / "queen" / "session" / session_id
     events_path = queen_dir / "events.jsonl"
     if not events_path.exists():
-        return web.json_response(
-            {
-                "events": [],
-                "session_id": session_id,
-                "total": 0,
-                "returned": 0,
-                "truncated": False,
-                "limit": limit,
-            }
-        )
+        return web.json_response({"events": [], "session_id": session_id})
 
-    # Tail the file using a bounded deque — O(limit) memory regardless
-    # of file size. No need to materialize the whole list only to slice it.
-    from collections import deque
-
-    tail: deque[dict] = deque(maxlen=limit)
-    total = 0
+    events: list[dict] = []
     try:
         with open(events_path, encoding="utf-8") as f:
             for line in f:
@@ -756,44 +654,24 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
                 if not line:
                     continue
                 try:
-                    evt = json.loads(line)
+                    events.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-                total += 1
-                tail.append(evt)
     except OSError:
-        return web.json_response(
-            {
-                "events": [],
-                "session_id": session_id,
-                "total": 0,
-                "returned": 0,
-                "truncated": False,
-                "limit": limit,
-            }
-        )
+        return web.json_response({"events": [], "session_id": session_id})
 
-    events = list(tail)
-    return web.json_response(
-        {
-            "events": events,
-            "session_id": session_id,
-            "total": total,
-            "returned": len(events),
-            "truncated": total > len(events),
-            "limit": limit,
-        }
-    )
+    return web.json_response({"events": events, "session_id": session_id})
 
 
 async def handle_session_history(request: web.Request) -> web.Response:
     """GET /api/sessions/history — all queen sessions on disk (live + cold).
 
-    Returns every queen session directory on disk, newest first.
+    Returns every session directory under ~/.hive/queen/session/, newest first.
     Live sessions have ``live: true, cold: false``; sessions that survived a
     server restart have ``live: false, cold: true``.
     """
     manager = _get_manager(request)
+    project_id = request.query.get("project_id")
     live_sessions = {s.id: s for s in manager.list_sessions()}
 
     disk_sessions = SessionManager.list_cold_sessions()
@@ -807,6 +685,11 @@ async def handle_session_history(request: web.Request) -> web.Response:
                 s["agent_name"] = live.worker_info.name
             if not s.get("agent_path") and live.worker_path:
                 s["agent_path"] = str(live.worker_path)
+            if not s.get("project_id"):
+                s["project_id"] = getattr(live, "project_id", None)
+
+    if project_id:
+        disk_sessions = [s for s in disk_sessions if s.get("project_id") == project_id]
 
     return web.json_response({"sessions": disk_sessions})
 
@@ -815,7 +698,7 @@ async def handle_delete_history_session(request: web.Request) -> web.Response:
     """DELETE /api/sessions/history/{session_id} — permanently remove a session.
 
     Stops the live session (if still running) and deletes the queen session
-    directory from disk.
+    directory from disk at ~/.hive/queen/session/{session_id}/.
     This is the frontend 'delete from history' action.
     """
     manager = _get_manager(request)
@@ -826,9 +709,7 @@ async def handle_delete_history_session(request: web.Request) -> web.Response:
         await manager.stop_session(session_id)
 
     # Delete the queen session directory from disk
-    from framework.server.session_manager import _find_queen_session_dir
-
-    queen_session_dir = _find_queen_session_dir(session_id)
+    queen_session_dir = Path.home() / ".hive" / "queen" / "session" / session_id
     if queen_session_dir.exists() and queen_session_dir.is_dir():
         try:
             shutil.rmtree(queen_session_dir)
@@ -856,7 +737,7 @@ async def handle_discover(request: web.Request) -> web.Response:
     for category, entries in groups.items():
         result[category] = [
             {
-                "path": str(entry.path.resolve()),
+                "path": str(entry.path),
                 "name": entry.name,
                 "description": entry.description,
                 "category": entry.category,
@@ -866,84 +747,122 @@ async def handle_discover(request: web.Request) -> web.Response:
                 "tool_count": entry.tool_count,
                 "tags": entry.tags,
                 "last_active": entry.last_active,
-                "is_loaded": str(entry.path.resolve()) in loaded_paths,
-                "workers": [w.to_dict() for w in entry.workers],
+                "is_loaded": str(entry.path) in loaded_paths,
             }
             for entry in entries
         ]
     return web.json_response(result)
 
 
-async def handle_delete_agent(request: web.Request) -> web.Response:
-    """DELETE /api/agents — permanently remove an agent from disk.
-
-    Body: {"agent_path": "exports/my_agent"}
-
-    Stops any live sessions for this agent, then deletes the agent
-    directory so it no longer appears in /discover.
-    """
-    manager = _get_manager(request)
-    body = await request.json()
-    agent_path = body.get("agent_path")
-    if not agent_path:
-        return web.json_response({"error": "agent_path is required"}, status=400)
+async def handle_reveal_session_folder(request: web.Request) -> web.Response:
+    """POST /api/sessions/{session_id}/reveal — open session data folder in the OS file manager."""
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
+    session_id = request.match_info["session_id"]
 
     try:
-        resolved = validate_agent_path(agent_path)
+        folder = _resolve_session_storage_folder(manager, session_id, create=True)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        return web.json_response({"error": f"Failed to prepare session folder: {exc}"}, status=500)
+
+    if sys.platform == "darwin":
+        cmd = ["open", str(folder)]
+    elif sys.platform == "win32":
+        cmd = ["explorer", str(folder)]
+    else:
+        cmd = ["xdg-open", str(folder)]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=5)
+        if proc.returncode != 0:
+            details = (proc.stderr or proc.stdout or "").strip() or f"launcher exited with code {proc.returncode}"
+            return web.json_response(
+                {
+                    "path": str(folder),
+                    "opened": False,
+                    "error": details,
+                    "launcher": cmd[0],
+                }
+            )
+    except FileNotFoundError:
+        return web.json_response(
+            {
+                "path": str(folder),
+                "opened": False,
+                "error": f"Launcher '{cmd[0]}' is unavailable in this environment",
+                "hint": "Use Export to download the session archive (.zip).",
+                "launcher": cmd[0],
+            }
+        )
+    except Exception as exc:
+        return web.json_response(
+            {
+                "path": str(folder),
+                "opened": False,
+                "error": str(exc),
+                "launcher": cmd[0],
+            }
+        )
+
+    return web.json_response({"path": str(folder), "opened": True, "launcher": cmd[0]})
+
+
+async def handle_export_session_folder(request: web.Request) -> web.StreamResponse:
+    """GET /api/sessions/{session_id}/export — download session data as .zip."""
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
+    session_id = request.match_info["session_id"]
+
+    try:
+        folder = _resolve_session_storage_folder(manager, session_id)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
-    # Reject deletion of framework agents (~/.hive/agents/) — those are internal
-    hive_agents_dir = Path.home() / ".hive" / "agents"
-    if resolved.is_relative_to(hive_agents_dir):
-        return web.json_response({"error": "Cannot delete framework agents"}, status=403)
+    if not folder.exists() or not folder.is_dir():
+        return web.json_response({"error": f"Session folder not found: {folder}"}, status=404)
 
-    # Stop any live sessions that use this agent
-    for session in list(manager.list_sessions()):
-        if session.worker_path and str(session.worker_path) == str(resolved):
-            try:
-                await manager.stop_session(session.id)
-            except Exception:
-                pass
-
-    # Delete the agent directory from disk
-    if resolved.exists() and resolved.is_dir():
-        try:
-            shutil.rmtree(resolved)
-        except OSError as e:
-            return web.json_response({"error": f"Failed to delete agent directory: {e}"}, status=500)
-
-    return web.json_response({"deleted": str(resolved)})
-
-
-async def handle_reveal_session_folder(request: web.Request) -> web.Response:
-    """POST /api/sessions/{session_id}/reveal — open session data folder in the OS file manager."""
-    manager: SessionManager = request.app["manager"]
-    session_id = request.match_info["session_id"]
-
-    session = manager.get_session(session_id)
-    storage_session_id = (session.queen_resume_from or session.id) if session else session_id
-    if session:
-        from framework.server.session_manager import _queen_session_dir
-
-        folder = _queen_session_dir(storage_session_id, session.queen_name)
-    else:
-        from framework.server.session_manager import _find_queen_session_dir
-
-        folder = _find_queen_session_dir(storage_session_id)
-    folder.mkdir(parents=True, exist_ok=True)
+    safe_session_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in folder.name)
+    if not safe_session_id:
+        safe_session_id = "session"
+    archive_name = f"{safe_session_id}.zip"
+    archive_path: Path | None = None
 
     try:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", str(folder)])
-        elif sys.platform == "win32":
-            subprocess.Popen(["explorer", str(folder)])
-        else:
-            subprocess.Popen(["xdg-open", str(folder)])
-    except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        with tempfile.NamedTemporaryFile(
+            prefix=f"hive-session-{safe_session_id}-",
+            suffix=".zip",
+            delete=False,
+        ) as tmp:
+            archive_path = Path(tmp.name)
 
-    return web.json_response({"path": str(folder)})
+        with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for entry in sorted(folder.rglob("*")):
+                if entry.is_file():
+                    zf.write(entry, arcname=str(entry.relative_to(folder)))
+
+        size = archive_path.stat().st_size
+        headers = {
+            "Content-Type": "application/zip",
+            "Content-Disposition": f'attachment; filename="{archive_name}"',
+            "Content-Length": str(size),
+        }
+        response = web.StreamResponse(status=200, headers=headers)
+        await response.prepare(request)
+        with archive_path.open("rb") as f:
+            while True:
+                chunk = f.read(256 * 1024)
+                if not chunk:
+                    break
+                await response.write(chunk)
+        await response.write_eof()
+        return response
+    except Exception as exc:
+        logger.exception("Failed to export session folder '%s': %s", folder, exc)
+        return web.json_response({"error": f"Failed to export session folder: {exc}"}, status=500)
+    finally:
+        if archive_path is not None:
+            with contextlib.suppress(OSError):
+                archive_path.unlink()
 
 
 # ------------------------------------------------------------------
@@ -953,9 +872,8 @@ async def handle_reveal_session_folder(request: web.Request) -> web.Response:
 
 def register_routes(app: web.Application) -> None:
     """Register session routes."""
-    # Discovery & agent management
+    # Discovery
     app.router.add_get("/api/discover", handle_discover)
-    app.router.add_delete("/api/agents", handle_delete_agent)
 
     # Session lifecycle
     app.router.add_post("/api/sessions", handle_create_session)
@@ -966,23 +884,18 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/sessions/{session_id}", handle_get_live_session)
     app.router.add_delete("/api/sessions/{session_id}", handle_stop_session)
 
-    # Colony lifecycle
-    app.router.add_post("/api/sessions/{session_id}/colony", handle_load_colony)
-    app.router.add_delete("/api/sessions/{session_id}/colony", handle_unload_colony)
+    # Graph lifecycle
+    app.router.add_post("/api/sessions/{session_id}/graph", handle_load_graph)
+    app.router.add_delete("/api/sessions/{session_id}/graph", handle_unload_graph)
 
     # Session info
     app.router.add_post("/api/sessions/{session_id}/reveal", handle_reveal_session_folder)
+    app.router.add_get("/api/sessions/{session_id}/export", handle_export_session_folder)
     app.router.add_get("/api/sessions/{session_id}/stats", handle_session_stats)
     app.router.add_get("/api/sessions/{session_id}/entry-points", handle_session_entry_points)
-    app.router.add_patch("/api/sessions/{session_id}/triggers/{trigger_id}", handle_update_trigger_task)
-    app.router.add_post(
-        "/api/sessions/{session_id}/triggers/{trigger_id}/activate",
-        handle_activate_trigger,
+    app.router.add_patch(
+        "/api/sessions/{session_id}/triggers/{trigger_id}", handle_update_trigger_task
     )
-    app.router.add_post(
-        "/api/sessions/{session_id}/triggers/{trigger_id}/deactivate",
-        handle_deactivate_trigger,
-    )
-    app.router.add_get("/api/sessions/{session_id}/colonies", handle_session_colonies)
+    app.router.add_get("/api/sessions/{session_id}/graphs", handle_session_graphs)
 
     app.router.add_get("/api/sessions/{session_id}/events/history", handle_session_events_history)

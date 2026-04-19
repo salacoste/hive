@@ -7,8 +7,6 @@ Groq, and local models.
 See: https://docs.litellm.ai/docs/providers
 """
 
-from __future__ import annotations
-
 import ast
 import asyncio
 import hashlib
@@ -16,14 +14,13 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from framework.llm.key_pool import KeyPool
+from typing import Any
 
 try:
     import litellm
@@ -37,10 +34,6 @@ from framework.llm.provider import LLMProvider, LLMResponse, Tool
 from framework.llm.stream_events import StreamEvent
 
 logger = logging.getLogger(__name__)
-
-logging.getLogger("openai._base_client").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _patch_litellm_anthropic_oauth() -> None:
@@ -100,7 +93,9 @@ def _patch_litellm_anthropic_oauth() -> None:
             result["authorization"] = f"Bearer {token}"
             # Merge the OAuth beta header with any existing beta headers.
             existing_beta = result.get("anthropic-beta", "")
-            beta_parts = [b.strip() for b in existing_beta.split(",") if b.strip()] if existing_beta else []
+            beta_parts = (
+                [b.strip() for b in existing_beta.split(",") if b.strip()] if existing_beta else []
+            )
             if ANTHROPIC_OAUTH_BETA_HEADER not in beta_parts:
                 beta_parts.append(ANTHROPIC_OAUTH_BETA_HEADER)
             result["anthropic-beta"] = ",".join(beta_parts)
@@ -186,19 +181,30 @@ def _ensure_ollama_chat_prefix(model: str) -> str:
     return model
 
 
-RATE_LIMIT_MAX_RETRIES = 10
+def _get_env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Read integer env var safely with a lower bound."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r, using default=%d", name, raw, default)
+        return default
+    return max(minimum, value)
+
+
+RATE_LIMIT_MAX_RETRIES = _get_env_int("HIVE_LLM_RATE_LIMIT_MAX_RETRIES", 3, minimum=0)
 RATE_LIMIT_BACKOFF_BASE = 2  # seconds
 RATE_LIMIT_MAX_DELAY = 120  # seconds - cap to prevent absurd waits
-# Separate, much lower cap for "empty response, finish_reason=stop"
-# scenarios. Unlike a real 429, these are rarely transient: Gemini
-# returns stop+empty on silently-filtered safety blocks, poisoned
-# conversation state (dangling tool_result after compaction), or
-# malformed tool schemas. Waiting minutes doesn't fix any of those, so
-# give up after 3 attempts (2+4+8 = 14s) and surface an actionable
-# error instead of burning 12+ minutes on exponential backoff.
-EMPTY_RESPONSE_MAX_RETRIES = 3
+LLM_MAX_CONCURRENT_REQUESTS = _get_env_int("HIVE_LLM_MAX_CONCURRENT_REQUESTS", 4, minimum=1)
+_SYNC_LLM_REQUEST_SEMAPHORE = threading.BoundedSemaphore(LLM_MAX_CONCURRENT_REQUESTS)
+_ASYNC_LLM_REQUEST_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
+_ASYNC_LLM_REQUEST_SEMAPHORES_LOCK = threading.Lock()
 MINIMAX_API_BASE = "https://api.minimax.io/v1"
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+GEMINI_PROXY_API_BASE_ENV = "GEMINI_API_BASE"
+ZAI_API_BASE_ENV = "ZAI_API_BASE"
 
 # Providers that accept cache_control on message content blocks.
 # Anthropic: native ephemeral caching. MiniMax & Z-AI/GLM: pass-through to their APIs.
@@ -228,6 +234,24 @@ KIMI_API_BASE = "https://api.kimi.com/coding"
 CLAUDE_CODE_VERSION = "2.1.76"
 CLAUDE_CODE_USER_AGENT = f"claude-code/{CLAUDE_CODE_VERSION}"
 _CLAUDE_CODE_BILLING_SALT = "59cf53e54c78"
+
+
+def _is_openai_compatible_proxy_base(api_base: str | None) -> bool:
+    """Return True when api_base looks like an OpenAI-compatible proxy endpoint."""
+    if not api_base:
+        return False
+    base = api_base.lower().strip()
+    # Google native Gemini endpoints should keep the Gemini provider path.
+    if "googleapis.com" in base or "generativelanguage" in base:
+        return False
+    return "/v1" in base
+
+
+def _is_zai_api_base(api_base: str | None) -> bool:
+    """Return True when api_base points to z.ai OpenAI-compatible API."""
+    if not api_base:
+        return False
+    return "api.z.ai" in api_base.lower()
 
 
 def _sample_js_code_unit(text: str, idx: int) -> str:
@@ -260,7 +284,9 @@ def _claude_code_billing_header(messages: list[dict[str, Any]]) -> str:
                 break
 
     sampled = "".join(_sample_js_code_unit(first_text, i) for i in (4, 7, 20))
-    version_hash = hashlib.sha256(f"{_CLAUDE_CODE_BILLING_SALT}{sampled}{CLAUDE_CODE_VERSION}".encode()).hexdigest()
+    version_hash = hashlib.sha256(
+        f"{_CLAUDE_CODE_BILLING_SALT}{sampled}{CLAUDE_CODE_VERSION}".encode()
+    ).hexdigest()
     entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").strip() or "cli"
     return (
         f"x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{version_hash[:3]}; "
@@ -312,6 +338,65 @@ def _estimate_tokens(model: str, messages: list[dict]) -> tuple[int, str]:
     return total_chars // 4, "estimate"
 
 
+def _retry_budget_for_model(model: str, default_retries: int) -> int:
+    """Return retry budget for model, with optional Claude-specific cap."""
+    model_l = (model or "").lower()
+    if "claude" not in model_l and "anthropic/" not in model_l:
+        return default_retries
+    # User-requested fast failover for Claude: 1 retry by default.
+    claude_cap = _get_env_int(
+        "HIVE_LLM_CLAUDE_RATE_LIMIT_MAX_RETRIES",
+        1,
+        minimum=0,
+    )
+    return min(default_retries, claude_cap)
+
+
+def _needs_json_object_prompt_hint(response_format: dict[str, Any] | None) -> bool:
+    if not isinstance(response_format, dict):
+        return False
+    return str(response_format.get("type") or "").strip().lower() == "json_object"
+
+
+def _ensure_json_object_prompt_hint(full_messages: list[dict[str, Any]]) -> None:
+    """Ensure prompt contains the word 'json' for json_object response format.
+
+    Some providers (notably GPT-5 via OpenAI-compatible backends) reject
+    response_format={"type":"json_object"} unless at least one message explicitly
+    mentions JSON.
+    """
+    for msg in full_messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and "json" in content.lower():
+            return
+
+    instruction = "Respond with valid JSON."
+
+    # Prefer adding the hint to a user message for providers that enforce
+    # user-visible JSON instruction checks.
+    for msg in reversed(full_messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
+            continue
+        existing = msg.get("content")
+        if isinstance(existing, str):
+            msg["content"] = f"{existing.rstrip()}\n\n{instruction}" if existing.strip() else instruction
+            return
+
+    # Fallback: place hint in system message.
+    if full_messages and full_messages[0].get("role") == "system":
+        existing = full_messages[0].get("content")
+        if isinstance(existing, str):
+            full_messages[0]["content"] = (
+                f"{existing.rstrip()}\n\n{instruction}" if existing.strip() else instruction
+            )
+            return
+    full_messages.insert(0, {"role": "system", "content": instruction})
+
+
 def _prune_failed_request_dumps(max_files: int = MAX_FAILED_REQUEST_DUMPS) -> None:
     """Remove oldest dump files when the count exceeds *max_files*.
 
@@ -332,7 +417,9 @@ def _prune_failed_request_dumps(max_files: int = MAX_FAILED_REQUEST_DUMPS) -> No
 
 def _remember_openrouter_tool_compat_model(model: str) -> None:
     """Cache OpenRouter tool-compat fallback for a bounded time window."""
-    OPENROUTER_TOOL_COMPAT_MODEL_CACHE[model] = time.monotonic() + OPENROUTER_TOOL_COMPAT_CACHE_TTL_SECONDS
+    OPENROUTER_TOOL_COMPAT_MODEL_CACHE[model] = (
+        time.monotonic() + OPENROUTER_TOOL_COMPAT_CACHE_TTL_SECONDS
+    )
 
 
 def _is_openrouter_tool_compat_cached(model: str) -> bool:
@@ -369,15 +456,10 @@ def _dump_failed_request(
             "attempt": attempt,
             "estimated_tokens": _estimate_tokens(model, messages),
             "num_messages": len(messages),
-            "api_base": kwargs.get("api_base"),
-            "request_keys": sorted(kwargs.keys()),
             "messages": messages,
             "tools": kwargs.get("tools"),
             "max_tokens": kwargs.get("max_tokens"),
             "temperature": kwargs.get("temperature"),
-            "stream": kwargs.get("stream"),
-            "tool_choice": kwargs.get("tool_choice"),
-            "response_format": kwargs.get("response_format"),
         }
 
         with open(filepath, "w", encoding="utf-8") as f:
@@ -390,108 +472,6 @@ def _dump_failed_request(
     except OSError as e:
         logger.warning(f"Failed to dump request debug log to {FAILED_REQUESTS_DIR}: {e}")
         return "log_write_failed"
-
-
-def _summarize_message_content(content: Any) -> dict[str, Any]:
-    """Return a structural summary of one message content payload."""
-    if isinstance(content, str):
-        return {
-            "content_kind": "string",
-            "text_chars": len(content),
-        }
-
-    if isinstance(content, list):
-        block_types: list[str] = []
-        text_chars = 0
-        for block in content:
-            if isinstance(block, dict):
-                block_type = str(block.get("type", "unknown"))
-                block_types.append(block_type)
-                if block_type == "text":
-                    text_chars += len(str(block.get("text", "")))
-                elif block_type == "tool_result":
-                    block_content = block.get("content")
-                    if isinstance(block_content, str):
-                        text_chars += len(block_content)
-                    elif isinstance(block_content, list):
-                        for inner in block_content:
-                            if isinstance(inner, dict) and inner.get("type") == "text":
-                                text_chars += len(str(inner.get("text", "")))
-            else:
-                block_types.append(type(block).__name__)
-        return {
-            "content_kind": "list",
-            "blocks": len(content),
-            "block_types": block_types,
-            "text_chars": text_chars,
-        }
-
-    return {
-        "content_kind": type(content).__name__,
-    }
-
-
-def _summarize_messages_for_log(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build a high-signal, no-secret summary of the outgoing messages payload."""
-    summary: list[dict[str, Any]] = []
-    for idx, message in enumerate(messages):
-        item: dict[str, Any] = {
-            "idx": idx,
-            "role": message.get("role"),
-            "keys": sorted(message.keys()),
-        }
-        item.update(_summarize_message_content(message.get("content")))
-        tool_calls = message.get("tool_calls")
-        if isinstance(tool_calls, list):
-            item["tool_calls"] = len(tool_calls)
-            tool_names = []
-            for tc in tool_calls:
-                if isinstance(tc, dict):
-                    fn = tc.get("function")
-                    if isinstance(fn, dict) and fn.get("name"):
-                        tool_names.append(str(fn["name"]))
-            if tool_names:
-                item["tool_call_names"] = tool_names
-        if message.get("cache_control"):
-            item["cache_control"] = True
-        if message.get("tool_call_id"):
-            item["tool_call_id"] = str(message.get("tool_call_id"))
-        summary.append(item)
-    return summary
-
-
-def _summarize_request_for_log(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return a compact structural summary of a LiteLLM request payload."""
-    tools = kwargs.get("tools")
-    tool_names: list[str] = []
-    if isinstance(tools, list):
-        for tool in tools:
-            if isinstance(tool, dict):
-                fn = tool.get("function")
-                if isinstance(fn, dict) and fn.get("name"):
-                    tool_names.append(str(fn["name"]))
-
-    messages = kwargs.get("messages", [])
-    if isinstance(messages, list):
-        non_system_roles = [m.get("role") for m in messages if m.get("role") != "system"]
-    else:
-        non_system_roles = []
-    return {
-        "model": kwargs.get("model"),
-        "api_base": kwargs.get("api_base"),
-        "stream": kwargs.get("stream"),
-        "max_tokens": kwargs.get("max_tokens"),
-        "tool_count": len(tools) if isinstance(tools, list) else 0,
-        "tool_names": tool_names,
-        "tool_choice": kwargs.get("tool_choice"),
-        "response_format": bool(kwargs.get("response_format")),
-        "message_count": len(messages) if isinstance(messages, list) else 0,
-        "non_system_message_count": len(non_system_roles),
-        "first_non_system_role": non_system_roles[0] if non_system_roles else None,
-        "last_non_system_role": non_system_roles[-1] if non_system_roles else None,
-        "system_only": bool(messages) and not non_system_roles,
-        "messages": _summarize_messages_for_log(messages if isinstance(messages, list) else []),
-    }
 
 
 def _compute_retry_delay(
@@ -548,6 +528,55 @@ def _compute_retry_delay(
     # Fallback: exponential backoff
     delay = backoff_base * (2**attempt)
     return min(delay, max_delay)
+
+
+def _get_async_llm_semaphore() -> asyncio.Semaphore:
+    """Return a loop-bound LLM request semaphore for async calls."""
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    with _ASYNC_LLM_REQUEST_SEMAPHORES_LOCK:
+        sem = _ASYNC_LLM_REQUEST_SEMAPHORES.get(loop_id)
+        if sem is None:
+            sem = asyncio.Semaphore(LLM_MAX_CONCURRENT_REQUESTS)
+            _ASYNC_LLM_REQUEST_SEMAPHORES[loop_id] = sem
+        return sem
+
+
+@contextmanager
+def _sync_llm_request_slot(model: str):
+    """Queue sync requests when concurrent LLM call budget is exhausted."""
+    sem = _SYNC_LLM_REQUEST_SEMAPHORE
+    acquired = sem.acquire(blocking=False)
+    if not acquired:
+        logger.warning(
+            "[llm-queue] Saturated (%d in-flight). Queueing sync request for %s.",
+            LLM_MAX_CONCURRENT_REQUESTS,
+            model,
+        )
+        sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+@asynccontextmanager
+async def _async_llm_request_slot(model: str):
+    """Queue async requests when concurrent LLM call budget is exhausted."""
+    sem = _get_async_llm_semaphore()
+    if sem.locked():
+        waiters = len(getattr(sem, "_waiters", ()) or ())
+        logger.warning(
+            "[llm-queue] Saturated (%d in-flight, %d queued). Queueing async request for %s.",
+            LLM_MAX_CONCURRENT_REQUESTS,
+            waiters,
+            model,
+        )
+    await sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
 
 
 def _is_stream_transient_error(exc: BaseException) -> bool:
@@ -679,7 +708,6 @@ class LiteLLMProvider(LLMProvider):
         model: str = "gpt-4o-mini",
         api_key: str | None = None,
         api_base: str | None = None,
-        api_keys: list[str] | None = None,
         **kwargs: Any,
     ):
         """
@@ -692,9 +720,6 @@ class LiteLLMProvider(LLMProvider):
                      look for the appropriate env var (OPENAI_API_KEY,
                      ANTHROPIC_API_KEY, etc.)
             api_base: Custom API base URL (for proxies or local deployments)
-            api_keys: Optional list of API keys for key-pool rotation. When
-                      provided with 2+ keys, a :class:`KeyPool` is created and
-                      keys are rotated on rate-limit errors.
             **kwargs: Additional arguments passed to litellm.completion()
         """
         # Kimi For Coding exposes an Anthropic-compatible endpoint at
@@ -715,65 +740,46 @@ class LiteLLMProvider(LLMProvider):
             model = "anthropic/" + model[len("hive/") :]
             if api_base and api_base.rstrip("/").endswith("/v1"):
                 api_base = api_base.rstrip("/")[:-3]
+        elif model.lower().startswith("glm-") or model.lower().startswith("z-ai/"):
+            # z.ai (GLM) is OpenAI-compatible at api.z.ai/api/coding/paas/v4.
+            # Normalize bare GLM model ids so LiteLLM can resolve the provider.
+            resolved_api_base = api_base or os.environ.get(ZAI_API_BASE_ENV, "").strip()
+            model_suffix = model.split("/", 1)[1] if "/" in model else model
+            model = "openai/" + model_suffix
+            if _is_zai_api_base(resolved_api_base):
+                api_base = resolved_api_base
+        elif model.lower().startswith("gemini/") or model.lower().startswith("google/"):
+            # Route Gemini models through OpenAI-compatible proxies (e.g. Antigravity-Manager)
+            # when GEMINI_API_BASE (or explicit api_base) points to /v1.
+            # This keeps "gemini/<model>" ergonomics in configs while sending requests to
+            # proxy /v1/chat/completions instead of Google's native SDK endpoint.
+            resolved_api_base = api_base or os.environ.get(GEMINI_PROXY_API_BASE_ENV, "").strip()
+            if _is_openai_compatible_proxy_base(resolved_api_base):
+                model_suffix = model.split("/", 1)[1] if "/" in model else model
+                model = "openai/" + model_suffix
+                api_base = resolved_api_base
         self.model = model
-        # Key pool: when multiple keys are provided, enable rotation.
-        self._key_pool: KeyPool | None = None
-        if api_keys and len(api_keys) > 1:
-            from framework.llm.key_pool import KeyPool
-
-            self._key_pool = KeyPool(api_keys)
-            self.api_key = api_keys[0]  # default for OAuth detection below
-            logger.info(
-                "[litellm] Key pool enabled with %d keys for model %s",
-                len(api_keys),
-                model,
-            )
-        else:
-            self.api_key = api_key or (api_keys[0] if api_keys else None)
+        self.api_key = api_key
         self.api_base = api_base or self._default_api_base_for_model(_original_model)
         self.extra_kwargs = kwargs
         # Detect Claude Code OAuth subscription by checking the api_key prefix.
-        self._claude_code_oauth = bool(self.api_key and self.api_key.startswith("sk-ant-oat"))
+        self._claude_code_oauth = bool(api_key and api_key.startswith("sk-ant-oat"))
         if self._claude_code_oauth:
             # Anthropic requires a specific User-Agent for OAuth requests.
             eh = self.extra_kwargs.setdefault("extra_headers", {})
             eh.setdefault("user-agent", CLAUDE_CODE_USER_AGENT)
         # The Codex ChatGPT backend (chatgpt.com/backend-api/codex) rejects
         # several standard OpenAI params: max_output_tokens, stream_options.
-        self._codex_backend = bool(self.api_base and "chatgpt.com/backend-api/codex" in self.api_base)
+        self._codex_backend = bool(
+            self.api_base and "chatgpt.com/backend-api/codex" in self.api_base
+        )
         # Antigravity routes through a local OpenAI-compatible proxy — no patches needed.
         self._antigravity = bool(self.api_base and "localhost:8069" in self.api_base)
 
         if litellm is None:
-            raise ImportError("LiteLLM is not installed. Please install it with: uv pip install litellm")
-
-    def reconfigure(self, model: str, api_key: str | None = None, api_base: str | None = None) -> None:
-        """Hot-swap the model, API key, and/or base URL on this provider instance.
-
-        Since the same LiteLLMProvider object is shared by reference across the
-        session, queen runner, agent runtime, and execution streams, mutating
-        these attributes in-place propagates to all callers on the next LLM call.
-        """
-        _original_model = model
-        if _is_ollama_model(model):
-            model = _ensure_ollama_chat_prefix(model)
-        elif model.lower().startswith("kimi/"):
-            model = "anthropic/" + model[len("kimi/") :]
-            if api_base and api_base.rstrip("/").endswith("/v1"):
-                api_base = api_base.rstrip("/")[:-3]
-        elif model.lower().startswith("hive/"):
-            model = "anthropic/" + model[len("hive/") :]
-            if api_base and api_base.rstrip("/").endswith("/v1"):
-                api_base = api_base.rstrip("/")[:-3]
-        self.model = model
-        self.api_key = api_key
-        self.api_base = api_base or self._default_api_base_for_model(_original_model)
-        self._claude_code_oauth = bool(api_key and api_key.startswith("sk-ant-oat"))
-        if self._claude_code_oauth:
-            eh = self.extra_kwargs.setdefault("extra_headers", {})
-            eh.setdefault("user-agent", CLAUDE_CODE_USER_AGENT)
-        self._codex_backend = bool(self.api_base and "chatgpt.com/backend-api/codex" in self.api_base)
-        self._antigravity = bool(self.api_base and "localhost:8069" in self.api_base)
+            raise ImportError(
+                "LiteLLM is not installed. Please install it with: uv pip install litellm"
+            )
 
         # Note: The Codex ChatGPT backend is a Responses API endpoint at
         # chatgpt.com/backend-api/codex/responses.  LiteLLM's model registry
@@ -789,29 +795,33 @@ class LiteLLMProvider(LLMProvider):
             return MINIMAX_API_BASE
         if model_lower.startswith("openrouter/"):
             return OPENROUTER_API_BASE
+        if (
+            model_lower.startswith("glm-")
+            or model_lower.startswith("zai-glm")
+            or model_lower.startswith("z-ai/")
+        ):
+            env_base = os.environ.get(ZAI_API_BASE_ENV, "").strip()
+            return env_base or None
+        if model_lower.startswith("gemini/") or model_lower.startswith("google/"):
+            env_base = os.environ.get(GEMINI_PROXY_API_BASE_ENV, "").strip()
+            return env_base or None
         if model_lower.startswith("kimi/"):
             return KIMI_API_BASE
         if model_lower.startswith("hive/"):
             return HIVE_API_BASE
         return None
 
-    def _completion_with_rate_limit_retry(self, max_retries: int | None = None, **kwargs: Any) -> Any:
-        """Call litellm.completion with retry on 429 rate limit errors and empty responses.
-
-        When a :class:`KeyPool` is configured, rate-limited keys are rotated
-        automatically so the next attempt uses a different key -- no sleep
-        needed between attempts.
-        """
+    def _completion_with_rate_limit_retry(
+        self, max_retries: int | None = None, **kwargs: Any
+    ) -> Any:
+        """Call litellm.completion with retry on 429 rate limit errors and empty responses."""
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
+        retries = _retry_budget_for_model(str(model), retries)
         for attempt in range(retries + 1):
-            # Rotate key from pool when available.
-            current_key: str | None = None
-            if self._key_pool:
-                current_key = self._key_pool.get_key()
-                kwargs["api_key"] = current_key
             try:
-                response = litellm.completion(**kwargs)  # type: ignore[union-attr]
+                with _sync_llm_request_slot(str(model)):
+                    response = litellm.completion(**kwargs)  # type: ignore[union-attr]
 
                 # Some providers (e.g. Gemini) return 200 with empty content on
                 # rate limit / quota exhaustion instead of a proper 429.  Treat
@@ -827,10 +837,15 @@ class LiteLLMProvider(LLMProvider):
                         None,
                     )
                     if last_role == "assistant":
-                        logger.debug("[retry] Empty response after assistant message — expected, not retrying.")
+                        logger.debug(
+                            "[retry] Empty response after assistant message — "
+                            "expected, not retrying."
+                        )
                         return response
 
-                    finish_reason = response.choices[0].finish_reason if response.choices else "unknown"
+                    finish_reason = (
+                        response.choices[0].finish_reason if response.choices else "unknown"
+                    )
                     # Dump full request to file for debugging
                     token_count, token_method = _estimate_tokens(model, messages)
                     dump_path = _dump_failed_request(
@@ -859,51 +874,28 @@ class LiteLLMProvider(LLMProvider):
                         )
                         return response
 
-                    empty_cap = min(retries, EMPTY_RESPONSE_MAX_RETRIES)
-                    if attempt >= empty_cap:
+                    if attempt == retries:
                         logger.error(
-                            f"[retry] GAVE UP on {model} after "
-                            f"{attempt + 1} attempts — empty response "
+                            f"[retry] GAVE UP on {model} after {retries + 1} "
+                            f"attempts — empty response "
                             f"(finish_reason={finish_reason}, "
-                            f"choices={len(response.choices) if response.choices else 0}). "
-                            f"This is almost never a rate limit despite the "
-                            f"earlier log message — check the dumped request "
-                            f"at {dump_path} for poisoned conversation state "
-                            f"(dangling tool_result after compaction), a "
-                            f"safety-filter trigger in the prompt, or a "
-                            f"malformed tool schema."
+                            f"choices={len(response.choices) if response.choices else 0})"
                         )
                         return response
                     wait = _compute_retry_delay(attempt)
                     logger.warning(
                         f"[retry] {model} returned empty response "
                         f"(finish_reason={finish_reason}, "
-                        f"choices={len(response.choices) if response.choices else 0}). "
+                        f"choices={len(response.choices) if response.choices else 0}) — "
+                        f"likely rate limited or quota exceeded. "
                         f"Retrying in {wait}s "
-                        f"(attempt {attempt + 1}/{empty_cap}). "
-                        f"Note: empty-response retries are capped at "
-                        f"{EMPTY_RESPONSE_MAX_RETRIES} because this is rarely "
-                        f"a transient rate limit on small payloads."
+                        f"(attempt {attempt + 1}/{retries})"
                     )
                     time.sleep(wait)
                     continue
 
-                if self._key_pool and current_key:
-                    self._key_pool.mark_success(current_key)
                 return response
             except RateLimitError as e:
-                # Key pool: mark the offending key and rotate immediately.
-                if self._key_pool and current_key:
-                    self._key_pool.mark_rate_limited(current_key, retry_after=60.0)
-                    # When we have other healthy keys, skip the sleep -- the
-                    # next iteration will pick a different key automatically.
-                    if attempt < retries:
-                        logger.info(
-                            "[retry] Key pool rotating away from ...%s on 429",
-                            current_key[-6:],
-                        )
-                        continue
-
                 # Dump full request to file for debugging
                 messages = kwargs.get("messages", [])
                 token_count, token_method = _estimate_tokens(model, messages)
@@ -916,7 +908,7 @@ class LiteLLMProvider(LLMProvider):
                 if attempt == retries:
                     logger.error(
                         f"[retry] GAVE UP on {model} after {retries + 1} "
-                        f"attempts -- rate limit error: {e!s}. "
+                        f"attempts — rate limit error: {e!s}. "
                         f"~{token_count} tokens ({token_method}). "
                         f"Full request dumped to: {dump_path}"
                     )
@@ -973,6 +965,8 @@ class LiteLLMProvider(LLMProvider):
                 full_messages[0]["content"] += json_instruction
             else:
                 full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
+        elif _needs_json_object_prompt_hint(response_format):
+            _ensure_json_object_prompt_hint(full_messages)
 
         # Build kwargs
         kwargs: dict[str, Any] = {
@@ -1029,22 +1023,20 @@ class LiteLLMProvider(LLMProvider):
     # Async variants — non-blocking on the event loop
     # ------------------------------------------------------------------
 
-    async def _acompletion_with_rate_limit_retry(self, max_retries: int | None = None, **kwargs: Any) -> Any:
+    async def _acompletion_with_rate_limit_retry(
+        self, max_retries: int | None = None, **kwargs: Any
+    ) -> Any:
         """Async version of _completion_with_rate_limit_retry.
 
         Uses litellm.acompletion and asyncio.sleep instead of blocking calls.
-        When a :class:`KeyPool` is configured, rate-limited keys are rotated.
         """
         model = kwargs.get("model", self.model)
         retries = max_retries if max_retries is not None else RATE_LIMIT_MAX_RETRIES
+        retries = _retry_budget_for_model(str(model), retries)
         for attempt in range(retries + 1):
-            # Rotate key from pool when available.
-            current_key: str | None = None
-            if self._key_pool:
-                current_key = self._key_pool.get_key()
-                kwargs["api_key"] = current_key
             try:
-                response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
+                async with _async_llm_request_slot(str(model)):
+                    response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
 
                 content = response.choices[0].message.content if response.choices else None
                 has_tool_calls = bool(response.choices and response.choices[0].message.tool_calls)
@@ -1055,10 +1047,15 @@ class LiteLLMProvider(LLMProvider):
                         None,
                     )
                     if last_role == "assistant":
-                        logger.debug("[async-retry] Empty response after assistant message — expected, not retrying.")
+                        logger.debug(
+                            "[async-retry] Empty response after assistant message — "
+                            "expected, not retrying."
+                        )
                         return response
 
-                    finish_reason = response.choices[0].finish_reason if response.choices else "unknown"
+                    finish_reason = (
+                        response.choices[0].finish_reason if response.choices else "unknown"
+                    )
                     token_count, token_method = _estimate_tokens(model, messages)
                     dump_path = _dump_failed_request(
                         model=model,
@@ -1086,53 +1083,28 @@ class LiteLLMProvider(LLMProvider):
                         )
                         return response
 
-                    # Use a much lower retry cap for empty-response
-                    # recoveries than for real exceptions. These are
-                    # almost never transient (see EMPTY_RESPONSE_MAX_RETRIES
-                    # rationale at the top of the file).
-                    empty_cap = min(retries, EMPTY_RESPONSE_MAX_RETRIES)
-                    if attempt >= empty_cap:
+                    if attempt == retries:
                         logger.error(
-                            f"[async-retry] GAVE UP on {model} after "
-                            f"{attempt + 1} attempts — empty response "
+                            f"[async-retry] GAVE UP on {model} after {retries + 1} "
+                            f"attempts — empty response "
                             f"(finish_reason={finish_reason}, "
-                            f"choices={len(response.choices) if response.choices else 0}). "
-                            f"This is almost never a rate limit despite the "
-                            f"earlier log message — check the dumped request "
-                            f"at {dump_path} for poisoned conversation state "
-                            f"(dangling tool_result after compaction), a "
-                            f"safety-filter trigger in the prompt, or a "
-                            f"malformed tool schema."
+                            f"choices={len(response.choices) if response.choices else 0})"
                         )
                         return response
                     wait = _compute_retry_delay(attempt)
                     logger.warning(
                         f"[async-retry] {model} returned empty response "
                         f"(finish_reason={finish_reason}, "
-                        f"choices={len(response.choices) if response.choices else 0}). "
+                        f"choices={len(response.choices) if response.choices else 0}) — "
+                        f"likely rate limited or quota exceeded. "
                         f"Retrying in {wait}s "
-                        f"(attempt {attempt + 1}/{empty_cap}). "
-                        f"Note: empty-response retries are capped at "
-                        f"{EMPTY_RESPONSE_MAX_RETRIES} because this is rarely "
-                        f"a transient rate limit on small payloads."
+                        f"(attempt {attempt + 1}/{retries})"
                     )
                     await asyncio.sleep(wait)
                     continue
 
-                if self._key_pool and current_key:
-                    self._key_pool.mark_success(current_key)
                 return response
             except RateLimitError as e:
-                # Key pool: mark the offending key and rotate immediately.
-                if self._key_pool and current_key:
-                    self._key_pool.mark_rate_limited(current_key, retry_after=60.0)
-                    if attempt < retries:
-                        logger.info(
-                            "[async-retry] Key pool rotating away from ...%s on 429",
-                            current_key[-6:],
-                        )
-                        continue
-
                 messages = kwargs.get("messages", [])
                 token_count, token_method = _estimate_tokens(model, messages)
                 dump_path = _dump_failed_request(
@@ -1144,7 +1116,7 @@ class LiteLLMProvider(LLMProvider):
                 if attempt == retries:
                     logger.error(
                         f"[async-retry] GAVE UP on {model} after {retries + 1} "
-                        f"attempts -- rate limit error: {e!s}. "
+                        f"attempts — rate limit error: {e!s}. "
                         f"~{token_count} tokens ({token_method}). "
                         f"Full request dumped to: {dump_path}"
                     )
@@ -1201,6 +1173,10 @@ class LiteLLMProvider(LLMProvider):
                 full_messages[0]["content"] += json_instruction
             else:
                 full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
+        elif _needs_json_object_prompt_hint(response_format):
+            _ensure_json_object_prompt_hint(full_messages)
+        elif _needs_json_object_prompt_hint(response_format):
+            _ensure_json_object_prompt_hint(full_messages)
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -1271,12 +1247,6 @@ class LiteLLMProvider(LLMProvider):
         api_base = (self.api_base or "").lower()
         return "openrouter.ai/api/v1" in api_base
 
-    def _is_zai_openai_backend(self) -> bool:
-        """Return True when using Z-AI's OpenAI-compatible chat endpoint."""
-        model = (self.model or "").lower()
-        api_base = (self.api_base or "").lower()
-        return "api.z.ai" in api_base or model.startswith("openai/glm-") or model == "glm-5"
-
     def _should_use_openrouter_tool_compat(
         self,
         error: BaseException,
@@ -1342,7 +1312,8 @@ class LiteLLMProvider(LLMProvider):
                 )
                 return text_tool_content, text_tool_calls
             logger.info(
-                "[openrouter-tool-compat] %s returned non-JSON fallback content; treating it as plain text.",
+                "[openrouter-tool-compat] %s returned non-JSON fallback content; "
+                "treating it as plain text.",
                 self.model,
             )
             return content.strip(), []
@@ -1494,7 +1465,9 @@ class LiteLLMProvider(LLMProvider):
             )
             return repaired
 
-        raise ValueError(f"Failed to parse tool call arguments for '{tool_name}' (likely truncated JSON).")
+        raise ValueError(
+            f"Failed to parse tool call arguments for '{tool_name}' (likely truncated JSON)."
+        )
 
     def _parse_openrouter_text_tool_calls(
         self,
@@ -1651,7 +1624,11 @@ class LiteLLMProvider(LLMProvider):
         return [
             message
             for message in full_messages
-            if not (message.get("role") == "assistant" and not message.get("content") and not message.get("tool_calls"))
+            if not (
+                message.get("role") == "assistant"
+                and not message.get("content")
+                and not message.get("tool_calls")
+            )
         ]
 
     async def _acomplete_via_openrouter_tool_compat(
@@ -1877,38 +1854,6 @@ class LiteLLMProvider(LLMProvider):
             full_messages.append(sys_msg)
         full_messages.extend(messages)
 
-        if logger.isEnabledFor(logging.DEBUG) and full_messages:
-            import json as _json
-            from datetime import datetime as _dt
-            from pathlib import Path as _Path
-
-            _debug_dir = _Path.home() / ".hive" / "debug_logs"
-            _debug_dir.mkdir(parents=True, exist_ok=True)
-            _ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")
-            _dump_file = _debug_dir / f"llm_request_{_ts}.json"
-            _summary = []
-            for _mi, _m in enumerate(full_messages):
-                _role = _m.get("role", "?")
-                _c = _m.get("content")
-                _tc = _m.get("tool_calls")
-                _tcid = _m.get("tool_call_id")
-                _summary.append(
-                    {
-                        "idx": _mi,
-                        "role": _role,
-                        "content_length": len(str(_c)) if _c else 0,
-                        "content_preview": str(_c)[:200] if _c else repr(_c),
-                        "has_tool_calls": bool(_tc),
-                        "tool_call_count": len(_tc) if _tc else 0,
-                        "tool_call_id": _tcid,
-                    }
-                )
-            try:
-                _dump_file.write_text(_json.dumps(_summary, indent=2, ensure_ascii=False), encoding="utf-8")
-                logger.debug("[LLM-MSG] %d messages dumped to %s", len(full_messages), _dump_file)
-            except Exception:
-                pass
-
         # Codex Responses API requires an `instructions` field (system prompt).
         # Inject a minimal one when callers don't provide a system message.
         if self._codex_backend and not any(m["role"] == "system" for m in full_messages):
@@ -1929,7 +1874,9 @@ class LiteLLMProvider(LLMProvider):
         full_messages = [
             m
             for m in full_messages
-            if not (m.get("role") == "assistant" and not m.get("content") and not m.get("tool_calls"))
+            if not (
+                m.get("role") == "assistant" and not m.get("content") and not m.get("tool_calls")
+            )
         ]
 
         kwargs: dict[str, Any] = {
@@ -1960,34 +1907,10 @@ class LiteLLMProvider(LLMProvider):
             kwargs.pop("max_tokens", None)
             kwargs.pop("stream_options", None)
 
-        request_summary = _summarize_request_for_log(kwargs)
-        logger.debug(
-            "[stream] prepared request: %s",
-            json.dumps(request_summary, default=str),
-        )
-        if request_summary["system_only"]:
-            logger.warning(
-                "[stream] %s request has no non-system chat messages "
-                "(api_base=%s tools=%d system_chars=%d). "
-                "Some chat-completions backends reject system-only payloads.",
-                self.model,
-                self.api_base,
-                request_summary["tool_count"],
-                sum(
-                    message.get("text_chars", 0)
-                    for message in request_summary["messages"]
-                    if message.get("role") == "system"
-                ),
-            )
-            if self._is_zai_openai_backend():
-                logger.warning(
-                    "[stream] %s appears to be using Z-AI/GLM's OpenAI-compatible backend. "
-                    "This backend has rejected system-only payloads with "
-                    "'The messages parameter is illegal.' in prior requests.",
-                    self.model,
-                )
-
-        for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        rate_limit_retries = _retry_budget_for_model(self.model, RATE_LIMIT_MAX_RETRIES)
+        transient_retries = _retry_budget_for_model(self.model, STREAM_TRANSIENT_MAX_RETRIES)
+        max_attempts = max(rate_limit_retries, transient_retries, EMPTY_STREAM_MAX_RETRIES)
+        for attempt in range(max_attempts + 1):
             # Post-stream events (ToolCall, TextEnd, Finish) are buffered
             # because they depend on the full stream.  TextDeltaEvents are
             # yielded immediately so callers see tokens in real time.
@@ -2000,145 +1923,149 @@ class LiteLLMProvider(LLMProvider):
             stream_finish_reason: str | None = None
 
             try:
-                response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
+                async with _async_llm_request_slot(self.model):
+                    response = await litellm.acompletion(**kwargs)  # type: ignore[union-attr]
 
-                async for chunk in response:
-                    # Capture usage from the trailing usage-only chunk that
-                    # stream_options={"include_usage": True} sends with empty choices.
-                    if not chunk.choices:
-                        usage = getattr(chunk, "usage", None)
-                        if usage:
-                            input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-                            output_tokens = getattr(usage, "completion_tokens", 0) or 0
-                            logger.debug(
-                                "[tokens] trailing usage chunk: input=%d output=%d model=%s",
-                                input_tokens,
-                                output_tokens,
-                                self.model,
-                            )
-                        else:
-                            logger.debug(
-                                "[tokens] empty-choices chunk with no usage (model=%s)",
-                                self.model,
-                            )
-                        continue
-                    choice = chunk.choices[0]
-
-                    delta = choice.delta
-
-                    # --- Text content — yield immediately for real-time streaming ---
-                    if delta and delta.content:
-                        accumulated_text += delta.content
-                        yield TextDeltaEvent(
-                            content=delta.content,
-                            snapshot=accumulated_text,
-                        )
-
-                    # --- Tool calls (accumulate across chunks) ---
-                    # The Codex/Responses API bridge (litellm bug) hardcodes
-                    # index=0 on every ChatCompletionToolCallChunk, even for
-                    # parallel tool calls.  We work around this by using tc.id
-                    # (set on output_item.added events) as a "new tool call"
-                    # signal and tracking the most recently opened slot for
-                    # argument deltas that arrive with id=None.
-                    if delta and delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            idx = tc.index if hasattr(tc, "index") and tc.index is not None else 0
-
-                            if tc.id:
-                                # New tool call announced (or done event re-sent).
-                                # Check if this id already has a slot.
-                                existing_idx = next(
-                                    (k for k, v in tool_calls_acc.items() if v["id"] == tc.id),
-                                    None,
+                    async for chunk in response:
+                        # Capture usage from the trailing usage-only chunk that
+                        # stream_options={"include_usage": True} sends with empty choices.
+                        if not chunk.choices:
+                            usage = getattr(chunk, "usage", None)
+                            if usage:
+                                input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                                output_tokens = getattr(usage, "completion_tokens", 0) or 0
+                                logger.debug(
+                                    "[tokens] trailing usage chunk: input=%d output=%d model=%s",
+                                    input_tokens,
+                                    output_tokens,
+                                    self.model,
                                 )
-                                if existing_idx is not None:
-                                    idx = existing_idx
-                                elif idx in tool_calls_acc and tool_calls_acc[idx]["id"] not in (
-                                    "",
-                                    tc.id,
-                                ):
-                                    # Slot taken by a different call — assign new index
-                                    idx = max(tool_calls_acc.keys()) + 1
-                                _last_tool_idx = idx
                             else:
-                                # Argument delta with no id — route to last opened slot
-                                idx = _last_tool_idx
-
-                            if idx not in tool_calls_acc:
-                                tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
-                            if tc.id:
-                                tool_calls_acc[idx]["id"] = tc.id
-                            if tc.function:
-                                if tc.function.name:
-                                    tool_calls_acc[idx]["name"] = tc.function.name
-                                if tc.function.arguments:
-                                    tool_calls_acc[idx]["arguments"] += tc.function.arguments
-
-                    # --- Finish ---
-                    if choice.finish_reason:
-                        # Kimi's 'pause_turn' means the model emitted tool
-                        # calls and expects results — equivalent to 'tool_calls'.
-                        if choice.finish_reason == "pause_turn":
-                            choice.finish_reason = "tool_calls" if tool_calls_acc else "stop"
-                        stream_finish_reason = choice.finish_reason
-                        for _idx, tc_data in sorted(tool_calls_acc.items()):
-                            parsed_args = self._parse_tool_call_arguments(
-                                tc_data.get("arguments", ""),
-                                tc_data.get("name", ""),
-                            )
-                            tail_events.append(
-                                ToolCallEvent(
-                                    tool_use_id=tc_data["id"],
-                                    tool_name=tc_data["name"],
-                                    tool_input=parsed_args,
+                                logger.debug(
+                                    "[tokens] empty-choices chunk with no usage (model=%s)",
+                                    self.model,
                                 )
+                            continue
+                        choice = chunk.choices[0]
+
+                        delta = choice.delta
+
+                        # --- Text content — yield immediately for real-time streaming ---
+                        if delta and delta.content:
+                            accumulated_text += delta.content
+                            yield TextDeltaEvent(
+                                content=delta.content,
+                                snapshot=accumulated_text,
                             )
 
-                        if accumulated_text:
-                            tail_events.append(TextEndEvent(full_text=accumulated_text))
+                        # --- Tool calls (accumulate across chunks) ---
+                        # The Codex/Responses API bridge (litellm bug) hardcodes
+                        # index=0 on every ChatCompletionToolCallChunk, even for
+                        # parallel tool calls.  We work around this by using tc.id
+                        # (set on output_item.added events) as a "new tool call"
+                        # signal and tracking the most recently opened slot for
+                        # argument deltas that arrive with id=None.
+                        if delta and delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                idx = (
+                                    tc.index if hasattr(tc, "index") and tc.index is not None else 0
+                                )
 
-                        usage = getattr(chunk, "usage", None)
-                        logger.debug(
-                            "[tokens] finish-chunk raw usage: %r (type=%s)",
-                            usage,
-                            type(usage).__name__,
-                        )
-                        cached_tokens = 0
-                        if usage:
-                            input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-                            output_tokens = getattr(usage, "completion_tokens", 0) or 0
-                            _details = getattr(usage, "prompt_tokens_details", None)
-                            cached_tokens = (
-                                getattr(_details, "cached_tokens", 0) or 0
-                                if _details is not None
-                                else getattr(usage, "cache_read_input_tokens", 0) or 0
-                            )
+                                if tc.id:
+                                    # New tool call announced (or done event re-sent).
+                                    # Check if this id already has a slot.
+                                    existing_idx = next(
+                                        (k for k, v in tool_calls_acc.items() if v["id"] == tc.id),
+                                        None,
+                                    )
+                                    if existing_idx is not None:
+                                        idx = existing_idx
+                                    elif idx in tool_calls_acc and tool_calls_acc[idx]["id"] not in (
+                                        "",
+                                        tc.id,
+                                    ):
+                                        # Slot taken by a different call — assign new index
+                                        idx = max(tool_calls_acc.keys()) + 1
+                                    _last_tool_idx = idx
+                                else:
+                                    # Argument delta with no id — route to last opened slot
+                                    idx = _last_tool_idx
+
+                                if idx not in tool_calls_acc:
+                                    tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                                if tc.id:
+                                    tool_calls_acc[idx]["id"] = tc.id
+                                if tc.function:
+                                    if tc.function.name:
+                                        tool_calls_acc[idx]["name"] = tc.function.name
+                                    if tc.function.arguments:
+                                        tool_calls_acc[idx]["arguments"] += tc.function.arguments
+
+                        # --- Finish ---
+                        if choice.finish_reason:
+                            # Kimi's 'pause_turn' means the model emitted tool
+                            # calls and expects results — equivalent to 'tool_calls'.
+                            if choice.finish_reason == "pause_turn":
+                                choice.finish_reason = "tool_calls" if tool_calls_acc else "stop"
+                            stream_finish_reason = choice.finish_reason
+                            for _idx, tc_data in sorted(tool_calls_acc.items()):
+                                parsed_args = self._parse_tool_call_arguments(
+                                    tc_data.get("arguments", ""),
+                                    tc_data.get("name", ""),
+                                )
+                                tail_events.append(
+                                    ToolCallEvent(
+                                        tool_use_id=tc_data["id"],
+                                        tool_name=tc_data["name"],
+                                        tool_input=parsed_args,
+                                    )
+                                )
+
+                            if accumulated_text:
+                                tail_events.append(TextEndEvent(full_text=accumulated_text))
+
+                            usage = getattr(chunk, "usage", None)
                             logger.debug(
-                                "[tokens] finish-chunk usage: input=%d output=%d cached=%d model=%s",
+                                "[tokens] finish-chunk raw usage: %r (type=%s)",
+                                usage,
+                                type(usage).__name__,
+                            )
+                            cached_tokens = 0
+                            if usage:
+                                input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                                output_tokens = getattr(usage, "completion_tokens", 0) or 0
+                                _details = getattr(usage, "prompt_tokens_details", None)
+                                cached_tokens = (
+                                    getattr(_details, "cached_tokens", 0) or 0
+                                    if _details is not None
+                                    else getattr(usage, "cache_read_input_tokens", 0) or 0
+                                )
+                                logger.debug(
+                                    "[tokens] finish-chunk usage: "
+                                    "input=%d output=%d cached=%d model=%s",
+                                    input_tokens,
+                                    output_tokens,
+                                    cached_tokens,
+                                    self.model,
+                                )
+
+                            logger.debug(
+                                "[tokens] finish event: input=%d output=%d cached=%d stop=%s model=%s",
                                 input_tokens,
                                 output_tokens,
                                 cached_tokens,
+                                choice.finish_reason,
                                 self.model,
                             )
-
-                        logger.debug(
-                            "[tokens] finish event: input=%d output=%d cached=%d stop=%s model=%s",
-                            input_tokens,
-                            output_tokens,
-                            cached_tokens,
-                            choice.finish_reason,
-                            self.model,
-                        )
-                        tail_events.append(
-                            FinishEvent(
-                                stop_reason=choice.finish_reason,
-                                input_tokens=input_tokens,
-                                output_tokens=output_tokens,
-                                cached_tokens=cached_tokens,
-                                model=self.model,
+                            tail_events.append(
+                                FinishEvent(
+                                    stop_reason=choice.finish_reason,
+                                    input_tokens=input_tokens,
+                                    output_tokens=output_tokens,
+                                    cached_tokens=cached_tokens,
+                                    model=self.model,
+                                )
                             )
-                        )
 
                 # Fallback: LiteLLM strips usage from yielded chunks before
                 # returning them to us, but appends the original chunk (with
@@ -2162,7 +2089,8 @@ class LiteLLMProvider(LLMProvider):
                                 else getattr(_usage, "cache_read_input_tokens", 0) or 0
                             )
                             logger.debug(
-                                "[tokens] post-loop chunks fallback: input=%d output=%d cached=%d model=%s",
+                                "[tokens] post-loop chunks fallback:"
+                                " input=%d output=%d cached=%d model=%s",
                                 input_tokens,
                                 output_tokens,
                                 cached_tokens,
@@ -2254,13 +2182,9 @@ class LiteLLMProvider(LLMProvider):
                 if accumulated_text and "<tool_code>" in accumulated_text:
                     extracted, cleaned = _extract_text_tool_calls(accumulated_text)
                     if extracted:
-                        tool_names = [tc.tool_name for tc in extracted]
                         logger.info(
-                            "[stream] Model emitted %d tool call(s) as <tool_code> text "
-                            "instead of structured function calls; converting to "
-                            "synthetic ToolCallEvents: %s",
+                            "[stream] extracted %d hallucinated tool call(s) from text",
                             len(extracted),
-                            tool_names,
                         )
                         accumulated_text = cleaned
                         # Emit a corrected TextDeltaEvent so the caller's
@@ -2285,12 +2209,12 @@ class LiteLLMProvider(LLMProvider):
                 return
 
             except RateLimitError as e:
-                if attempt < RATE_LIMIT_MAX_RETRIES:
+                if attempt < rate_limit_retries:
                     wait = _compute_retry_delay(attempt, exception=e)
                     logger.warning(
                         f"[stream-retry] {self.model} rate limited (429): {e!s}. "
                         f"Retrying in {wait:.1f}s "
-                        f"(attempt {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{rate_limit_retries})"
                     )
                     await asyncio.sleep(wait)
                     continue
@@ -2338,30 +2262,16 @@ class LiteLLMProvider(LLMProvider):
                     ):
                         yield event
                     return
-                if _is_stream_transient_error(e) and attempt < STREAM_TRANSIENT_MAX_RETRIES:
+                if _is_stream_transient_error(e) and attempt < transient_retries:
                     wait = _compute_retry_delay(attempt, exception=e)
                     logger.warning(
                         f"[stream-retry] {self.model} transient error "
                         f"({type(e).__name__}): {e!s}. "
                         f"Retrying in {wait:.1f}s "
-                        f"(attempt {attempt + 1}/{STREAM_TRANSIENT_MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{transient_retries})"
                     )
                     await asyncio.sleep(wait)
                     continue
-                dump_path = _dump_failed_request(
-                    model=self.model,
-                    kwargs=kwargs,
-                    error_type=f"stream_exception_{type(e).__name__.lower()}",
-                    attempt=attempt,
-                )
-                logger.error(
-                    "[stream] %s request failed with %s: %s | request=%s | dump=%s",
-                    self.model,
-                    type(e).__name__,
-                    e,
-                    json.dumps(_summarize_request_for_log(kwargs), default=str),
-                    dump_path,
-                )
                 recoverable = _is_stream_transient_error(e)
                 yield StreamErrorEvent(error=str(e), recoverable=recoverable)
                 return

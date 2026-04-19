@@ -1,0 +1,12 @@
+{
+  "title": "Implement feature X",
+  "goal": "Deliver feature X with tests and documentation",
+  "acceptance_criteria": [
+    "Feature X implemented end-to-end",
+    "Automated tests are green",
+    "Docs updated for changed behavior"
+  ],
+  "priority": "high",
+  "repository": "org/repo",
+  "branch": "hive/task/feature-x"
+}

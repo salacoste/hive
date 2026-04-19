@@ -3,74 +3,40 @@
 import asyncio
 import logging
 import os
+import re
+from datetime import UTC, datetime
+from typing import Any
 
 from aiohttp import web
 from pydantic import SecretStr
 
 from framework.credentials.models import CredentialKey, CredentialObject
 from framework.credentials.store import CredentialStore
-from framework.server.app import validate_agent_path
+from framework.server.app import APP_KEY_CREDENTIAL_STORE, validate_agent_path
 
 logger = logging.getLogger(__name__)
 
-_llm_key_providers_cache: dict | None = None
-
-
-def _get_llm_key_providers() -> dict:
-    """Lazily load the PROVIDERS dict from scripts/check_llm_key.py (cached)."""
-    global _llm_key_providers_cache
-    if _llm_key_providers_cache is None:
-        import importlib.util
-        from pathlib import Path as _Path
-
-        script = _Path(__file__).resolve().parents[3] / "scripts" / "check_llm_key.py"
-        if not script.exists():
-            logger.warning("check_llm_key.py not found at %s — key validation disabled", script)
-            _llm_key_providers_cache = {}
-            return _llm_key_providers_cache
-        spec = importlib.util.spec_from_file_location("check_llm_key", script)
-        if spec is None or spec.loader is None:
-            logger.warning("Failed to load spec for %s — key validation disabled", script)
-            _llm_key_providers_cache = {}
-            return _llm_key_providers_cache
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _llm_key_providers_cache = mod.PROVIDERS
-    return _llm_key_providers_cache
+READINESS_BUNDLES: dict[str, dict[str, list[str]]] = {
+    "local_pro_stack": {
+        "required": [
+            "BRAVE_SEARCH_API_KEY",
+            "GITHUB_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "GOOGLE_ACCESS_TOKEN",
+            "REDIS_URL",
+            "DATABASE_URL",
+        ],
+        "optional": [
+            "GOOGLE_MAPS_API_KEY",
+            "GOOGLE_SEARCH_CONSOLE_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ],
+    }
+}
 
 
 def _get_store(request: web.Request) -> CredentialStore:
-    return request.app["credential_store"]
-
-
-def _invalidate_queen_credentials_cache(request: web.Request) -> None:
-    """Force every live Queen session to rebuild its ambient credentials block.
-
-    Called after credential save/delete so newly added or removed integrations
-    appear in the Queen's prompt on her next turn instead of waiting for the
-    cache TTL to expire.
-    """
-    manager = request.app.get("manager")
-    if manager is None:
-        return
-    sessions = getattr(manager, "_sessions", None)
-    if not sessions:
-        return
-    for session in sessions.values():
-        phase_state = getattr(session, "phase_state", None)
-        if phase_state is None:
-            continue
-        provider = getattr(phase_state, "credentials_prompt_provider", None)
-        invalidate = getattr(provider, "invalidate", None)
-        if callable(invalidate):
-            try:
-                invalidate()
-            except Exception:
-                logger.debug(
-                    "Credentials cache invalidate failed for session %s",
-                    getattr(session, "id", "?"),
-                    exc_info=True,
-                )
+    return request.app[APP_KEY_CREDENTIAL_STORE]
 
 
 def _credential_to_dict(cred: CredentialObject) -> dict:
@@ -82,6 +48,48 @@ def _credential_to_dict(cred: CredentialObject) -> dict:
         "created_at": cred.created_at.isoformat() if cred.created_at else None,
         "updated_at": cred.updated_at.isoformat() if cred.updated_at else None,
     }
+
+
+def _normalize_provider_name(raw: str | None, fallback: str) -> str:
+    text = (raw or fallback or "unknown").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    if not text:
+        return "unknown"
+    head = text.split("_", 1)[0]
+    if head == "google":
+        return "google"
+    return head
+
+
+def _credential_available(store: CredentialStore, cred_name: str, spec) -> bool:
+    # Environment wins for speed and compatibility with scripts.
+    if spec.env_var and os.environ.get(spec.env_var):
+        return True
+
+    cred_id = spec.credential_id or cred_name
+    try:
+        cred_obj = store.get_credential(cred_id, refresh_if_needed=False)
+    except Exception:
+        cred_obj = None
+    if cred_obj is not None:
+        try:
+            if spec.credential_key and cred_obj.get_key(spec.credential_key):
+                return True
+        except Exception:
+            pass
+        return bool(store.get(cred_id))
+    return False
+
+
+def _env_var_available(store: CredentialStore, env_var: str, specs: dict[str, Any]) -> bool:
+    if os.environ.get(env_var):
+        return True
+    for cred_name, spec in specs.items():
+        if spec.env_var != env_var:
+            continue
+        if _credential_available(store, cred_name, spec):
+            return True
+    return False
 
 
 async def handle_list_credentials(request: web.Request) -> web.Response:
@@ -141,7 +149,6 @@ async def handle_save_credential(request: web.Request) -> web.Response:
         except Exception as exc:
             logger.warning("Aden token sync after key save failed: %s", exc)
 
-        _invalidate_queen_credentials_cache(request)
         return web.json_response({"saved": "aden_api_key"}, status=201)
 
     store = _get_store(request)
@@ -150,7 +157,6 @@ async def handle_save_credential(request: web.Request) -> web.Response:
         keys={k: CredentialKey(name=k, value=SecretStr(v)) for k, v in keys.items()},
     )
     store.save_credential(cred)
-    _invalidate_queen_credentials_cache(request)
     return web.json_response({"saved": credential_id}, status=201)
 
 
@@ -167,20 +173,9 @@ async def handle_delete_credential(request: web.Request) -> web.Response:
         return web.json_response({"deleted": True})
 
     store = _get_store(request)
-    deleted_from_store = store.delete_credential(credential_id)
-
-    # Also clear the env var for this process so the key doesn't
-    # reappear via the env-var fallback in _resolve_api_key().
-    from framework.server.routes_config import PROVIDER_ENV_VARS
-
-    env_var = PROVIDER_ENV_VARS.get(credential_id.lower())
-    deleted_from_env = False
-    if env_var and os.environ.pop(env_var, None) is not None:
-        deleted_from_env = True
-
-    if not deleted_from_store and not deleted_from_env:
+    deleted = store.delete_credential(credential_id)
+    if not deleted:
         return web.json_response({"error": f"Credential '{credential_id}' not found"}, status=404)
-    _invalidate_queen_credentials_cache(request)
     return web.json_response({"deleted": True})
 
 
@@ -216,7 +211,9 @@ async def handle_check_agent(request: web.Request) -> web.Response:
         ensure_credential_key_env()
 
         nodes = load_agent_nodes(agent_path)
-        result = validate_agent_credentials(nodes, verify=verify, raise_on_error=False, force_refresh=True)
+        result = validate_agent_credentials(
+            nodes, verify=verify, raise_on_error=False, force_refresh=True
+        )
 
         # If any credential needs Aden, include ADEN_API_KEY as a first-class row
         if any(c.aden_supported for c in result.credentials):
@@ -253,6 +250,111 @@ async def handle_check_agent(request: web.Request) -> web.Response:
         )
 
 
+async def handle_credentials_readiness(request: web.Request) -> web.Response:
+    """GET /api/credentials/readiness — bundle-first credential readiness snapshot."""
+    bundle_name = (request.query.get("bundle") or "local_pro_stack").strip()
+    bundle = READINESS_BUNDLES.get(bundle_name)
+    if bundle is None:
+        return web.json_response(
+            {
+                "error": f"Unknown readiness bundle: {bundle_name}",
+                "available_bundles": sorted(READINESS_BUNDLES.keys()),
+            },
+            status=400,
+        )
+
+    try:
+        from aden_tools.credentials import CREDENTIAL_SPECS
+        from framework.credentials.validation import ensure_credential_key_env
+
+        ensure_credential_key_env()
+    except Exception:
+        return web.json_response(
+            {"error": "Failed to load credential specs for readiness report"},
+            status=500,
+        )
+
+    store = _get_store(request)
+    required_vars = [str(v).strip() for v in bundle.get("required", []) if str(v).strip()]
+    optional_vars = [str(v).strip() for v in bundle.get("optional", []) if str(v).strip()]
+
+    required_rows = [
+        {"env_var": env_var, "available": _env_var_available(store, env_var, CREDENTIAL_SPECS)}
+        for env_var in required_vars
+    ]
+    optional_rows = [
+        {"env_var": env_var, "available": _env_var_available(store, env_var, CREDENTIAL_SPECS)}
+        for env_var in optional_vars
+    ]
+
+    missing_required = [row["env_var"] for row in required_rows if not row["available"]]
+    missing_optional = [row["env_var"] for row in optional_rows if not row["available"]]
+
+    provider_rows: dict[str, dict[str, Any]] = {}
+    for cred_name, spec in CREDENTIAL_SPECS.items():
+        env_var = str(spec.env_var or "").strip()
+        if not env_var:
+            continue
+        provider_hint = spec.aden_provider_name or spec.credential_group or spec.credential_id
+        provider = _normalize_provider_name(provider_hint, fallback=cred_name)
+        row = provider_rows.setdefault(
+            provider,
+            {
+                "provider": provider,
+                "credentials_total": 0,
+                "credentials_available": 0,
+                "credentials_missing": 0,
+                "env_vars": set(),
+                "missing_env_vars": set(),
+            },
+        )
+        if env_var in row["env_vars"]:
+            continue
+        row["env_vars"].add(env_var)
+        row["credentials_total"] += 1
+        available = _env_var_available(store, env_var, CREDENTIAL_SPECS)
+        if available:
+            row["credentials_available"] += 1
+        else:
+            row["credentials_missing"] += 1
+            row["missing_env_vars"].add(env_var)
+
+    providers = []
+    for provider in sorted(provider_rows.keys()):
+        row = provider_rows[provider]
+        providers.append(
+            {
+                "provider": provider,
+                "credentials_total": int(row["credentials_total"]),
+                "credentials_available": int(row["credentials_available"]),
+                "credentials_missing": int(row["credentials_missing"]),
+                "env_vars": sorted(row["env_vars"]),
+                "missing_env_vars": sorted(row["missing_env_vars"]),
+            }
+        )
+
+    summary = {
+        "ready": len(missing_required) == 0,
+        "required_total": len(required_rows),
+        "required_available": len(required_rows) - len(missing_required),
+        "required_missing": len(missing_required),
+        "optional_total": len(optional_rows),
+        "optional_available": len(optional_rows) - len(missing_optional),
+        "optional_missing": len(missing_optional),
+    }
+    return web.json_response(
+        {
+            "bundle": bundle_name,
+            "required": required_rows,
+            "optional": optional_rows,
+            "missing": {"required": missing_required, "optional": missing_optional},
+            "summary": summary,
+            "providers": providers,
+            "checked_at": datetime.now(UTC).isoformat(),
+        }
+    )
+
+
 def _status_to_dict(c) -> dict:
     """Convert a CredentialStatus to the JSON dict expected by the frontend."""
     return {
@@ -273,217 +375,11 @@ def _status_to_dict(c) -> dict:
     }
 
 
-def _collect_accounts_by_provider() -> dict[str, list[dict]]:
-    """Snapshot connected accounts grouped by provider (credential_id).
-
-    Returns a dict mapping provider → list of account dicts with the
-    fields the frontend needs to render per-account rows. Best-effort —
-    returns {} if the adapter cannot be built.
-    """
-    try:
-        from aden_tools.credentials.store_adapter import CredentialStoreAdapter
-
-        adapter = CredentialStoreAdapter.default()
-        grouped: dict[str, list[dict]] = {}
-        for acct in adapter.get_all_account_info():
-            provider = acct.get("provider", "")
-            if not provider:
-                continue
-            grouped.setdefault(provider, []).append(
-                {
-                    "provider": provider,
-                    "alias": acct.get("alias", ""),
-                    "identity": acct.get("identity", {}) or {},
-                    "source": acct.get("source", "aden"),
-                    "credential_id": acct.get("credential_id", provider),
-                }
-            )
-        return grouped
-    except Exception:
-        logger.debug("Failed to collect accounts for specs response", exc_info=True)
-        return {}
-
-
-async def handle_resync_credentials(request: web.Request) -> web.Response:
-    """POST /api/credentials/resync — force-resync Aden OAuth tokens.
-
-    Called by the frontend after the user completes an OAuth flow on
-    hive.adenhq.com so the new account appears in Hive without waiting
-    for a cache TTL. Returns the current connected-accounts snapshot so
-    the caller can diff against what it had before opening the Aden tab.
-    """
-    try:
-        from aden_tools.credentials import CREDENTIAL_SPECS
-
-        from framework.credentials.validation import _presync_aden_tokens, ensure_credential_key_env
-
-        ensure_credential_key_env()
-
-        if not os.environ.get("ADEN_API_KEY"):
-            return web.json_response(
-                {"error": "Aden API key not configured", "accounts_by_provider": {}},
-                status=400,
-            )
-
-        loop = asyncio.get_running_loop()
-        # _presync_aden_tokens makes blocking HTTP calls to the Aden server.
-        await loop.run_in_executor(None, lambda: _presync_aden_tokens(CREDENTIAL_SPECS, force=True))
-
-        _invalidate_queen_credentials_cache(request)
-
-        accounts_by_provider = _collect_accounts_by_provider()
-        return web.json_response(
-            {
-                "synced": True,
-                "accounts_by_provider": accounts_by_provider,
-            }
-        )
-    except Exception as exc:
-        logger.exception("Error during credential resync: %s", exc)
-        return web.json_response(
-            {"error": "Internal server error during resync"},
-            status=500,
-        )
-
-
-async def handle_list_specs(request: web.Request) -> web.Response:
-    """GET /api/credentials/specs — list ALL credential specs with availability."""
-    try:
-        from aden_tools.credentials import CREDENTIAL_SPECS
-
-        from framework.credentials.storage import (
-            CompositeStorage,
-            EncryptedFileStorage,
-            EnvVarStorage,
-        )
-        from framework.credentials.store import CredentialStore
-        from framework.credentials.validation import _presync_aden_tokens, ensure_credential_key_env
-
-        ensure_credential_key_env()
-
-        has_aden_key = bool(os.environ.get("ADEN_API_KEY"))
-        if has_aden_key:
-            _presync_aden_tokens(CREDENTIAL_SPECS)
-
-        # Build composite store (env → encrypted file)
-        env_mapping = {(spec.credential_id or name): spec.env_var for name, spec in CREDENTIAL_SPECS.items()}
-        env_storage = EnvVarStorage(env_mapping=env_mapping)
-        if os.environ.get("HIVE_CREDENTIAL_KEY"):
-            storage = CompositeStorage(primary=env_storage, fallbacks=[EncryptedFileStorage()])
-        else:
-            storage = env_storage
-        store = CredentialStore(storage=storage)
-
-        # Snapshot accounts once — the adapter walks the same specs internally
-        # and hits both Aden and local stores, so we reuse it for every row.
-        accounts_by_provider = _collect_accounts_by_provider()
-
-        specs = []
-        any_aden = False
-        for name, spec in CREDENTIAL_SPECS.items():
-            cred_id = spec.credential_id or name
-            if spec.aden_supported:
-                any_aden = True
-            accounts = accounts_by_provider.get(cred_id, [])
-            # Pure-OAuth (Aden-only, no direct API key) credentials are
-            # authoritative through Aden — the accounts list is the source of
-            # truth. Local stores can hold stale cache entries after a remote
-            # deletion, so trusting `store.is_available()` here would surface
-            # ghost "Connected" rows with no accounts and no add affordance.
-            if spec.aden_supported and not spec.direct_api_key_supported:
-                available = len(accounts) > 0
-            else:
-                available = store.is_available(cred_id)
-            specs.append(
-                {
-                    "credential_name": name,
-                    "credential_id": cred_id,
-                    "env_var": spec.env_var,
-                    "description": spec.description,
-                    "help_url": spec.help_url,
-                    "api_key_instructions": spec.api_key_instructions,
-                    "tools": spec.tools,
-                    "aden_supported": spec.aden_supported,
-                    "direct_api_key_supported": spec.direct_api_key_supported,
-                    "credential_key": spec.credential_key,
-                    "credential_group": spec.credential_group,
-                    "available": available,
-                    "accounts": accounts,
-                }
-            )
-
-        # Include aden_api_key synthetic row if any spec uses Aden
-        if any_aden:
-            specs.insert(
-                0,
-                {
-                    "credential_name": "Aden Platform",
-                    "credential_id": "aden_api_key",
-                    "env_var": "ADEN_API_KEY",
-                    "description": "API key from the Developers tab in Settings",
-                    "help_url": "https://hive.adenhq.com/",
-                    "api_key_instructions": (
-                        "1. Go to hive.adenhq.com\n2. Open Settings > Developers\n3. Copy your API key"
-                    ),
-                    "tools": [],
-                    "aden_supported": True,
-                    "direct_api_key_supported": True,
-                    "credential_key": "api_key",
-                    "credential_group": "",
-                    "available": has_aden_key,
-                },
-            )
-
-        return web.json_response({"specs": specs, "has_aden_key": has_aden_key})
-    except Exception as e:
-        logger.exception(f"Error listing credential specs: {e}")
-        return web.json_response(
-            {"error": "Internal server error while listing credential specs"},
-            status=500,
-        )
-
-
-async def handle_validate_key(request: web.Request) -> web.Response:
-    """POST /api/credentials/validate-key — health-check an LLM provider key.
-
-    Body: {"provider_id": "anthropic", "api_key": "sk-..."}
-    Returns: {"valid": bool|null, "message": str}
-
-    Runs the same checks as ``quickstart.sh`` (scripts/check_llm_key.py)
-    but in-process — no subprocess overhead.
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
-
-    provider_id = body.get("provider_id", "").strip()
-    api_key = body.get("api_key", "").strip()
-
-    if not provider_id or not api_key:
-        return web.json_response({"error": "provider_id and api_key are required"}, status=400)
-
-    try:
-        checker = _get_llm_key_providers().get(provider_id)
-        if not checker:
-            return web.json_response({"valid": True, "message": f"No health check for {provider_id}"})
-
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, lambda: checker(api_key))
-        return web.json_response(result)
-
-    except Exception as exc:
-        logger.warning("LLM key validation failed for %s: %s", provider_id, exc)
-        return web.json_response({"valid": None, "message": f"Validation error: {exc}"})
-
-
 def register_routes(app: web.Application) -> None:
     """Register credential routes on the application."""
-    # specs and check-agent must be registered BEFORE the {credential_id} wildcard
-    app.router.add_get("/api/credentials/specs", handle_list_specs)
+    # check-agent must be registered BEFORE the {credential_id} wildcard
     app.router.add_post("/api/credentials/check-agent", handle_check_agent)
-    app.router.add_post("/api/credentials/resync", handle_resync_credentials)
-    app.router.add_post("/api/credentials/validate-key", handle_validate_key)
+    app.router.add_get("/api/credentials/readiness", handle_credentials_readiness)
     app.router.add_get("/api/credentials", handle_list_credentials)
     app.router.add_post("/api/credentials", handle_save_credential)
     app.router.add_get("/api/credentials/{credential_id}", handle_get_credential)

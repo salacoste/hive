@@ -16,6 +16,7 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 from fastmcp import FastMCP
@@ -149,11 +150,26 @@ from .zendesk_tool import register_tools as register_zendesk
 from .zoho_crm_tool import register_tools as register_zoho_crm
 from .zoom_tool import register_tools as register_zoom
 
-# Tool names registered by `_register_verified()`. Populated on first call.
-# Consumed by the `__aden_verified_manifest` sentinel tool so downstream
-# registries (e.g. the queen's MCP loader) can gate free/credential-less tools
-# on whether they have been promoted to verified status.
-_VERIFIED_TOOL_NAMES: set[str] = set()
+
+def _list_registered_tool_names(mcp: FastMCP) -> list[str]:
+    """Return tool names across FastMCP versions (v2/v3 compatibility)."""
+    # FastMCP v2
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is not None and hasattr(manager, "_tools"):
+        return list(manager._tools.keys())
+
+    # FastMCP v3 (async API)
+    list_tools = getattr(mcp, "list_tools", None)
+    if callable(list_tools):
+        tools = asyncio.run(list_tools())
+        names: list[str] = []
+        for t in tools or []:
+            name = getattr(t, "name", None)
+            if name:
+                names.append(str(name))
+        return names
+
+    return []
 
 
 def _register_verified(
@@ -161,7 +177,6 @@ def _register_verified(
     credentials: CredentialStoreAdapter | None = None,
 ) -> None:
     """Register verified (stable) tools."""
-    _verified_before = set(mcp._tool_manager._tools.keys())
     # --- No credentials ---
     register_example(mcp)
     if register_web_scrape:
@@ -238,22 +253,6 @@ def _register_verified(
     register_google_maps(mcp, credentials=credentials)
     register_notion(mcp, credentials=credentials)
     register_account_info(mcp, credentials=credentials)
-
-    _VERIFIED_TOOL_NAMES.update(set(mcp._tool_manager._tools.keys()) - _verified_before)
-
-
-def _register_manifest(mcp: FastMCP) -> None:
-    """Expose the verified-tool manifest as a sentinel MCP tool.
-
-    Registered after both verified and unverified passes so the manifest tool
-    itself never appears in `_VERIFIED_TOOL_NAMES`. Downstream registries call
-    this to decide whether a credential-less tool is safe to admit.
-    """
-
-    @mcp.tool(name="__aden_verified_manifest")
-    def aden_verified_manifest() -> list[str]:
-        """Return tool names registered by `_register_verified()`."""
-        return sorted(_VERIFIED_TOOL_NAMES)
 
 
 def _register_unverified(
@@ -357,9 +356,7 @@ def register_all_tools(
     if include_unverified:
         _register_unverified(mcp, credentials=credentials)
 
-    _register_manifest(mcp)
-
-    return list(mcp._tool_manager._tools.keys())
+    return _list_registered_tool_names(mcp)
 
 
 __all__ = ["register_all_tools"]

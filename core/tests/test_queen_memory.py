@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from pathlib import Path
@@ -13,12 +12,10 @@ import pytest
 
 from framework.agents.queen import queen_memory_v2 as qm
 from framework.agents.queen.recall_selector import (
-    build_scoped_recall_blocks,
     format_recall_injection,
     select_memories,
 )
-from framework.orchestrator.prompting import build_system_prompt_for_node_context
-from framework.server.queen_orchestrator import initialize_memory_scopes
+from framework.graph.prompting import build_system_prompt_for_node_context
 from framework.tools.queen_lifecycle_tools import QueenPhaseState
 
 
@@ -191,24 +188,16 @@ def test_init_memory_dir(tmp_path: Path):
     assert mem_dir.is_dir()
 
 
-def test_initialize_memory_scopes_uses_queen_memory_dir(tmp_path: Path, monkeypatch):
-    global_dir = tmp_path / "memories" / "global"
-    queen_dir = tmp_path / "memories" / "agents" / "queens" / "queen_technology"
+def test_init_memory_dir_accepts_migrate_legacy_kw(tmp_path: Path):
+    mem_dir = tmp_path / "memories_legacy_flag"
+    qm.init_memory_dir(mem_dir, migrate_legacy=True)
+    assert mem_dir.is_dir()
 
-    monkeypatch.setattr(qm, "global_memory_dir", lambda: global_dir)
-    monkeypatch.setattr(qm, "queen_memory_dir", lambda queen_name="default": queen_dir)
 
-    session = SimpleNamespace(queen_name="queen_technology")
-    phase = QueenPhaseState()
-
-    resolved_global, resolved_queen = initialize_memory_scopes(session, phase)
-
-    assert resolved_global == global_dir
-    assert resolved_queen == queen_dir
-    assert phase.global_memory_dir == global_dir
-    assert phase.queen_memory_dir == queen_dir
-    assert global_dir.is_dir()
-    assert queen_dir.is_dir()
+def test_colony_memory_dir_normalizes_session_id():
+    path = qm.colony_memory_dir("session 42/alpha")
+    assert path.name == "session-42-alpha"
+    assert "colony_memory" in str(path)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +216,9 @@ async def test_select_memories_empty_dir(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_select_memories_with_files(tmp_path: Path):
     (tmp_path / "a.md").write_text("---\nname: a\ndescription: about A\ntype: profile\n---\nbody")
-    (tmp_path / "b.md").write_text("---\nname: b\ndescription: about B\ntype: preference\n---\nbody")
+    (tmp_path / "b.md").write_text(
+        "---\nname: b\ndescription: about B\ntype: preference\n---\nbody"
+    )
 
     llm = AsyncMock()
     llm.acomplete.return_value = MagicMock(content=json.dumps({"selected_memories": ["a.md"]}))
@@ -235,6 +226,30 @@ async def test_select_memories_with_files(tmp_path: Path):
     result = await select_memories("tell me about A", llm, memory_dir=tmp_path)
     assert result == ["a.md"]
     llm.acomplete.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_select_memories_accepts_markdown_fenced_json(tmp_path: Path):
+    (tmp_path / "a.md").write_text("---\nname: a\ndescription: about A\ntype: profile\n---\nbody")
+    llm = AsyncMock()
+    llm.acomplete.return_value = MagicMock(
+        content="```json\n{\"selected_memories\": [\"a.md\"]}\n```"
+    )
+
+    result = await select_memories("tell me about A", llm, memory_dir=tmp_path)
+    assert result == ["a.md"]
+
+
+@pytest.mark.asyncio
+async def test_select_memories_accepts_wrapped_json_payload(tmp_path: Path):
+    (tmp_path / "a.md").write_text("---\nname: a\ndescription: about A\ntype: profile\n---\nbody")
+    llm = AsyncMock()
+    llm.acomplete.return_value = MagicMock(
+        content='Selection result: {"selected_memories": ["a.md"]} Thanks.'
+    )
+
+    result = await select_memories("tell me about A", llm, memory_dir=tmp_path)
+    assert result == ["a.md"]
 
 
 @pytest.mark.asyncio
@@ -255,68 +270,8 @@ def test_format_recall_injection(tmp_path: Path):
     assert "body of a" in result
 
 
-def test_format_recall_injection_custom_label(tmp_path: Path):
-    (tmp_path / "a.md").write_text("---\nname: a\n---\nbody of a")
-    result = format_recall_injection(["a.md"], memory_dir=tmp_path, label="Queen Memories: queen_technology")
-    assert "Queen Memories: queen_technology" in result
-    assert "body of a" in result
-
-
 def test_format_recall_injection_empty():
     assert format_recall_injection([]) == ""
-
-
-@pytest.mark.asyncio
-async def test_build_scoped_recall_blocks_includes_global_and_queen(tmp_path: Path):
-    global_dir = tmp_path / "global"
-    queen_dir = tmp_path / "queen"
-    global_dir.mkdir()
-    queen_dir.mkdir()
-    (global_dir / "shared.md").write_text("---\nname: shared\n---\nshared body")
-    (queen_dir / "shared.md").write_text("---\nname: shared\n---\nqueen body")
-
-    llm = AsyncMock()
-    llm.acomplete.side_effect = [
-        MagicMock(content=json.dumps({"selected_memories": ["shared.md"]})),
-        MagicMock(content=json.dumps({"selected_memories": ["shared.md"]})),
-    ]
-
-    global_block, queen_block = await build_scoped_recall_blocks(
-        "help me",
-        llm,
-        global_memory_dir=global_dir,
-        queen_memory_dir=queen_dir,
-        queen_id="queen_technology",
-    )
-
-    assert "Global Memories" in global_block
-    assert "shared body" in global_block
-    assert "Queen Memories: queen_technology" in queen_block
-    assert "queen body" in queen_block
-
-
-@pytest.mark.asyncio
-async def test_build_scoped_recall_blocks_tolerates_empty_scope(tmp_path: Path):
-    global_dir = tmp_path / "global"
-    queen_dir = tmp_path / "queen"
-    global_dir.mkdir()
-    queen_dir.mkdir()
-    (global_dir / "a.md").write_text("---\nname: a\n---\nglobal body")
-
-    llm = AsyncMock()
-    llm.acomplete.return_value = MagicMock(content=json.dumps({"selected_memories": ["a.md"]}))
-
-    global_block, queen_block = await build_scoped_recall_blocks(
-        "help me",
-        llm,
-        global_memory_dir=global_dir,
-        queen_memory_dir=queen_dir,
-        queen_id="queen_technology",
-    )
-
-    assert "Global Memories" in global_block
-    assert queen_block == ""
-    llm.acomplete.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +288,9 @@ async def test_short_reflection(tmp_path: Path):
     parts_dir.mkdir(parents=True)
     for i in range(3):
         role = "user" if i % 2 == 0 else "assistant"
-        (parts_dir / f"{i:010d}.json").write_text(json.dumps({"role": role, "content": f"message {i}"}))
+        (parts_dir / f"{i:010d}.json").write_text(
+            json.dumps({"role": role, "content": f"message {i}"})
+        )
 
     mem_dir = tmp_path / "global_memory"
     mem_dir.mkdir()
@@ -368,121 +325,6 @@ async def test_short_reflection(tmp_path: Path):
     written = mem_dir / "user-likes-tests.md"
     assert written.exists()
     assert "user-likes-tests" in written.read_text()
-
-
-@pytest.mark.asyncio
-async def test_queen_short_reflection_writes_only_queen_scope(tmp_path: Path):
-    """Queen short reflection writes to queen memory without touching global memory."""
-    from framework.agents.queen.reflection_agent import run_queen_short_reflection
-
-    parts_dir = tmp_path / "session" / "conversations" / "parts"
-    parts_dir.mkdir(parents=True)
-    for i in range(3):
-        role = "user" if i % 2 == 0 else "assistant"
-        (parts_dir / f"{i:010d}.json").write_text(json.dumps({"role": role, "content": f"message {i}"}))
-
-    global_dir = tmp_path / "global_memory"
-    queen_dir = tmp_path / "queen_memory"
-    global_dir.mkdir()
-    queen_dir.mkdir()
-
-    llm = AsyncMock()
-    llm.acomplete.side_effect = [
-        _make_litellm_response(
-            tool_calls=[
-                {
-                    "id": "tc_1",
-                    "name": "write_memory_file",
-                    "input": {
-                        "filename": "technology-workflow.md",
-                        "content": (
-                            "---\nname: technology-workflow\n"
-                            "type: preference\n"
-                            "description: User prefers implementation-first technical help\n"
-                            "---\nFor technical work, the user wants concrete implementation details."
-                        ),
-                    },
-                }
-            ]
-        ),
-        _make_litellm_response(content="Done reflecting."),
-    ]
-
-    await run_queen_short_reflection(
-        tmp_path / "session",
-        llm,
-        "queen_technology",
-        queen_dir,
-    )
-
-    assert (queen_dir / "technology-workflow.md").exists()
-    assert list(global_dir.glob("*.md")) == []
-
-
-@pytest.mark.asyncio
-async def test_unified_short_reflection_can_write_both_scopes_in_one_loop(tmp_path: Path):
-    """Unified short reflection can place memories in both scopes in one pass."""
-    from framework.agents.queen.reflection_agent import run_unified_short_reflection
-
-    parts_dir = tmp_path / "session" / "conversations" / "parts"
-    parts_dir.mkdir(parents=True)
-    for i in range(3):
-        role = "user" if i % 2 == 0 else "assistant"
-        (parts_dir / f"{i:010d}.json").write_text(json.dumps({"role": role, "content": f"message {i}"}))
-
-    global_dir = tmp_path / "global_memory"
-    queen_dir = tmp_path / "queen_memory"
-    global_dir.mkdir()
-    queen_dir.mkdir()
-
-    llm = AsyncMock()
-    llm.acomplete.side_effect = [
-        _make_litellm_response(
-            tool_calls=[
-                {
-                    "id": "tc_1",
-                    "name": "write_memory_file",
-                    "input": {
-                        "scope": "global",
-                        "filename": "user-profile.md",
-                        "content": (
-                            "---\nname: User Profile\n"
-                            "type: profile\n"
-                            "description: Shared user profile\n"
-                            "---\nShared profile body."
-                        ),
-                    },
-                },
-                {
-                    "id": "tc_2",
-                    "name": "write_memory_file",
-                    "input": {
-                        "scope": "queen",
-                        "filename": "technology-preferences.md",
-                        "content": (
-                            "---\nname: technology-preferences\n"
-                            "type: preference\n"
-                            "description: Technical execution preferences\n"
-                            "---\nThe user wants implementation-first technical answers."
-                        ),
-                    },
-                },
-            ]
-        ),
-        _make_litellm_response(content="Done reflecting."),
-    ]
-
-    await run_unified_short_reflection(
-        tmp_path / "session",
-        llm,
-        global_memory_dir=global_dir,
-        queen_memory_dir=queen_dir,
-        queen_id="queen_technology",
-    )
-
-    assert (global_dir / "user-profile.md").exists()
-    assert (queen_dir / "technology-preferences.md").exists()
-    assert llm.acomplete.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -557,120 +399,6 @@ async def test_long_reflection(tmp_path: Path):
     assert "merged" in (mem_dir / "dup-a.md").read_text()
 
 
-@pytest.mark.asyncio
-async def test_subscribe_reflection_triggers_runs_housekeeping_for_both_scopes(
-    tmp_path: Path,
-    monkeypatch,
-):
-    from framework.agents.queen import reflection_agent as ra
-    from framework.host.event_bus import AgentEvent, EventBus, EventType
-
-    bus = EventBus()
-    session_dir = tmp_path / "session"
-    global_dir = tmp_path / "global"
-    queen_dir = tmp_path / "queen"
-    global_dir.mkdir()
-    queen_dir.mkdir()
-    llm = AsyncMock()
-
-    unified_short = AsyncMock()
-    unified_long = AsyncMock()
-
-    monkeypatch.setattr(ra, "run_unified_short_reflection", unified_short)
-    monkeypatch.setattr(ra, "run_unified_long_reflection", unified_long)
-
-    sub_ids = await ra.subscribe_reflection_triggers(
-        bus,
-        session_dir,
-        llm,
-        global_memory_dir=global_dir,
-        queen_memory_dir=queen_dir,
-        queen_id="queen_technology",
-    )
-
-    for _ in range(5):
-        await bus.publish(
-            AgentEvent(
-                type=EventType.LLM_TURN_COMPLETE,
-                stream_id="queen",
-                data={"stop_reason": "stop"},
-            )
-        )
-
-    await asyncio.sleep(0.05)
-
-    assert len(sub_ids) == 2
-    # With 5 turns and _SHORT_REFLECT_TURN_INTERVAL=3 plus the 5-minute
-    # cooldown, reflections fire on count=1 (first run, no gate) and
-    # count=3 (turn interval hit). Counts 2, 4, 5 are all gated out.
-    assert unified_short.await_count == 2
-    unified_long.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_shutdown_reflection_writes_global_and_queen_scope(tmp_path: Path):
-    from framework.agents.queen.reflection_agent import run_shutdown_reflection
-
-    parts_dir = tmp_path / "session" / "conversations" / "parts"
-    parts_dir.mkdir(parents=True)
-    for i in range(3):
-        role = "user" if i % 2 == 0 else "assistant"
-        (parts_dir / f"{i:010d}.json").write_text(json.dumps({"role": role, "content": f"message {i}"}))
-
-    global_dir = tmp_path / "global_memory"
-    queen_dir = tmp_path / "queen_memory"
-    global_dir.mkdir()
-    queen_dir.mkdir()
-
-    llm = AsyncMock()
-    llm.acomplete.side_effect = [
-        _make_litellm_response(
-            tool_calls=[
-                {
-                    "id": "tc_1",
-                    "name": "write_memory_file",
-                    "input": {
-                        "scope": "global",
-                        "filename": "user-profile.md",
-                        "content": (
-                            "---\nname: User Profile\n"
-                            "type: profile\n"
-                            "description: Shared user profile\n"
-                            "---\nShared profile body."
-                        ),
-                    },
-                },
-                {
-                    "id": "tc_2",
-                    "name": "write_memory_file",
-                    "input": {
-                        "scope": "queen",
-                        "filename": "technology-preferences.md",
-                        "content": (
-                            "---\nname: technology-preferences\n"
-                            "type: preference\n"
-                            "description: Technical execution preferences\n"
-                            "---\nThe user wants implementation-first technical answers."
-                        ),
-                    },
-                },
-            ]
-        ),
-        _make_litellm_response(content="Done reflecting."),
-    ]
-
-    await run_shutdown_reflection(
-        tmp_path / "session",
-        llm,
-        global_memory_dir_override=global_dir,
-        queen_memory_dir=queen_dir,
-        queen_id="queen_technology",
-    )
-
-    assert (global_dir / "user-profile.md").exists()
-    assert (queen_dir / "technology-preferences.md").exists()
-
-
 # ---------------------------------------------------------------------------
 # Path traversal prevention
 # ---------------------------------------------------------------------------
@@ -722,13 +450,16 @@ def test_safe_path_accepted(tmp_path: Path):
 def test_build_system_prompt_injects_dynamic_memory():
     ctx = SimpleNamespace(
         identity_prompt="Identity",
-        node_spec=SimpleNamespace(system_prompt="Focus", node_type="event_loop", output_keys=["out"]),
+        node_spec=SimpleNamespace(
+            system_prompt="Focus", node_type="event_loop", output_keys=["out"]
+        ),
         narrative="Narrative",
         accounts_prompt="",
         skills_catalog_prompt="",
         protocols_prompt="",
         memory_prompt="",
         dynamic_memory_provider=lambda: "--- Global Memories ---\nremember this",
+        is_subagent_mode=False,
     )
 
     prompt = build_system_prompt_for_node_context(ctx)
@@ -738,8 +469,7 @@ def test_build_system_prompt_injects_dynamic_memory():
 
 def test_queen_phase_state_appends_global_memory_block():
     phase = QueenPhaseState(
-        phase="working",
-        prompt_working="base prompt",
+        prompt_building="base prompt",
         _cached_global_recall_block="--- Global Memories ---\nglobal stuff",
     )
 
@@ -749,23 +479,8 @@ def test_queen_phase_state_appends_global_memory_block():
     assert "global stuff" in prompt
 
 
-def test_queen_phase_state_appends_queen_memory_block():
-    phase = QueenPhaseState(
-        phase="working",
-        prompt_working="base prompt",
-        _cached_global_recall_block="--- Global Memories ---\nglobal stuff",
-        _cached_queen_recall_block="--- Queen Memories: queen_technology ---\nqueen stuff",
-    )
-
-    prompt = phase.get_current_prompt()
-    assert "base prompt" in prompt
-    assert "Global Memories" in prompt
-    assert "Queen Memories: queen_technology" in prompt
-    assert "queen stuff" in prompt
-
-
 def test_queen_phase_state_prompt_without_memory():
-    phase = QueenPhaseState(phase="working", prompt_working="base prompt")
+    phase = QueenPhaseState(prompt_building="base prompt")
 
     prompt = phase.get_current_prompt()
     assert "base prompt" in prompt

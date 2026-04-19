@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/_cron_job_lib.sh"
+
+MARKER="HIVE_CRON_ACCEPTANCE_WEEKLY"
+CRON_EXPR="${HIVE_ACCEPTANCE_WEEKLY_CRON_EXPR:-0 4 * * 1}"
+LOG_DIR="$ROOT_DIR/.logs"
+LOG_FILE="$LOG_DIR/acceptance-weekly.cron.log"
+SCRIPT_PATH="$ROOT_DIR/scripts/acceptance_weekly_maintenance.sh"
+
+ENFORCE_HISTORY="${HIVE_ACCEPTANCE_ENFORCE_HISTORY:-true}"
+REPORT_PRUNE_APPLY="${HIVE_ACCEPTANCE_REPORT_PRUNE_APPLY:-false}"
+REPORT_KEEP="${HIVE_ACCEPTANCE_REPORT_KEEP:-50}"
+DIGEST_DAYS="${HIVE_ACCEPTANCE_DIGEST_DAYS:-7}"
+DIGEST_LIMIT="${HIVE_ACCEPTANCE_DIGEST_LIMIT:-20}"
+HISTORY_MAX_FAIL="${HIVE_ACCEPTANCE_HISTORY_MAX_FAIL:-0}"
+HISTORY_MIN_PASS_RATE="${HIVE_ACCEPTANCE_HISTORY_MIN_PASS_RATE:-1.0}"
+
+hive_cron_require_crontab
+hive_cron_validate_expr "$CRON_EXPR"
+mkdir -p "$LOG_DIR"
+
+CMD="HIVE_ACCEPTANCE_ENFORCE_HISTORY=$(hive_cron_q "$ENFORCE_HISTORY") \
+HIVE_ACCEPTANCE_REPORT_PRUNE_APPLY=$(hive_cron_q "$REPORT_PRUNE_APPLY") \
+HIVE_ACCEPTANCE_REPORT_KEEP=$(hive_cron_q "$REPORT_KEEP") \
+HIVE_ACCEPTANCE_DIGEST_DAYS=$(hive_cron_q "$DIGEST_DAYS") \
+HIVE_ACCEPTANCE_DIGEST_LIMIT=$(hive_cron_q "$DIGEST_LIMIT") \
+HIVE_ACCEPTANCE_HISTORY_MAX_FAIL=$(hive_cron_q "$HISTORY_MAX_FAIL") \
+HIVE_ACCEPTANCE_HISTORY_MIN_PASS_RATE=$(hive_cron_q "$HISTORY_MIN_PASS_RATE") \
+/bin/bash $(hive_cron_q "$SCRIPT_PATH") >> $(hive_cron_q "$LOG_FILE") 2>&1"
+
+hive_cron_upsert "$MARKER" "$CRON_EXPR" "$CMD"
+
+echo "Installed $MARKER"
+echo "cron: $CRON_EXPR"
+echo "log: $LOG_FILE"
+echo "script: $SCRIPT_PATH"
+

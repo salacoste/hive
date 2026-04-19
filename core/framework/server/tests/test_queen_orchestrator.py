@@ -1,60 +1,56 @@
 from __future__ import annotations
 
-import asyncio
-from contextlib import suppress
-from unittest.mock import MagicMock
+from pathlib import Path
 
-import pytest
-
-from framework.agents.queen import queen_memory_v2
-from framework.host.event_bus import EventBus
-from framework.llm.mock import MockLLMProvider
-from framework.loader.tool_registry import ToolRegistry
-from framework.server.queen_orchestrator import create_queen
-from framework.server.session_manager import Session
+from framework.server.queen_orchestrator import (
+    _patch_mcp_server_list_for_workspace,
+    _project_workspace_from_metadata,
+)
 
 
-@pytest.mark.asyncio
-async def test_create_queen_injects_identity_into_initial_prompt(monkeypatch, tmp_path) -> None:
-    """The first queen prompt should already include the selected profile."""
-    monkeypatch.setattr(queen_memory_v2, "MEMORIES_DIR", tmp_path / "memories")
+def test_project_workspace_from_metadata_prefers_direct_path(tmp_path: Path) -> None:
+    direct = tmp_path / "direct-workspace"
+    direct.mkdir(parents=True, exist_ok=True)
+    approved = tmp_path / "approved-workspace"
+    approved.mkdir(parents=True, exist_ok=True)
 
-    session = Session(
-        id="session_test",
-        event_bus=EventBus(),
-        llm=MockLLMProvider(),
-        loaded_at=0.0,
-        queen_name="queen_technology",
-    )
-    manager = MagicMock()
-    manager._subscribe_worker_handoffs = MagicMock()
-    queen_profile = {
-        "name": "Alexandra",
-        "title": "Head of Technology",
-        "core_traits": "A pragmatic technical leader.",
+    project = {
+        "workspace_path": str(direct),
+        "toolchain_profile": {
+            "approved_plan": {
+                "source": {"workspace_path": str(approved)},
+            }
+        },
     }
+    resolved = _project_workspace_from_metadata(project)
+    assert resolved == str(direct.resolve())
 
-    task = await create_queen(
-        session=session,
-        session_manager=manager,
-        worker_identity=None,
-        queen_dir=tmp_path / "queen",
-        queen_profile=queen_profile,
-        initial_prompt="who are you",
-        initial_phase="independent",
-        tool_registry=ToolRegistry(),
+
+def test_project_workspace_from_metadata_falls_back_to_approved_plan(tmp_path: Path) -> None:
+    approved = tmp_path / "approved-workspace"
+    approved.mkdir(parents=True, exist_ok=True)
+    project = {
+        "toolchain_profile": {
+            "approved_plan": {
+                "source": {"workspace_path": str(approved)},
+            }
+        },
+    }
+    resolved = _project_workspace_from_metadata(project)
+    assert resolved == str(approved.resolve())
+
+
+def test_patch_mcp_server_list_for_workspace_adds_coder_tools_env(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir(parents=True, exist_ok=True)
+    servers = [
+        {"name": "coder-tools", "env": {"EXISTING": "1"}},
+        {"name": "hive-tools"},
+    ]
+    patched = _patch_mcp_server_list_for_workspace(
+        server_list=servers,
+        allow_paths=[str(ws.resolve())],
     )
-
-    try:
-        assert session.phase_state is not None
-        assert "<core_identity>" in session.phase_state.queen_identity_prompt
-        assert "Alexandra" in session.phase_state.queen_identity_prompt
-        assert "Head of Technology" in session.phase_state.queen_identity_prompt
-
-        prompt = session.phase_state.get_current_prompt()
-        assert prompt.startswith(session.phase_state.queen_identity_prompt)
-        assert "<core_identity>" in prompt
-    finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    coder = next(item for item in patched if item.get("name") == "coder-tools")
+    assert "CODER_TOOLS_ALLOWED_PATHS" in (coder.get("env") or {})
+    assert str(ws.resolve()) in str((coder.get("env") or {}).get("CODER_TOOLS_ALLOWED_PATHS", ""))

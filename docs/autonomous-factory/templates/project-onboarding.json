@@ -1,0 +1,10 @@
+{
+  "template_id": "fullstack-platform",
+  "repository": "org/repo",
+  "workspace_path": "/workspace/projects/org-repo",
+  "stack": "fullstack",
+  "repo_type": "single",
+  "create_manifest": true,
+  "force_manifest": false,
+  "dry_run": true
+}

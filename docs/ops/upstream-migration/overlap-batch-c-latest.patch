@@ -1,0 +1,2900 @@
+diff --git a/tools/Dockerfile b/tools/Dockerfile
+index 4cbbad7c..f9f4ae85 100644
+--- a/tools/Dockerfile
++++ b/tools/Dockerfile
+@@ -1,20 +1,26 @@
+ # Aden Tools MCP Server
+-# Exposes tools via Model Context Protocol
++# Builds from root workspace context so uv resolves framework dependency
+ 
+ FROM python:3.11-slim
+ 
+ WORKDIR /app
+ 
+-# Copy project files
++# Install uv
++COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
++
++# Copy workspace definitions
+ COPY pyproject.toml ./
+-COPY README.md ./
++
++# Copy source code
+ COPY src ./src
+-COPY mcp_server.py ./
+ 
+-# Install package with all dependencies
+-RUN pip install --no-cache-dir -e .
++# Copy MCP server entry point
++COPY mcp_server.py .
+ 
+-# Install Google Chrome (stable) — used by GCU browser tools via CDP
++# Install via uv (resolves workspace dependency on framework)
++RUN uv pip install --no-cache-dir -e .
++
++# Install Google Chrome (stable) for GCU browser tools via CDP
+ RUN apt-get update && apt-get install -y wget gnupg \
+     && mkdir -p /etc/apt/keyrings \
+     && wget -q -O /etc/apt/keyrings/google-chrome.asc https://dl.google.com/linux/linux_signing_key.pub \
+@@ -23,25 +29,19 @@ RUN apt-get update && apt-get install -y wget gnupg \
+     && apt-get update && apt-get install -y google-chrome-stable \
+     && apt-get clean && rm -rf /var/lib/apt/lists/*
+ 
+-# Create non-root user for security
+-RUN useradd -m -u 1001 appuser
+-
+-# Create workspaces directory for file system tools persistence
+-# This directory will be mounted as a volume
+-RUN mkdir -p /app/workdir/workspaces && \
+-    chown -R appuser:appuser /app
++# Create non-root user
++RUN useradd -m -u 1001 appuser \
++    && mkdir -p /app/workdir/workspaces \
++    && chown -R appuser:appuser /app
+ 
+ USER appuser
+ 
+-# Declare volume for workspace persistence across container runs
+-VOLUME ["/app//workspaces"]
++# Workspace persistence
++VOLUME ["/app/workspaces"]
+ 
+-# Expose MCP server port
+ EXPOSE 4001
+ 
+-# Health check - verify server is responding
+ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+     CMD python -c "import httpx; httpx.get('http://localhost:4001/health').raise_for_status()" || exit 1
+ 
+-# Run MCP server with HTTP transport
+ CMD ["python", "mcp_server.py"]
+diff --git a/tools/coder_tools_server.py b/tools/coder_tools_server.py
+index 538121b9..73c27da9 100644
+--- a/tools/coder_tools_server.py
++++ b/tools/coder_tools_server.py
+@@ -85,8 +85,41 @@ def _find_project_root() -> str:
+ def _resolve_path(path: str) -> str:
+     """Resolve path relative to PROJECT_ROOT. Raises ValueError if outside.
+ 
+-    Also allows access to ~/.hive/ directory for agent session data files.
++    Also allows access to:
++    - ~/.hive/ directory for agent session data files.
++    - Extra roots from CODER_TOOLS_ALLOWED_PATHS (os.pathsep-separated).
+     """
++    def _allowed_roots() -> list[str]:
++        roots: list[str] = [os.path.abspath(PROJECT_ROOT)]
++        roots.append(os.path.abspath(os.path.expanduser("~/.hive")))
++        extra = os.environ.get("CODER_TOOLS_ALLOWED_PATHS", "")
++        if extra:
++            for raw in extra.split(os.pathsep):
++                item = raw.strip()
++                if not item:
++                    continue
++                roots.append(os.path.abspath(os.path.expanduser(item)))
++        # De-duplicate while preserving order
++        out: list[str] = []
++        seen: set[str] = set()
++        for root in roots:
++            if root in seen:
++                continue
++            seen.add(root)
++            out.append(root)
++        return out
++
++    def _is_within_allowed(resolved_path: str, roots: list[str]) -> bool:
++        for root in roots:
++            try:
++                if os.path.commonpath([resolved_path, root]) == root:
++                    return True
++            except ValueError:
++                continue
++        return False
++
++    allowed_roots = _allowed_roots()
++
+     # Normalize slashes for cross-platform (e.g. exports/hi_agent from LLM)
+     path = path.replace("/", os.sep)
+ 
+@@ -96,20 +129,7 @@ def _resolve_path(path: str) -> str:
+ 
+     if os.path.isabs(path):
+         resolved = os.path.abspath(path)
+-
+-        # Allow access to ~/.hive/ for agent session data
+-        hive_dir = os.path.expanduser("~/.hive")
+-        try:
+-            if os.path.commonpath([resolved, hive_dir]) == hive_dir:
+-                return resolved  # Path is under ~/.hive, allow it
+-        except ValueError:
+-            pass
+-
+-        try:
+-            common = os.path.commonpath([resolved, PROJECT_ROOT])
+-        except ValueError:
+-            common = ""
+-        if common != PROJECT_ROOT:
++        if not _is_within_allowed(resolved, allowed_roots):
+             # LLM may emit wrong-root paths (/mnt/data, /workspace, etc.).
+             # Strip known prefixes and treat the remainder as relative to PROJECT_ROOT.
+             path_norm = path.replace("\\", "/")
+@@ -123,7 +143,9 @@ def _resolve_path(path: str) -> str:
+             ):
+                 p = prefix.rstrip("/") + "/"
+                 prefix_stripped = prefix.rstrip("/")
+-                if path_norm.startswith(p) or (path_norm.startswith(prefix_stripped) and len(path_norm) > len(prefix)):
++                if path_norm.startswith(p) or (
++                    path_norm.startswith(prefix_stripped) and len(path_norm) > len(prefix)
++                ):
+                     suffix = path_norm[len(prefix_stripped) :].lstrip("/")
+                     if suffix:
+                         path = suffix.replace("/", os.sep)
+@@ -141,15 +163,15 @@ def _resolve_path(path: str) -> str:
+                     path = os.sep.join(parts[idx:])
+                     resolved = os.path.abspath(os.path.join(PROJECT_ROOT, path))
+                 else:
+-                    raise ValueError(f"Access denied: '{path}' is outside the project root.")
++                    allowed = ", ".join(allowed_roots)
++                    raise ValueError(
++                        f"Access denied: '{path}' is outside allowed roots: {allowed}"
++                    )
+     else:
+         resolved = os.path.abspath(os.path.join(PROJECT_ROOT, path))
+-    try:
+-        common = os.path.commonpath([resolved, PROJECT_ROOT])
+-    except ValueError as err:
+-        raise ValueError(f"Access denied: '{path}' is outside the project root.") from err
+-    if common != PROJECT_ROOT:
+-        raise ValueError(f"Access denied: '{path}' is outside the project root.")
++    if not _is_within_allowed(resolved, allowed_roots):
++        allowed = ", ".join(allowed_roots)
++        raise ValueError(f"Access denied: '{path}' is outside allowed roots: {allowed}")
+     return resolved
+ 
+ 
+@@ -159,7 +181,9 @@ def _resolve_path(path: str) -> str:
+ def _snapshot_git(*args: str) -> str:
+     """Run a git command with the snapshot GIT_DIR and PROJECT_ROOT worktree."""
+     cmd = ["git", "--git-dir", SNAPSHOT_DIR, "--work-tree", PROJECT_ROOT, *args]
+-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, encoding="utf-8", stdin=subprocess.DEVNULL)
++    result = subprocess.run(
++        cmd, capture_output=True, text=True, timeout=30, encoding="utf-8", stdin=subprocess.DEVNULL
++    )
+     return result.stdout.strip()
+ 
+ 
+@@ -286,13 +310,19 @@ def run_command(command: str, cwd: str = "", timeout: int = 120) -> str:
+         output = "\n".join(parts)
+ 
+         if len(output) > MAX_COMMAND_OUTPUT:
+-            output = output[:MAX_COMMAND_OUTPUT] + f"\n\n... (output truncated at {MAX_COMMAND_OUTPUT:,} chars)"
++            output = (
++                output[:MAX_COMMAND_OUTPUT]
++                + f"\n\n... (output truncated at {MAX_COMMAND_OUTPUT:,} chars)"
++            )
+ 
+         code = result.returncode
+         output += f"\n\n[exit code: {code}, {elapsed:.1f}s]"
+         return output
+     except subprocess.TimeoutExpired:
+-        return f"Error: Command timed out after {timeout}s. Consider breaking it into smaller operations."
++        return (
++            f"Error: Command timed out after {timeout}s. "
++            "Consider breaking it into smaller operations."
++        )
+     except Exception as e:
+         return f"Error executing command: {e}"
+ 
+@@ -379,7 +409,7 @@ def list_agent_tools(
+ 
+     Args:
+         server_config_path: Path to mcp_servers.json. Default: tools/mcp_servers.json
+-            (the standard hive_tools server). Can also point to an agent's config
++            (the standard hive-tools server). Can also point to an agent's config
+             to see what tools that specific agent has access to.
+         output_schema: Controls verbosity of the response.
+             "summary" (default) — provider list with tool counts + credential status. Very compact.
+@@ -402,11 +432,21 @@ def list_agent_tools(
+     """
+     if output_schema not in ("summary", "names", "simple", "full"):
+         return json.dumps(
+-            {"error": (f"Invalid output_schema: {output_schema!r}. Use 'summary', 'names', 'simple', or 'full'.")}
++            {
++                "error": (
++                    f"Invalid output_schema: {output_schema!r}. "
++                    "Use 'summary', 'names', 'simple', or 'full'."
++                )
++            }
+         )
+     if credentials not in ("all", "available", "unavailable"):
+         return json.dumps(
+-            {"error": (f"Invalid credentials: {credentials!r}. Use 'all', 'available', or 'unavailable'.")}
++            {
++                "error": (
++                    f"Invalid credentials: {credentials!r}. "
++                    "Use 'all', 'available', or 'unavailable'."
++                )
++            }
+         )
+ 
+     # Resolve config path
+@@ -436,8 +476,8 @@ def list_agent_tools(
+     try:
+         from pathlib import Path
+ 
+-        from framework.loader.mcp_client import MCPClient, MCPServerConfig
+-        from framework.loader.tool_registry import ToolRegistry
++        from framework.runner.mcp_client import MCPClient, MCPServerConfig
++        from framework.runner.tool_registry import ToolRegistry
+     except ImportError:
+         return json.dumps({"error": "Cannot import MCPClient"})
+ 
+@@ -446,7 +486,9 @@ def list_agent_tools(
+     config_dir = Path(config_path).parent
+ 
+     for server_name, server_conf in servers_config.items():
+-        resolved = ToolRegistry.resolve_mcp_stdio_config({"name": server_name, **server_conf}, config_dir)
++        resolved = ToolRegistry.resolve_mcp_stdio_config(
++            {"name": server_name, **server_conf}, config_dir
++        )
+         try:
+             config = MCPServerConfig(
+                 name=server_name,
+@@ -485,7 +527,9 @@ def _normalize_provider_name(raw: str | None, fallback: str) -> str:
+             return "google"
+         return head
+ 
+-    def _build_provider_metadata() -> tuple[dict[str, dict[str, dict[str, dict]]], dict[str, set[str]]]:
++    def _build_provider_metadata() -> tuple[
++        dict[str, dict[str, dict[str, dict]]], dict[str, set[str]]
++    ]:
+         """Build tool->provider->credential metadata index from CredentialSpecs."""
+         try:
+             from aden_tools.credentials import CREDENTIAL_SPECS
+@@ -529,17 +573,30 @@ def _get_available_credential_names() -> set[str]:
+         except ImportError:
+             return set()
+         return {
+-            cred_name for cred_name, spec in CREDENTIAL_SPECS.items() if spec.env_var and os.environ.get(spec.env_var)
++            cred_name
++            for cred_name, spec in CREDENTIAL_SPECS.items()
++            if spec.env_var and os.environ.get(spec.env_var)
+         }
+ 
+     def _tool_credentials_available(tool_name: str, available_creds: set[str]) -> bool:
+-        """True if all credentials required by tool_name are available (or tool needs none)."""
+-        required = set()
+-        for provider_creds in tool_provider_auth.get(tool_name, {}).values():
+-            required.update(provider_creds.keys())
+-        if not required:
++        """True if at least one provider path for a tool can be satisfied.
++
++        Some tools support multiple providers (example: send_email via google OR resend).
++        Those tools should be considered available when any provider's required
++        credential set is available.
++        """
++        provider_paths = tool_provider_auth.get(tool_name, {})
++        if not provider_paths:
+             return True  # no credentials needed
+-        return required.issubset(available_creds)
++
++        for provider_creds in provider_paths.values():
++            # Provider path is available only when all credentials bound to that
++            # provider path are present. `spec.required=False` is a global
++            # validation hint and does not mean "optional inside this path".
++            required = set(provider_creds.keys())
++            if required.issubset(available_creds):
++                return True
++        return False
+ 
+     def _group_by_provider(tools: list[dict]) -> dict[str, dict]:
+         """Group tools by provider, including auth metadata and providerless tools."""
+@@ -571,9 +628,11 @@ def _group_by_provider(tools: list[dict]) -> dict[str, dict]:
+                     {
+                         "authorization": {},
+                         "tools": [],
++                        "_tool_names": set(),
+                     },
+                 )
+                 bucket["tools"].append(tool_payload)
++                bucket["_tool_names"].add(t["name"])
+ 
+                 # Only accumulate full auth metadata for simple/full schemas.
+                 # summary/names use compact representations.
+@@ -583,13 +642,14 @@ def _group_by_provider(tools: list[dict]) -> dict[str, dict]:
+                         bucket["authorization"][cred_name] = auth
+ 
+         for provider, bucket in groups.items():
++            tool_names = sorted(bucket.pop("_tool_names", set()))
++            cred_keys: set[str] = set()
++            for tn in tool_names:
++                provider_creds = tool_provider_auth.get(tn, {}).get(provider, {})
++                cred_keys.update(provider_creds.keys())
++
+             if output_schema == "names":
+                 # Collapse to compact structure: flat sorted name list + credential keys only
+-                tool_names = sorted(set(bucket["tools"]))
+-                cred_keys: set[str] = set()
+-                for tn in tool_names:
+-                    for prov_creds in tool_provider_auth.get(tn, {}).values():
+-                        cred_keys.update(prov_creds.keys())
+                 groups[provider] = {
+                     "tool_count": len(tool_names),
+                     "credentials_required": sorted(cred_keys),
+@@ -598,12 +658,17 @@ def _group_by_provider(tools: list[dict]) -> dict[str, dict]:
+             else:
+                 bucket["tools"] = sorted(bucket["tools"], key=lambda x: x["name"])
+                 bucket["authorization"] = dict(sorted(bucket["authorization"].items()))
++                if output_schema == "summary":
++                    bucket["tool_names"] = tool_names
++                    bucket["credentials_required"] = sorted(cred_keys)
+ 
+         return dict(sorted(groups.items()))
+ 
+     # Compute credential availability once (used for filtering and summary)
+     available_creds: set[str] = (
+-        _get_available_credential_names() if credentials != "all" or output_schema == "summary" else set()
++        _get_available_credential_names()
++        if credentials != "all" or output_schema == "summary"
++        else set()
+     )
+ 
+     # Apply credentials filter before grouping (filter tool list)
+@@ -612,7 +677,8 @@ def _group_by_provider(tools: list[dict]) -> dict[str, dict]:
+         filtered_tools = [
+             t
+             for t in all_tools
+-            if (credentials == "available") == _tool_credentials_available(t["name"], available_creds)
++            if (credentials == "available")
++            == _tool_credentials_available(t["name"], available_creds)
+         ]
+ 
+     provider_groups = _group_by_provider(filtered_tools)
+@@ -638,7 +704,10 @@ def _group_by_provider(tools: list[dict]) -> dict[str, dict]:
+             # Only include tools from the already-filtered provider set
+             tool_name = t["name"]
+             in_provider = any(
+-                tool_name in p.get("tool_names", [tool_entry.get("name") for tool_entry in p.get("tools", [])])
++                tool_name
++                in p.get(
++                    "tool_names", [tool_entry.get("name") for tool_entry in p.get("tools", [])]
++                )
+                 for p in provider_groups.values()
+             )
+             if in_provider and tool_name.startswith(service_prefix):
+@@ -656,10 +725,19 @@ def _infer_service(tool_name: str) -> str:
+             full_groups = _group_by_provider(all_tools) if credentials != "all" else provider_groups
+             summary_providers: dict = {}
+             for prov, bucket in full_groups.items():
+-                cred_names = bucket.get("credentials_required", sorted(bucket.get("authorization", {}).keys()))
++                provider_tool_names = bucket.get(
++                    "tool_names", [entry.get("name") for entry in bucket.get("tools", [])]
++                )
++                cred_names_set: set[str] = set()
++                for tool_name in provider_tool_names:
++                    cred_names_set.update(tool_provider_auth.get(tool_name, {}).get(prov, {}).keys())
++                if not cred_names_set:
++                    # Backward-compat fallback for schemas carrying explicit auth metadata.
++                    cred_names_set.update(bucket.get("authorization", {}).keys())
++                cred_names = sorted(cred_names_set)
+                 creds_ok = all(c in available_creds for c in cred_names) if cred_names else True
+                 summary_providers[prov] = {
+-                    "tool_count": len(bucket.get("tool_names", bucket.get("tools", []))),
++                    "tool_count": len(provider_tool_names),
+                     "credentials_required": cred_names,
+                     "credentials_available": creds_ok,
+                 }
+@@ -678,29 +756,29 @@ def _infer_service(tool_name: str) -> str:
+             # Re-build from all filtered tools for this provider (ignore service filter for summary)
+             provider_tool_names: list[str] = []
+             for bucket in provider_groups.values():
+-                provider_tool_names.extend(bucket.get("tool_names", [e.get("name") for e in bucket.get("tools", [])]))
++                provider_tool_names.extend(
++                    bucket.get("tool_names", [e.get("name") for e in bucket.get("tools", [])])
++                )
+ 
+             services: dict = {}
+             for tn in sorted(set(provider_tool_names)):
+                 svc = _infer_service(tn)
+                 if svc not in services:
+-                    svc_creds: set[str] = set()
+-                    for prov_creds in tool_provider_auth.get(tn, {}).values():
+-                        svc_creds.update(prov_creds.keys())
++                    svc_creds: set[str] = set(tool_provider_auth.get(tn, {}).get(group, {}).keys())
+                     services[svc] = {"tool_count": 0, "credentials_required": sorted(svc_creds)}
+                 services[svc]["tool_count"] += 1
+                 # Accumulate credentials for other tools in this service
+-                for prov_creds in tool_provider_auth.get(tn, {}).values():
+-                    existing = set(services[svc]["credentials_required"])
+-                    existing.update(prov_creds.keys())
+-                    services[svc]["credentials_required"] = sorted(existing)
++                existing = set(services[svc]["credentials_required"])
++                existing.update(tool_provider_auth.get(tn, {}).get(group, {}).keys())
++                services[svc]["credentials_required"] = sorted(existing)
+ 
+             result = {
+                 "provider": group,
+                 "total_tools": len(provider_tool_names),
+                 "services": services,
+                 "hint": (
+-                    f"Use list_agent_tools(group='{group}', service='<service>') for tool names within a service."
++                    f"Use list_agent_tools(group='{group}', service='<service>') "
++                    "for tool names within a service."
+                 ),
+             }
+         if errors:
+@@ -751,7 +829,10 @@ def _validate_agent_tools_impl(agent_path: str) -> dict:
+     try:
+         resolved = str(validate_agent_path(resolved))
+     except ValueError:
+-        return {"error": "agent_path must be inside an allowed directory (exports/, examples/, or ~/.hive/agents/)"}
++        return {
++            "error": "agent_path must be inside an allowed directory "
++            "(exports/, examples/, or ~/.hive/agents/)"
++        }
+ 
+     if not os.path.isdir(resolved):
+         return {"error": f"Agent directory not found: {agent_path}"}
+@@ -766,8 +847,8 @@ def _validate_agent_tools_impl(agent_path: str) -> dict:
+     try:
+         from pathlib import Path
+ 
+-        from framework.loader.mcp_client import MCPClient, MCPServerConfig
+-        from framework.loader.tool_registry import ToolRegistry
++        from framework.runner.mcp_client import MCPClient, MCPServerConfig
++        from framework.runner.tool_registry import ToolRegistry
+     except ImportError:
+         return {"error": "Cannot import MCPClient"}
+ 
+@@ -782,7 +863,9 @@ def _validate_agent_tools_impl(agent_path: str) -> dict:
+         return {"error": f"Failed to read mcp_servers.json: {e}"}
+ 
+     for server_name, server_conf in servers_config.items():
+-        resolved = ToolRegistry.resolve_mcp_stdio_config({"name": server_name, **server_conf}, config_dir)
++        resolved = ToolRegistry.resolve_mcp_stdio_config(
++            {"name": server_name, **server_conf}, config_dir
++        )
+         try:
+             config = MCPServerConfig(
+                 name=server_name,
+@@ -803,52 +886,27 @@ def _validate_agent_tools_impl(agent_path: str) -> dict:
+             discovery_errors.append({"server": server_name, "error": str(e)})
+ 
+     # --- Load agent nodes and extract declared tools ---
+-    agent_json_file = os.path.join(agent_dir, "agent.json")
+     agent_py = os.path.join(agent_dir, "agent.py")
++    if not os.path.isfile(agent_py):
++        return {"error": f"No agent.py found in {agent_path}"}
+ 
+-    nodes = None
+-    if os.path.isfile(agent_json_file):
+-        # Declarative JSON agent
+-        try:
+-            with open(agent_json_file, encoding="utf-8") as f:
+-                data = json.load(f)
+-
+-            # Build lightweight node stubs with .tools and .id/.name
+-            class _NodeStub:
+-                def __init__(self, d):
+-                    self.id = d.get("id", "?")
+-                    self.name = d.get("name", self.id)
+-                    t = d.get("tools", {})
+-                    if isinstance(t, dict):
+-                        self.tools = t.get("allowed", [])
+-                    elif isinstance(t, list):
+-                        self.tools = t
+-                    else:
+-                        self.tools = []
+-
+-            nodes = [_NodeStub(n) for n in data.get("nodes", [])]
+-        except Exception as e:
+-            return {"error": f"Failed to parse agent.json: {e}"}
+-    elif os.path.isfile(agent_py):
+-        # Legacy Python agent
+-        import importlib
+-        import importlib.util
+-        import sys
+-
+-        package_name = os.path.basename(agent_dir)
+-        parent_dir = os.path.dirname(os.path.abspath(agent_dir))
+-        if parent_dir not in sys.path:
+-            sys.path.insert(0, parent_dir)
+-        try:
+-            agent_module = importlib.import_module(package_name)
+-        except Exception as e:
+-            return {"error": f"Failed to import agent: {e}"}
+-        nodes = getattr(agent_module, "nodes", None)
+-    else:
+-        return {"error": f"No agent.json or agent.py found in {agent_path}"}
++    import importlib
++    import importlib.util
++    import sys
++
++    package_name = os.path.basename(agent_dir)
++    parent_dir = os.path.dirname(os.path.abspath(agent_dir))
++    if parent_dir not in sys.path:
++        sys.path.insert(0, parent_dir)
++
++    try:
++        agent_module = importlib.import_module(package_name)
++    except Exception as e:
++        return {"error": f"Failed to import agent: {e}"}
+ 
++    nodes = getattr(agent_module, "nodes", None)
+     if not nodes:
+-        return {"error": "Agent has no nodes defined"}
++        return {"error": "Agent module has no 'nodes' attribute"}
+ 
+     # --- Validate declared vs available ---
+     missing_by_node: dict[str, list[str]] = {}
+@@ -934,44 +992,37 @@ def list_agents() -> str:
+             if not os.path.isdir(agent_dir):
+                 continue
+ 
+-            # Must have agent.json (declarative) or agent.py (legacy)
+-            has_json = os.path.isfile(os.path.join(agent_dir, "agent.json"))
+-            has_py = os.path.isfile(os.path.join(agent_dir, "agent.py"))
+-            if not has_json and not has_py:
++            # Must have agent.py to be considered an agent package
++            if not os.path.isfile(os.path.join(agent_dir, "agent.py")):
+                 continue
+ 
+             info = {
+                 "name": entry,
+                 "path": os.path.relpath(agent_dir, PROJECT_ROOT),
+                 "source": source,
+-                "format": "json" if has_json else "python",
++                "has_nodes": os.path.isdir(os.path.join(agent_dir, "nodes")),
++                "has_tests": os.path.isdir(os.path.join(agent_dir, "tests")),
+                 "has_mcp_config": os.path.isfile(os.path.join(agent_dir, "mcp_servers.json")),
+             }
+ 
+-            # Read description from agent.json or __init__.py
+-            if has_json:
++            # Read description from __init__.py docstring
++            init_path = os.path.join(agent_dir, "__init__.py")
++            if os.path.isfile(init_path):
+                 try:
+-                    with open(os.path.join(agent_dir, "agent.json"), encoding="utf-8") as f:
+-                        data = json.load(f)
+-                    if isinstance(data, dict) and data.get("description"):
+-                        info["description"] = data["description"]
+-                except Exception:
++                    with open(init_path, encoding="utf-8") as f:
++                        content = f.read(2000)
++                    # Extract module docstring
++                    for quote in ['"""', "'''"]:
++                        start = content.find(quote)
++                        if start != -1:
++                            end = content.find(quote, start + 3)
++                            if end != -1:
++                                info["description"] = (
++                                    content[start + 3 : end].strip().split("\n")[0]
++                                )
++                                break
++                except OSError:
+                     pass
+-            else:
+-                init_path = os.path.join(agent_dir, "__init__.py")
+-                if os.path.isfile(init_path):
+-                    try:
+-                        with open(init_path, encoding="utf-8") as f:
+-                            content = f.read(2000)
+-                        for quote in ['"""', "'''"]:
+-                            start = content.find(quote)
+-                            if start != -1:
+-                                end = content.find(quote, start + 3)
+-                                if end != -1:
+-                                    info["description"] = content[start + 3 : end].strip().split("\n")[0]
+-                                    break
+-                    except OSError:
+-                        pass
+ 
+             # Check runtime data
+             runtime_dir = hive_agents_dir / entry
+@@ -979,7 +1030,9 @@ def list_agents() -> str:
+                 sessions_dir = runtime_dir / "sessions"
+                 if sessions_dir.is_dir():
+                     session_count = sum(
+-                        1 for d in sessions_dir.iterdir() if d.is_dir() and d.name.startswith("session_")
++                        1
++                        for d in sessions_dir.iterdir()
++                        if d.is_dir() and d.name.startswith("session_")
+                     )
+                     info["session_count"] = session_count
+                 else:
+@@ -1064,7 +1117,9 @@ def list_agent_sessions(
+                 "agent_name": agent_name,
+                 "sessions": [],
+                 "total": 0,
+-                "hint": (f"No sessions found at {agent_dir}/sessions/. Has this agent been run yet?"),
++                "hint": (
++                    f"No sessions found at {agent_dir}/sessions/. Has this agent been run yet?"
++                ),
+             }
+         )
+ 
+@@ -1093,7 +1148,9 @@ def list_agent_sessions(
+                 "current_node": progress.get("current_node"),
+                 "steps_executed": progress.get("steps_executed", 0),
+                 "execution_quality": progress.get("execution_quality", ""),
+-                "has_checkpoints": (checkpoint_dir.exists() and any(checkpoint_dir.glob("cp_*.json"))),
++                "has_checkpoints": (
++                    checkpoint_dir.exists() and any(checkpoint_dir.glob("cp_*.json"))
++                ),
+             }
+         )
+ 
+@@ -1250,8 +1307,8 @@ def _run_agent_tests_impl(
+ 
+     if not tests_dir.exists():
+         return {
+-            "skipped": True,
+-            "summary": "No tests directory (OK for declarative agents)",
++            "error": f"No tests directory: exports/{agent_name}/tests/",
++            "hint": "Create test files in the tests/ directory first.",
+         }
+ 
+     # Parse test types
+@@ -1430,11 +1487,13 @@ def run_agent_tests(
+ def validate_agent_package(agent_name: str) -> str:
+     """Run structural validation checks on a built agent package in one call.
+ 
+-    Executes validation steps and reports all results:
+-      1. Schema validation — loads agent.json via load_agent_config
+-      2. Graph validation — loads the agent graph via AgentLoader
+-      3. Tool validation — checks declared tools exist in MCP servers
+-      4. Tests — runs the agent's pytest suite (skipped if no tests/)
++    Executes 5 steps and reports all results (does not stop on first failure):
++      1. Class validation — checks graph structure and entry_points contract
++      2. Node completeness — every NodeSpec in nodes/ must be in the nodes list,
++         and GCU nodes must be referenced in a parent's sub_agents
++      3. Graph validation — loads the agent graph without credential checks
++      4. Tool validation — checks declared tools exist in MCP servers
++      5. Tests — runs the agent's pytest suite
+ 
+     Note: Credential validation is intentionally skipped here (building phase).
+     Credentials are validated at run time by run_agent_with_input() preflight.
+@@ -1459,89 +1518,137 @@ def validate_agent_package(agent_name: str) -> str:
+         path_parts.append(pythonpath)
+     env["PYTHONPATH"] = os.pathsep.join(path_parts)
+ 
+-    # Detect agent format
+-    _is_json = os.path.isfile(os.path.join(PROJECT_ROOT, agent_path, "agent.json"))
+-
+-    if _is_json:
+-        # JSON agents: validate via load_agent_config (schema + round-trip)
+-        try:
+-            _json_script = textwrap.dedent("""\
+-                import json, pathlib
+-                from framework.loader.agent_loader import load_agent_config
+-                data = json.loads(
+-                    pathlib.Path('exports/{agent_name}/agent.json').read_text()
+-                )
+-                g, goal = load_agent_config(data)
++    # Step 0: Module contract — __init__.py must expose goal, nodes, edges
++    try:
++        _contract_script = textwrap.dedent("""\
++            import importlib, json
++            mod = importlib.import_module('{agent_name}')
++            missing = [a for a in ('goal', 'nodes', 'edges') if getattr(mod, a, None) is None]
++            if missing:
+                 print(json.dumps({{
+-                    'valid': True,
+-                    'nodes': len(g.nodes),
+-                    'edges': len(g.edges),
+-                    'entry': g.entry_node,
+-                    'errors': errors,
++                    'valid': False,
++                    'error': (
++                        "Module '{agent_name}' is missing module-level attributes: "
++                        + ", ".join(missing) + ". "
++                        "Fix: in {agent_name}/__init__.py, add "
++                        "'from .agent import " + ", ".join(missing) + "' "
++                        "so that 'import {agent_name}' exposes them at package level."
++                    )
+                 }}))
+-            """).format(agent_name=agent_name)
+-            proc = subprocess.run(
+-                ["uv", "run", "python", "-c", _json_script],
+-                capture_output=True,
+-                text=True,
+-                timeout=30,
+-                env=env,
+-                cwd=PROJECT_ROOT,
+-                stdin=subprocess.DEVNULL,
+-            )
+-            if proc.returncode == 0:
+-                result = json.loads(proc.stdout.strip())
+-                steps["schema_validation"] = {
+-                    "passed": result["valid"],
+-                    "output": (f"{result['nodes']} nodes, {result['edges']} edges, entry={result['entry']}"),
+-                }
+-                if result.get("errors"):
+-                    steps["schema_validation"]["errors"] = result["errors"]
+             else:
+-                steps["schema_validation"] = {
+-                    "passed": False,
+-                    "error": proc.stderr.strip()[:2000],
+-                }
+-        except Exception as e:
+-            steps["schema_validation"] = {"passed": False, "error": str(e)}
+-    else:
+-        # Legacy Python agents: module contract + class validation
+-        try:
+-            _contract_script = textwrap.dedent("""\
+-                import importlib, json
+-                mod = importlib.import_module('{agent_name}')
+-                missing = [
+-                    a for a in ('goal', 'nodes', 'edges')
+-                    if getattr(mod, a, None) is None
+-                ]
+-                print(json.dumps({{'valid': len(missing) == 0, 'missing': missing}}))
+-            """).format(agent_name=agent_name)
+-            proc = subprocess.run(
+-                ["uv", "run", "python", "-c", _contract_script],
+-                capture_output=True,
+-                text=True,
+-                timeout=30,
+-                env=env,
+-                cwd=PROJECT_ROOT,
+-                stdin=subprocess.DEVNULL,
+-            )
+-            if proc.returncode == 0:
+-                result = json.loads(proc.stdout.strip())
+-                steps["module_contract"] = {
+-                    "passed": result["valid"],
+-                    "output": (
+-                        f"Missing: {result['missing']}"
+-                        if result.get("missing")
+-                        else "goal, nodes, edges exported correctly"
+-                    ),
+-                }
+-            else:
+-                steps["module_contract"] = {
+-                    "passed": False,
+-                    "error": proc.stderr.strip()[:1000],
+-                }
+-        except Exception as e:
+-            steps["module_contract"] = {"passed": False, "error": str(e)}
++                print(json.dumps({{'valid': True}}))
++        """).format(agent_name=agent_name)
++        proc = subprocess.run(
++            ["uv", "run", "python", "-c", _contract_script],
++            capture_output=True,
++            text=True,
++            timeout=30,
++            env=env,
++            cwd=PROJECT_ROOT,
++            stdin=subprocess.DEVNULL,
++        )
++        if proc.returncode == 0:
++            result = json.loads(proc.stdout.strip())
++            steps["module_contract"] = {
++                "passed": result["valid"],
++                "output": result.get("error", "goal, nodes, edges exported correctly"),
++            }
++        else:
++            steps["module_contract"] = {
++                "passed": False,
++                "error": (
++                    f"Failed to import '{agent_name}': {proc.stderr.strip()[:1000]}. "
++                    f"Fix: ensure {agent_name}/__init__.py exists and can be imported "
++                    f"without errors (check syntax, missing dependencies, relative imports)."
++                ),
++            }
++    except Exception as e:
++        steps["module_contract"] = {"passed": False, "error": str(e)}
++
++    # Step A: Class validation (subprocess for import isolation)
++    try:
++        proc = subprocess.run(
++            [
++                "uv",
++                "run",
++                "python",
++                "-c",
++                f"from {agent_name} import default_agent; print(default_agent.validate())",
++            ],
++            capture_output=True,
++            text=True,
++            timeout=30,
++            env=env,
++            cwd=PROJECT_ROOT,
++            stdin=subprocess.DEVNULL,
++        )
++        passed = proc.returncode == 0
++        steps["class_validation"] = {
++            "passed": passed,
++            "output": (proc.stdout.strip() or proc.stderr.strip())[:2000],
++        }
++        if not passed:
++            steps["class_validation"]["error"] = proc.stderr.strip()[:2000]
++    except Exception as e:
++        steps["class_validation"] = {"passed": False, "error": str(e)}
++
++    # Step A2: Node completeness — every NodeSpec in nodes/ must be in the nodes list
++    try:
++        _check_template = textwrap.dedent("""\
++            import importlib, json
++            agent = importlib.import_module('{agent_name}')
++            nodes_mod = importlib.import_module('{agent_name}.nodes')
++            graph_ids = {{n.id for n in agent.nodes}}
++            defined = {{}}
++            for attr in dir(nodes_mod):
++                obj = getattr(nodes_mod, attr)
++                if hasattr(obj, 'id') and hasattr(obj, 'node_type'):
++                    defined[obj.id] = attr
++            orphaned = set(defined) - graph_ids
++            errors = [
++                f"Node '{{nid}}' ({{defined[nid]}}) defined in nodes/ but not in nodes list"
++                for nid in sorted(orphaned)
++            ]
++            sub_refs = set()
++            for n in agent.nodes:
++                for sa in getattr(n, 'sub_agents', []) or []:
++                    sub_refs.add(sa)
++            for n in agent.nodes:
++                if n.node_type == 'gcu' and n.id not in sub_refs:
++                    errors.append(
++                        f"GCU node '{{n.id}}' not referenced in any node's sub_agents list"
++                    )
++            print(json.dumps({{'valid': len(errors) == 0, 'errors': errors}}))
++        """)
++        check_script = _check_template.format(agent_name=agent_name)
++        proc = subprocess.run(
++            ["uv", "run", "python", "-c", check_script],
++            capture_output=True,
++            text=True,
++            timeout=30,
++            env=env,
++            cwd=PROJECT_ROOT,
++            stdin=subprocess.DEVNULL,
++        )
++        if proc.returncode == 0:
++            result = json.loads(proc.stdout.strip())
++            steps["node_completeness"] = {
++                "passed": result["valid"],
++                "output": (
++                    "; ".join(result["errors"])
++                    if result["errors"]
++                    else "All defined nodes are in the graph"
++                ),
++            }
++            if not result["valid"]:
++                steps["node_completeness"]["errors"] = result["errors"]
++        else:
++            steps["node_completeness"] = {
++                "passed": False,
++                "error": proc.stderr.strip()[:2000],
++            }
++    except Exception as e:
++        steps["node_completeness"] = {"passed": False, "error": str(e)}
+ 
+     # Step B: Graph validation (subprocess for import isolation)
+     # Credentials are checked at run time (run_agent_with_input preflight),
+@@ -1553,10 +1660,10 @@ def validate_agent_package(agent_name: str) -> str:
+                 "run",
+                 "python",
+                 "-c",
+-                f"from framework.loader.agent_loader import AgentLoader; "
+-                f'r = AgentLoader.load("exports/{agent_name}", '
++                f"from framework.runner.runner import AgentRunner; "
++                f'r = AgentRunner.load("exports/{agent_name}", '
+                 f"skip_credential_validation=True); "
+-                f'print("AgentLoader.load (graph-only): OK")',
++                f'print("AgentRunner.load (graph-only): OK")',
+             ],
+             capture_output=True,
+             text=True,
+@@ -1593,9 +1700,7 @@ def validate_agent_package(agent_name: str) -> str:
+     # Step D: Tests (direct call)
+     try:
+         test_result = _run_agent_tests_impl(agent_name)
+-        if test_result.get("skipped"):
+-            steps["tests"] = {"passed": True, "output": "No tests (skipped)"}
+-        elif "error" in test_result:
++        if "error" in test_result:
+             steps["tests"] = {"passed": False, "error": test_result["error"]}
+         else:
+             all_passed = test_result.get("failed", 0) == 0 and test_result.get("errors", 0) == 0
+@@ -1633,6 +1738,711 @@ def validate_agent_package(agent_name: str) -> str:
+ # ── Meta-agent: Package initialization ─────────────────────────────────────
+ 
+ 
++def _snake_to_camel(name: str) -> str:
++    """Convert snake_case to CamelCase."""
++    return "".join(word.capitalize() for word in name.split("_"))
++
++
++def _node_var_name(node_id: str) -> str:
++    """Convert node id to a Python variable name."""
++    return node_id.replace("-", "_") + "_node"
++
++
++@mcp.tool()
++def initialize_and_build_agent(
++    agent_name: str,
++    nodes: str | None = None,
++    _draft: dict | None = None,
++) -> str:
++    """Scaffold a new agent package with placeholder files.
++
++    Creates exports/{agent_name}/ with all files needed for a runnable agent:
++    config.py, nodes/__init__.py, agent.py, __init__.py, __main__.py,
++    mcp_servers.json, tests/conftest.py.
++
++    After initialization, customize the generated files:
++    - System prompts and node logic in nodes/__init__.py
++    - Goal and edges in agent.py
++    - CLI options in __main__.py
++
++    Args:
++        agent_name: Name for the agent package. Must be snake_case (e.g. 'my_agent').
++        nodes: Comma-separated node names (snake_case or kebab-case).
++               If omitted, a single 'start' node is created.
++               Example: 'intake,process,review'
++        _draft: Internal. Draft graph metadata from planning phase, used to
++                pre-populate descriptions, goals, and node metadata.
++
++    Returns:
++        JSON with files written and next steps.
++    """
++    import re
++
++    if not re.match(r"^[a-z][a-z0-9_]*$", agent_name):
++        return json.dumps(
++            {
++                "success": False,
++                "error": (
++                    f"Invalid agent_name '{agent_name}'. Must be snake_case: "
++                    "lowercase letters, numbers, underscores, starting with a letter."
++                ),
++            }
++        )
++
++    node_list = [n.strip() for n in nodes.split(",") if n.strip()] if nodes else ["start"]
++
++    # Build draft node lookup for pre-populating metadata from planning phase
++    _draft_nodes: dict[str, dict] = {}
++    if _draft and _draft.get("nodes"):
++        for dn in _draft["nodes"]:
++            _draft_nodes[dn.get("id", "")] = dn
++
++    # Extract top-level draft metadata early so it's available for all templates
++    _draft_desc = (_draft.get("description") or "") if _draft else ""
++
++    class_name = _snake_to_camel(agent_name)
++    human_name = agent_name.replace("_", " ").title()
++    entry_node = node_list[0]
++
++    exports_dir = os.path.join(PROJECT_ROOT, "exports", agent_name)
++    nodes_dir = os.path.join(exports_dir, "nodes")
++    tests_dir = os.path.join(exports_dir, "tests")
++    os.makedirs(nodes_dir, exist_ok=True)
++    os.makedirs(tests_dir, exist_ok=True)
++
++    files_written: dict[str, dict] = {}
++
++    def _write(rel_path: str, content: str) -> None:
++        full = os.path.join(exports_dir, rel_path)
++        os.makedirs(os.path.dirname(full), exist_ok=True)
++        with open(full, "w", encoding="utf-8") as f:
++            f.write(content)
++        files_written[rel_path] = {
++            "path": f"exports/{agent_name}/{rel_path}",
++            "size_bytes": os.path.getsize(full),
++        }
++
++    # -- config.py --
++    _write(
++        "config.py",
++        f'''\
++"""Runtime configuration."""
++
++import json
++from dataclasses import dataclass, field
++from pathlib import Path
++
++
++def _load_preferred_model() -> str:
++    """Load preferred model from ~/.hive/configuration.json."""
++    config_path = Path.home() / ".hive" / "configuration.json"
++    if config_path.exists():
++        try:
++            with open(config_path) as f:
++                config = json.load(f)
++            llm = config.get("llm", {{}})
++            if llm.get("provider") and llm.get("model"):
++                return f"{{llm[\'provider\']}}/{{llm[\'model\']}}"
++        except Exception:
++            pass
++    return "anthropic/claude-sonnet-4-20250514"
++
++
++@dataclass
++class RuntimeConfig:
++    model: str = field(default_factory=_load_preferred_model)
++    temperature: float = 0.7
++    max_tokens: int = 40000
++    api_key: str | None = None
++    api_base: str | None = None
++
++
++default_config = RuntimeConfig()
++
++
++@dataclass
++class AgentMetadata:
++    name: str = "{human_name}"
++    version: str = "1.0.0"
++    description: str = "{_draft_desc or "TODO: Add agent description."}"
++    intro_message: str = "TODO: Add intro message."
++
++
++metadata = AgentMetadata()
++''',
++    )
++
++    # -- nodes/__init__.py --
++    node_specs = []
++    node_var_names = []
++    for node_id in node_list:
++        var = _node_var_name(node_id)
++        node_var_names.append(var)
++        is_first = node_id == entry_node
++
++        # Use draft metadata to pre-populate if available
++        dn = _draft_nodes.get(node_id, {})
++        node_name = dn.get("name") or node_id.replace("_", " ").replace("-", " ").title()
++        node_desc = dn.get("description") or "TODO: Describe what this node does."
++        node_type = dn.get("node_type") or "event_loop"
++        node_tools = dn.get("tools") or []
++        node_input_keys = dn.get("input_keys") or []
++        node_output_keys = dn.get("output_keys") or []
++        node_sc = dn.get("success_criteria") or "TODO: Define success criteria."
++
++        node_specs.append(f'''\
++{var} = NodeSpec(
++    id="{node_id}",
++    name="{node_name}",
++    description="{node_desc}",
++    node_type="{node_type}",
++    client_facing={is_first},
++    max_node_visits=0,
++    input_keys={node_input_keys!r},
++    output_keys={node_output_keys!r},
++    nullable_output_keys=[],
++    success_criteria="{node_sc}",
++    system_prompt="""\\
++TODO: Add system prompt for this node.
++""",
++    tools={node_tools!r},
++)''')
++
++    nodes_init = f'''\
++"""Node definitions for {human_name}."""
++
++from framework.graph import NodeSpec
++
++{chr(10).join(node_specs)}
++
++__all__ = {node_var_names!r}
++'''
++    _write("nodes/__init__.py", nodes_init)
++
++    # -- agent.py --
++    node_imports = ", ".join(node_var_names)
++    nodes_list = ", ".join(node_var_names)
++
++    # Use draft edges if available, otherwise generate linear edges
++    _draft_edges = _draft.get("edges", []) if _draft else []
++    edge_defs = []
++    if _draft_edges:
++        for de in _draft_edges:
++            eid = de.get("id", f"{de.get('source', '')}-to-{de.get('target', '')}")
++            src = de.get("source", "")
++            tgt = de.get("target", "")
++            cond = de.get("condition", "on_success").upper()
++            desc = de.get("description", "")
++            desc_line = f'\n        description="{desc}",' if desc else ""
++            edge_defs.append(f"""\
++    EdgeSpec(
++        id="{eid}",
++        source="{src}",
++        target="{tgt}",
++        condition=EdgeCondition.{cond},{desc_line}
++        priority=1,
++    ),""")
++    else:
++        for i in range(len(node_list) - 1):
++            src, tgt = node_list[i], node_list[i + 1]
++            edge_defs.append(f"""\
++    EdgeSpec(
++        id="{src}-to-{tgt}",
++        source="{src}",
++        target="{tgt}",
++        condition=EdgeCondition.ON_SUCCESS,
++        priority=1,
++    ),""")
++    edges_str = "\n".join(edge_defs) if edge_defs else "    # TODO: Add edges"
++
++    # Pre-populate goal from draft metadata
++    _draft_goal = (
++        (_draft.get("goal") or "TODO: Describe the agent's goal.")
++        if _draft
++        else "TODO: Describe the agent's goal."
++    )
++    _draft_sc = (_draft.get("success_criteria") or []) if _draft else []
++    _draft_constraints = (_draft.get("constraints") or []) if _draft else []
++
++    # Build success criteria entries
++    if _draft_sc:
++        sc_entries = "\n".join(
++            f"""\
++        SuccessCriterion(
++            id="sc-{i + 1}",
++            description="{sc}",
++            metric="TODO",
++            target="TODO",
++            weight=1.0,
++        ),"""
++            for i, sc in enumerate(_draft_sc)
++        )
++    else:
++        sc_entries = """\
++        SuccessCriterion(
++            id="sc-1",
++            description="TODO: Define success criterion.",
++            metric="TODO",
++            target="TODO",
++            weight=1.0,
++        ),"""
++
++    # Build constraint entries
++    if _draft_constraints:
++        constraint_entries = "\n".join(
++            f"""\
++        Constraint(
++            id="c-{i + 1}",
++            description="{c}",
++            constraint_type="hard",
++            category="functional",
++        ),"""
++            for i, c in enumerate(_draft_constraints)
++        )
++    else:
++        constraint_entries = """\
++        Constraint(
++            id="c-1",
++            description="TODO: Define constraint.",
++            constraint_type="hard",
++            category="functional",
++        ),"""
++
++    _write(
++        "agent.py",
++        f'''\
++"""Agent graph construction for {human_name}."""
++
++from pathlib import Path
++
++from framework.graph import EdgeSpec, EdgeCondition, Goal, SuccessCriterion, Constraint
++from framework.graph.edge import GraphSpec
++from framework.graph.executor import ExecutionResult
++from framework.graph.checkpoint_config import CheckpointConfig
++from framework.llm import LiteLLMProvider
++from framework.runner.tool_registry import ToolRegistry
++from framework.runtime.agent_runtime import create_agent_runtime
++from framework.runtime.execution_stream import EntryPointSpec
++
++from .config import default_config, metadata
++from .nodes import {node_imports}
++
++# Goal definition
++goal = Goal(
++    id="{agent_name}-goal",
++    name="{human_name}",
++    description="{_draft_goal}",
++    success_criteria=[
++{sc_entries}
++    ],
++    constraints=[
++{constraint_entries}
++    ],
++)
++
++# Node list
++nodes = [{nodes_list}]
++
++# Edge definitions
++edges = [
++{edges_str}
++]
++
++# Graph configuration
++entry_node = "{entry_node}"
++entry_points = {{"start": "{entry_node}"}}
++pause_nodes = []
++terminal_nodes = []
++
++conversation_mode = "continuous"
++identity_prompt = "TODO: Add identity prompt."
++loop_config = {{
++    "max_iterations": 100,
++    "max_tool_calls_per_turn": 30,
++    "max_history_tokens": 32000,
++}}
++
++
++class {class_name}:
++    def __init__(self, config=None):
++        self.config = config or default_config
++        self.goal = goal
++        self.nodes = nodes
++        self.edges = edges
++        self.entry_node = entry_node
++        self.entry_points = entry_points
++        self.pause_nodes = pause_nodes
++        self.terminal_nodes = terminal_nodes
++        self._graph = None
++        self._agent_runtime = None
++        self._tool_registry = None
++        self._storage_path = None
++
++    def _build_graph(self):
++        return GraphSpec(
++            id="{agent_name}-graph",
++            goal_id=self.goal.id,
++            version="1.0.0",
++            entry_node=self.entry_node,
++            entry_points=self.entry_points,
++            terminal_nodes=self.terminal_nodes,
++            pause_nodes=self.pause_nodes,
++            nodes=self.nodes,
++            edges=self.edges,
++            default_model=self.config.model,
++            max_tokens=self.config.max_tokens,
++            loop_config=loop_config,
++            conversation_mode=conversation_mode,
++            identity_prompt=identity_prompt,
++        )
++
++    def _setup(self):
++        self._storage_path = Path.home() / ".hive" / "agents" / "{agent_name}"
++        self._storage_path.mkdir(parents=True, exist_ok=True)
++        self._tool_registry = ToolRegistry()
++        mcp_config = Path(__file__).parent / "mcp_servers.json"
++        if mcp_config.exists():
++            self._tool_registry.load_mcp_config(mcp_config)
++        llm = LiteLLMProvider(
++            model=self.config.model,
++            api_key=self.config.api_key,
++            api_base=self.config.api_base,
++        )
++        tools = list(self._tool_registry.get_tools().values())
++        tool_executor = self._tool_registry.get_executor()
++        self._graph = self._build_graph()
++        self._agent_runtime = create_agent_runtime(
++            graph=self._graph,
++            goal=self.goal,
++            storage_path=self._storage_path,
++            entry_points=[
++                EntryPointSpec(
++                    id="default",
++                    name="Default",
++                    entry_node=self.entry_node,
++                    trigger_type="manual",
++                    isolation_level="shared",
++                ),
++            ],
++            llm=llm,
++            tools=tools,
++            tool_executor=tool_executor,
++            checkpoint_config=CheckpointConfig(
++                enabled=True,
++                checkpoint_on_node_complete=True,
++                checkpoint_max_age_days=7,
++                async_checkpoint=True,
++            ),
++        )
++
++    async def start(self):
++        if self._agent_runtime is None:
++            self._setup()
++        if not self._agent_runtime.is_running:
++            await self._agent_runtime.start()
++
++    async def stop(self):
++        if self._agent_runtime and self._agent_runtime.is_running:
++            await self._agent_runtime.stop()
++        self._agent_runtime = None
++
++    async def trigger_and_wait(
++        self,
++        entry_point="default",
++        input_data=None,
++        timeout=None,
++        session_state=None,
++    ):
++        if self._agent_runtime is None:
++            raise RuntimeError("Agent not started. Call start() first.")
++        return await self._agent_runtime.trigger_and_wait(
++            entry_point_id=entry_point,
++            input_data=input_data or {{}},
++            session_state=session_state,
++        )
++
++    async def run(self, context, session_state=None):
++        await self.start()
++        try:
++            result = await self.trigger_and_wait(
++                "default", context, session_state=session_state
++            )
++            return result or ExecutionResult(success=False, error="Execution timeout")
++        finally:
++            await self.stop()
++
++    def info(self):
++        return {{
++            "name": metadata.name,
++            "version": metadata.version,
++            "description": metadata.description,
++            "goal": {{
++                "name": self.goal.name,
++                "description": self.goal.description,
++            }},
++            "nodes": [n.id for n in self.nodes],
++            "edges": [e.id for e in self.edges],
++            "entry_node": self.entry_node,
++            "entry_points": self.entry_points,
++            "terminal_nodes": self.terminal_nodes,
++            "client_facing_nodes": [n.id for n in self.nodes if n.client_facing],
++        }}
++
++    def validate(self):
++        errors, warnings = [], []
++        node_ids = {{n.id for n in self.nodes}}
++        for e in self.edges:
++            if e.source not in node_ids:
++                errors.append(f"Edge {{e.id}}: source '{{e.source}}' not found")
++            if e.target not in node_ids:
++                errors.append(f"Edge {{e.id}}: target '{{e.target}}' not found")
++        if self.entry_node not in node_ids:
++            errors.append(f"Entry node '{{self.entry_node}}' not found")
++        for t in self.terminal_nodes:
++            if t not in node_ids:
++                errors.append(f"Terminal node '{{t}}' not found")
++        for ep_id, nid in self.entry_points.items():
++            if nid not in node_ids:
++                errors.append(f"Entry point '{{ep_id}}' references unknown node '{{nid}}'")
++
++        return {{"valid": len(errors) == 0, "errors": errors, "warnings": warnings}}
++
++
++default_agent = {class_name}()
++''',
++    )
++
++    # -- __init__.py --
++    _write(
++        "__init__.py",
++        f'''\
++"""{human_name} — TODO: Add description."""
++
++from .agent import (
++    {class_name},
++    default_agent,
++    goal,
++    nodes,
++    edges,
++    entry_node,
++    entry_points,
++    pause_nodes,
++    terminal_nodes,
++    conversation_mode,
++    identity_prompt,
++    loop_config,
++)
++from .config import default_config, metadata
++
++__all__ = [
++    "{class_name}",
++    "default_agent",
++    "goal",
++    "nodes",
++    "edges",
++    "entry_node",
++    "entry_points",
++    "pause_nodes",
++    "terminal_nodes",
++    "conversation_mode",
++    "identity_prompt",
++    "loop_config",
++    "default_config",
++    "metadata",
++]
++''',
++    )
++
++    # -- __main__.py --
++    _write(
++        "__main__.py",
++        f'''\
++"""CLI entry point for {human_name}."""
++
++import asyncio
++import json
++import logging
++import sys
++
++import click
++
++from .agent import default_agent, {class_name}
++
++
++def setup_logging(verbose=False, debug=False):
++    if debug:
++        level, fmt = logging.DEBUG, "%(asctime)s %(name)s: %(message)s"
++    elif verbose:
++        level, fmt = logging.INFO, "%(message)s"
++    else:
++        level, fmt = logging.WARNING, "%(levelname)s: %(message)s"
++    logging.basicConfig(level=level, format=fmt, stream=sys.stderr)
++
++
++@click.group()
++@click.version_option(version="1.0.0")
++def cli():
++    """{human_name}."""
++    pass
++
++
++@cli.command()
++@click.option("--verbose", "-v", is_flag=True)
++def run(verbose):
++    """Execute the agent."""
++    setup_logging(verbose=verbose)
++    result = asyncio.run(default_agent.run({{}}))
++    click.echo(
++        json.dumps(
++            {{"success": result.success, "output": result.output}},
++            indent=2,
++            default=str,
++        )
++    )
++    sys.exit(0 if result.success else 1)
++
++
++@cli.command()
++def info():
++    """Show agent info."""
++    data = default_agent.info()
++    click.echo(
++        f"Agent: {{data[\'name\']}}\n"
++        f"Version: {{data[\'version\']}}\n"
++        f"Description: {{data[\'description\']}}"
++    )
++    click.echo(f"Nodes: {{', '.join(data[\'nodes\'])}}")
++    click.echo(f"Client-facing: {{', '.join(data[\'client_facing_nodes\'])}}")
++
++
++@cli.command()
++def validate():
++    """Validate agent structure."""
++    v = default_agent.validate()
++    if v["valid"]:
++        click.echo("Agent is valid")
++    else:
++        click.echo("Errors:")
++        for e in v["errors"]:
++            click.echo(f"  {{e}}")
++    sys.exit(0 if v["valid"] else 1)
++
++
++if __name__ == "__main__":
++    cli()
++''',
++    )
++
++    # -- mcp_servers.json --
++    mcp_config: dict = {
++        "hive-tools": {
++            "transport": "stdio",
++            "command": "uv",
++            "args": ["run", "python", "mcp_server.py", "--stdio"],
++            "cwd": "../../tools",
++            "description": "Primary integration server: web, GitHub, Telegram, Google, data stores",
++        },
++        "gcu-tools": {
++            "transport": "stdio",
++            "command": "uv",
++            "args": ["run", "python", "-m", "gcu.server", "--stdio"],
++            "cwd": "../../tools",
++            "description": "Browser automation tools",
++        },
++        "files-tools": {
++            "transport": "stdio",
++            "command": "uv",
++            "args": ["run", "python", "files_server.py", "--stdio"],
++            "cwd": "../../tools",
++            "tools": ["write_file", "edit_file", "list_directory", "run_command"],
++            "description": "Focused file operations server",
++        },
++    }
++
++    _write("mcp_servers.json", json.dumps(mcp_config, indent=2))
++
++    # -- tests/conftest.py --
++    _write(
++        "tests/conftest.py",
++        '''\
++"""Test fixtures."""
++
++import sys
++from pathlib import Path
++
++import pytest
++
++_repo_root = Path(__file__).resolve().parents[3]
++for _p in ["exports", "core"]:
++    _path = str(_repo_root / _p)
++    if _path not in sys.path:
++        sys.path.insert(0, _path)
++
++AGENT_PATH = str(Path(__file__).resolve().parents[1])
++
++
++@pytest.fixture(scope="session")
++def agent_module():
++    """Import the agent package for structural validation."""
++    import importlib
++
++    return importlib.import_module(Path(AGENT_PATH).name)
++
++
++@pytest.fixture(scope="session")
++def runner_loaded():
++    """Load the agent through AgentRunner (structural only, no LLM needed)."""
++    from framework.runner.runner import AgentRunner
++
++    return AgentRunner.load(AGENT_PATH)
++''',
++    )
++
++    # Build list of all generated file paths for the caller.
++    all_file_paths = [info["path"] for info in files_written.values()]
++
++    return json.dumps(
++        {
++            "success": True,
++            "agent_name": agent_name,
++            "class_name": class_name,
++            "entry_node": entry_node,
++            "nodes": node_list,
++            "files_written": files_written,
++            "file_count": len(files_written),
++            "files": all_file_paths,
++            "next_steps": [
++                (
++                    "IMPORTANT: All generated files are structurally complete "
++                    "with correct imports, class definition, validate() method, "
++                    "and __init__.py exports. Use edit_file to customize TODO "
++                    "placeholders — do NOT use write_file to rewrite entire files, "
++                    "as this will break imports and structure."
++                ),
++                (
++                    f"Use edit_file to customize system prompts, tools, "
++                    f"input_keys, output_keys, and success_criteria in "
++                    f"exports/{agent_name}/nodes/__init__.py"
++                ),
++                (
++                    f"Use edit_file to customize goal description, "
++                    f"success_criteria values, constraint values, edge "
++                    f"definitions, and identity_prompt in "
++                    f"exports/{agent_name}/agent.py"
++                ),
++                (
++                    "Do NOT modify: imports at top of agent.py, the class "
++                    "definition, validate() method, _build_graph()/_setup()/"
++                    "lifecycle methods, or __init__.py exports — they are "
++                    "already correct."
++                ),
++                f'Run validate_agent_package("{agent_name}") to verify structure',
++            ],
++        },
++        indent=2,
++    )
++
++
+ # ── Main ──────────────────────────────────────────────────────────────────
+ 
+ 
+diff --git a/tools/mcp_servers.json b/tools/mcp_servers.json
+index eca535a5..4027d24f 100644
+--- a/tools/mcp_servers.json
++++ b/tools/mcp_servers.json
+@@ -1,9 +1,32 @@
+ {
+-  "hive_tools": {
++  "hive-tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "mcp_server.py", "--stdio"],
+     "cwd": ".",
+-    "description": "hive_tools MCP server providing web_search, web_scrape, send_email, and data tools"
++    "description": "Hive tools MCP server providing web_search, web_scrape, github, telegram, google, redis, postgres and more"
++  },
++  "gcu-tools": {
++    "transport": "stdio",
++    "command": "uv",
++    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
++    "cwd": ".",
++    "description": "GCU browser automation tools"
++  },
++  "files-tools": {
++    "transport": "stdio",
++    "command": "uv",
++    "args": ["run", "python", "files_server.py", "--stdio"],
++    "cwd": ".",
++    "allow_zero_tools": true,
++    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
++    "description": "Focused file operations MCP server"
++  },
++  "coder-tools": {
++    "transport": "stdio",
++    "command": "uv",
++    "args": ["run", "python", "coder_tools_server.py", "--stdio"],
++    "cwd": ".",
++    "description": "Coder tools MCP server for deep code generation and validation"
+   }
+ }
+diff --git a/tools/src/aden_tools/credentials/__init__.py b/tools/src/aden_tools/credentials/__init__.py
+index 43afd335..a6e15c74 100644
+--- a/tools/src/aden_tools/credentials/__init__.py
++++ b/tools/src/aden_tools/credentials/__init__.py
+@@ -219,8 +219,8 @@
+     **TWILIO_CREDENTIALS,
+     **TWITTER_CREDENTIALS,
+     **VERCEL_CREDENTIALS,
+-    **YOUTUBE_CREDENTIALS,
+     **WANDB_CREDENTIALS,
++    **YOUTUBE_CREDENTIALS,
+     **ZENDESK_CREDENTIALS,
+     **ZOHO_CRM_CREDENTIALS,
+     **ZOOM_CREDENTIALS,
+diff --git a/tools/src/aden_tools/tools/__init__.py b/tools/src/aden_tools/tools/__init__.py
+index 66bcc654..a89c5601 100644
+--- a/tools/src/aden_tools/tools/__init__.py
++++ b/tools/src/aden_tools/tools/__init__.py
+@@ -16,6 +16,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ from typing import TYPE_CHECKING
+ 
+ from fastmcp import FastMCP
+@@ -149,11 +150,26 @@
+ from .zoho_crm_tool import register_tools as register_zoho_crm
+ from .zoom_tool import register_tools as register_zoom
+ 
+-# Tool names registered by `_register_verified()`. Populated on first call.
+-# Consumed by the `__aden_verified_manifest` sentinel tool so downstream
+-# registries (e.g. the queen's MCP loader) can gate free/credential-less tools
+-# on whether they have been promoted to verified status.
+-_VERIFIED_TOOL_NAMES: set[str] = set()
++
++def _list_registered_tool_names(mcp: FastMCP) -> list[str]:
++    """Return tool names across FastMCP versions (v2/v3 compatibility)."""
++    # FastMCP v2
++    manager = getattr(mcp, "_tool_manager", None)
++    if manager is not None and hasattr(manager, "_tools"):
++        return list(manager._tools.keys())
++
++    # FastMCP v3 (async API)
++    list_tools = getattr(mcp, "list_tools", None)
++    if callable(list_tools):
++        tools = asyncio.run(list_tools())
++        names: list[str] = []
++        for t in tools or []:
++            name = getattr(t, "name", None)
++            if name:
++                names.append(str(name))
++        return names
++
++    return []
+ 
+ 
+ def _register_verified(
+@@ -161,7 +177,6 @@ def _register_verified(
+     credentials: CredentialStoreAdapter | None = None,
+ ) -> None:
+     """Register verified (stable) tools."""
+-    _verified_before = set(mcp._tool_manager._tools.keys())
+     # --- No credentials ---
+     register_example(mcp)
+     if register_web_scrape:
+@@ -239,22 +254,6 @@ def _register_verified(
+     register_notion(mcp, credentials=credentials)
+     register_account_info(mcp, credentials=credentials)
+ 
+-    _VERIFIED_TOOL_NAMES.update(set(mcp._tool_manager._tools.keys()) - _verified_before)
+-
+-
+-def _register_manifest(mcp: FastMCP) -> None:
+-    """Expose the verified-tool manifest as a sentinel MCP tool.
+-
+-    Registered after both verified and unverified passes so the manifest tool
+-    itself never appears in `_VERIFIED_TOOL_NAMES`. Downstream registries call
+-    this to decide whether a credential-less tool is safe to admit.
+-    """
+-
+-    @mcp.tool(name="__aden_verified_manifest")
+-    def aden_verified_manifest() -> list[str]:
+-        """Return tool names registered by `_register_verified()`."""
+-        return sorted(_VERIFIED_TOOL_NAMES)
+-
+ 
+ def _register_unverified(
+     mcp: FastMCP,
+@@ -357,9 +356,7 @@ def register_all_tools(
+     if include_unverified:
+         _register_unverified(mcp, credentials=credentials)
+ 
+-    _register_manifest(mcp)
+-
+-    return list(mcp._tool_manager._tools.keys())
++    return _list_registered_tool_names(mcp)
+ 
+ 
+ __all__ = ["register_all_tools"]
+diff --git a/tools/src/aden_tools/tools/calendar_tool/calendar_tool.py b/tools/src/aden_tools/tools/calendar_tool/calendar_tool.py
+index d5bb4230..dadcb3a8 100644
+--- a/tools/src/aden_tools/tools/calendar_tool/calendar_tool.py
++++ b/tools/src/aden_tools/tools/calendar_tool/calendar_tool.py
+@@ -25,6 +25,8 @@
+ import httpx
+ from fastmcp import FastMCP
+ 
++from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
++
+ if TYPE_CHECKING:
+     from framework.credentials.oauth2 import TokenLifecycleManager
+ 
+@@ -85,7 +87,7 @@ def _get_token() -> str | None:
+             return credentials.get("google")
+ 
+         # Fall back to environment variable
+-        return os.getenv("GOOGLE_ACCESS_TOKEN")
++        return get_google_access_token_from_env_or_file()
+ 
+     def _get_headers() -> dict[str, str]:
+         """Get authorization headers for API requests.
+@@ -368,9 +370,13 @@ def calendar_create_event(
+         if all_day:
+             # Validate date-only format for all-day events
+             if not _DATE_ONLY_RE.match(start_time):
+-                return {"error": "all-day events require date-only format for start_time (YYYY-MM-DD)"}
++                return {
++                    "error": "all-day events require date-only format for start_time (YYYY-MM-DD)"
++                }
+             if not _DATE_ONLY_RE.match(end_time):
+-                return {"error": "all-day events require date-only format for end_time (YYYY-MM-DD)"}
++                return {
++                    "error": "all-day events require date-only format for end_time (YYYY-MM-DD)"
++                }
+             event_body: dict = {
+                 "summary": summary,
+                 "start": {"date": start_time},
+@@ -507,7 +513,9 @@ def calendar_update_event(
+ 
+             current_attendees = event_data.get("attendees", [])
+             remove_set = {e.lower() for e in remove_attendees}
+-            remaining = [a for a in current_attendees if a.get("email", "").lower() not in remove_set]
++            remaining = [
++                a for a in current_attendees if a.get("email", "").lower() not in remove_set
++            ]
+             patch_body["attendees"] = remaining
+         elif attendees is not None:
+             patch_body["attendees"] = [{"email": email} for email in attendees]
+@@ -523,7 +531,11 @@ def calendar_update_event(
+         if start_time is not None:
+             if all_day:
+                 if not _DATE_ONLY_RE.match(start_time):
+-                    return {"error": ("all-day events require date-only format for start_time (YYYY-MM-DD)")}
++                    return {
++                        "error": (
++                            "all-day events require date-only format for start_time (YYYY-MM-DD)"
++                        )
++                    }
+                 patch_body["start"] = {"date": start_time}
+             else:
+                 patch_body["start"] = {"dateTime": start_time}
+@@ -533,7 +545,11 @@ def calendar_update_event(
+         if end_time is not None:
+             if all_day:
+                 if not _DATE_ONLY_RE.match(end_time):
+-                    return {"error": ("all-day events require date-only format for end_time (YYYY-MM-DD)")}
++                    return {
++                        "error": (
++                            "all-day events require date-only format for end_time (YYYY-MM-DD)"
++                        )
++                    }
+                 patch_body["end"] = {"date": end_time}
+             else:
+                 patch_body["end"] = {"dateTime": end_time}
+@@ -887,7 +903,9 @@ def calendar_check_availability(
+                 # Compute busy/free/conflicts
+                 window_start = _parse_event_dt(time_min)
+                 window_end = _parse_event_dt(time_max)
+-                busy, free_slots, conflicts = _compute_busy_free_conflicts(events, window_start, window_end)
++                busy, free_slots, conflicts = _compute_busy_free_conflicts(
++                    events, window_start, window_end
++                )
+ 
+                 formatted_calendars[cal_id] = {
+                     "events": events,
+diff --git a/tools/src/aden_tools/tools/github_tool/github_tool.py b/tools/src/aden_tools/tools/github_tool/github_tool.py
+index ba492303..1d11fe9b 100644
+--- a/tools/src/aden_tools/tools/github_tool/github_tool.py
++++ b/tools/src/aden_tools/tools/github_tool/github_tool.py
+@@ -270,6 +270,48 @@ def update_issue(
+         )
+         return self._handle_response(response)
+ 
++    def list_issue_comments(
++        self,
++        owner: str,
++        repo: str,
++        issue_number: int,
++        page: int = 1,
++        limit: int = 30,
++    ) -> dict[str, Any]:
++        """List issue comments (also works for PR conversation comments)."""
++        owner = _sanitize_path_param(owner, "owner")
++        repo = _sanitize_path_param(repo, "repo")
++        params = {
++            "per_page": min(limit, 100),
++            "page": max(1, page),
++        }
++
++        response = httpx.get(
++            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/comments",
++            headers=self._headers,
++            params=params,
++            timeout=30.0,
++        )
++        return self._handle_response(response)
++
++    def create_issue_comment(
++        self,
++        owner: str,
++        repo: str,
++        issue_number: int,
++        body: str,
++    ) -> dict[str, Any]:
++        """Create an issue comment (also works for PR conversation comments)."""
++        owner = _sanitize_path_param(owner, "owner")
++        repo = _sanitize_path_param(repo, "repo")
++        response = httpx.post(
++            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/comments",
++            headers=self._headers,
++            json={"body": body},
++            timeout=30.0,
++        )
++        return self._handle_response(response)
++
+     # --- Pull Requests ---
+ 
+     def list_pull_requests(
+@@ -343,6 +385,112 @@ def create_pull_request(
+         )
+         return self._handle_response(response)
+ 
++    def list_pull_request_reviews(
++        self,
++        owner: str,
++        repo: str,
++        pull_number: int,
++        page: int = 1,
++        limit: int = 30,
++    ) -> dict[str, Any]:
++        """List reviews on a pull request."""
++        owner = _sanitize_path_param(owner, "owner")
++        repo = _sanitize_path_param(repo, "repo")
++        params = {
++            "per_page": min(limit, 100),
++            "page": max(1, page),
++        }
++
++        response = httpx.get(
++            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
++            headers=self._headers,
++            params=params,
++            timeout=30.0,
++        )
++        return self._handle_response(response)
++
++    def list_pull_request_review_comments(
++        self,
++        owner: str,
++        repo: str,
++        pull_number: int,
++        page: int = 1,
++        limit: int = 30,
++    ) -> dict[str, Any]:
++        """List inline review comments on a pull request."""
++        owner = _sanitize_path_param(owner, "owner")
++        repo = _sanitize_path_param(repo, "repo")
++        params = {
++            "per_page": min(limit, 100),
++            "page": max(1, page),
++        }
++
++        response = httpx.get(
++            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/comments",
++            headers=self._headers,
++            params=params,
++            timeout=30.0,
++        )
++        return self._handle_response(response)
++
++    def create_pull_request_review(
++        self,
++        owner: str,
++        repo: str,
++        pull_number: int,
++        body: str | None = None,
++        event: str | None = None,
++        commit_id: str | None = None,
++    ) -> dict[str, Any]:
++        """Create a pull request review (COMMENT/APPROVE/REQUEST_CHANGES)."""
++        owner = _sanitize_path_param(owner, "owner")
++        repo = _sanitize_path_param(repo, "repo")
++        payload: dict[str, Any] = {}
++        if body is not None:
++            payload["body"] = body
++        if event is not None:
++            payload["event"] = event
++        if commit_id is not None:
++            payload["commit_id"] = commit_id
++
++        response = httpx.post(
++            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
++            headers=self._headers,
++            json=payload,
++            timeout=30.0,
++        )
++        return self._handle_response(response)
++
++    def create_pull_request_review_comment(
++        self,
++        owner: str,
++        repo: str,
++        pull_number: int,
++        body: str,
++        commit_id: str,
++        path: str,
++        line: int,
++        side: str = "RIGHT",
++    ) -> dict[str, Any]:
++        """Create an inline pull request review comment."""
++        owner = _sanitize_path_param(owner, "owner")
++        repo = _sanitize_path_param(repo, "repo")
++        payload: dict[str, Any] = {
++            "body": body,
++            "commit_id": commit_id,
++            "path": path,
++            "line": line,
++            "side": side,
++        }
++
++        response = httpx.post(
++            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/comments",
++            headers=self._headers,
++            json=payload,
++            timeout=30.0,
++        )
++        return self._handle_response(response)
++
+     # --- Search ---
+ 
+     def search_code(
+@@ -607,14 +755,26 @@ def register_tools(
+ 
+     def _get_token(account: str = "") -> str | None:
+         """Get GitHub token from credential manager or environment."""
++        env_token = os.getenv("GITHUB_TOKEN")
+         if credentials is not None:
+-            if account:
+-                return credentials.get_by_alias("github", account)
+-            token = credentials.get("github")
+-            if token is not None and not isinstance(token, str):
+-                raise TypeError(f"Expected string from credentials.get('github'), got {type(token).__name__}")
+-            return token
+-        return os.getenv("GITHUB_TOKEN")
++            try:
++                if account:
++                    token = credentials.get_by_alias("github", account)
++                    if token:
++                        return token
++                else:
++                    token = credentials.get("github")
++                    if token is not None and not isinstance(token, str):
++                        raise TypeError(
++                            f"Expected string from credentials.get('github'), got {type(token).__name__}"
++                        )
++                    if token:
++                        return token
++            except Exception:
++                # Credential store can fail to decrypt stale entries if key rotated.
++                # Fall back to env token so runtime can continue.
++                pass
++        return env_token
+ 
+     def _get_client(account: str = "") -> _GitHubClient | dict[str, str]:
+         """Get a GitHub client, or return an error dict if no credentials."""
+@@ -848,6 +1008,55 @@ def github_update_issue(
+         except httpx.RequestError as e:
+             return {"error": _sanitize_error_message(e)}
+ 
++    @mcp.tool()
++    def github_list_issue_comments(
++        owner: str,
++        repo: str,
++        issue_number: int,
++        page: int = 1,
++        limit: int = 30,
++        account: str = "",
++    ) -> dict:
++        """
++        List issue comments.
++
++        Note: Pull requests are issues in GitHub, so this also returns
++        PR conversation comments (top-level comments, not inline code comments).
++        """
++        client = _get_client(account)
++        if isinstance(client, dict):
++            return client
++        try:
++            return client.list_issue_comments(owner, repo, issue_number, page, limit)
++        except httpx.TimeoutException:
++            return {"error": "Request timed out"}
++        except httpx.RequestError as e:
++            return {"error": _sanitize_error_message(e)}
++
++    @mcp.tool()
++    def github_create_issue_comment(
++        owner: str,
++        repo: str,
++        issue_number: int,
++        body: str,
++        account: str = "",
++    ) -> dict:
++        """
++        Create an issue comment.
++
++        Note: Pull requests are issues in GitHub, so this can be used to
++        post a top-level PR conversation comment.
++        """
++        client = _get_client(account)
++        if isinstance(client, dict):
++            return client
++        try:
++            return client.create_issue_comment(owner, repo, issue_number, body)
++        except httpx.TimeoutException:
++            return {"error": "Request timed out"}
++        except httpx.RequestError as e:
++            return {"error": _sanitize_error_message(e)}
++
+     # --- Pull Requests ---
+ 
+     @mcp.tool()
+@@ -946,6 +1155,102 @@ def github_create_pull_request(
+         except httpx.RequestError as e:
+             return {"error": _sanitize_error_message(e)}
+ 
++    @mcp.tool()
++    def github_list_pull_request_reviews(
++        owner: str,
++        repo: str,
++        pull_number: int,
++        page: int = 1,
++        limit: int = 30,
++        account: str = "",
++    ) -> dict:
++        """
++        List pull request reviews (APPROVED/CHANGES_REQUESTED/COMMENTED).
++        """
++        client = _get_client(account)
++        if isinstance(client, dict):
++            return client
++        try:
++            return client.list_pull_request_reviews(owner, repo, pull_number, page, limit)
++        except httpx.TimeoutException:
++            return {"error": "Request timed out"}
++        except httpx.RequestError as e:
++            return {"error": _sanitize_error_message(e)}
++
++    @mcp.tool()
++    def github_list_pull_request_review_comments(
++        owner: str,
++        repo: str,
++        pull_number: int,
++        page: int = 1,
++        limit: int = 30,
++        account: str = "",
++    ) -> dict:
++        """
++        List inline review comments on a pull request (code-level comments).
++        """
++        client = _get_client(account)
++        if isinstance(client, dict):
++            return client
++        try:
++            return client.list_pull_request_review_comments(owner, repo, pull_number, page, limit)
++        except httpx.TimeoutException:
++            return {"error": "Request timed out"}
++        except httpx.RequestError as e:
++            return {"error": _sanitize_error_message(e)}
++
++    @mcp.tool()
++    def github_create_pull_request_review(
++        owner: str,
++        repo: str,
++        pull_number: int,
++        body: str | None = None,
++        event: str | None = None,
++        commit_id: str | None = None,
++        account: str = "",
++    ) -> dict:
++        """
++        Create a pull request review.
++
++        event can be COMMENT, APPROVE, or REQUEST_CHANGES.
++        """
++        client = _get_client(account)
++        if isinstance(client, dict):
++            return client
++        try:
++            return client.create_pull_request_review(owner, repo, pull_number, body, event, commit_id)
++        except httpx.TimeoutException:
++            return {"error": "Request timed out"}
++        except httpx.RequestError as e:
++            return {"error": _sanitize_error_message(e)}
++
++    @mcp.tool()
++    def github_create_pull_request_review_comment(
++        owner: str,
++        repo: str,
++        pull_number: int,
++        body: str,
++        commit_id: str,
++        path: str,
++        line: int,
++        side: str = "RIGHT",
++        account: str = "",
++    ) -> dict:
++        """
++        Create an inline pull request review comment.
++        """
++        client = _get_client(account)
++        if isinstance(client, dict):
++            return client
++        try:
++            return client.create_pull_request_review_comment(
++                owner, repo, pull_number, body, commit_id, path, line, side
++            )
++        except httpx.TimeoutException:
++            return {"error": "Request timed out"}
++        except httpx.RequestError as e:
++            return {"error": _sanitize_error_message(e)}
++
+     # --- Search ---
+ 
+     @mcp.tool()
+@@ -1189,7 +1494,9 @@ def github_create_release(
+         if isinstance(client, dict):
+             return client
+         try:
+-            return client.create_release(owner, repo, tag_name, name, body, draft, prerelease, target_commitish)
++            return client.create_release(
++                owner, repo, tag_name, name, body, draft, prerelease, target_commitish
++            )
+         except httpx.TimeoutException:
+             return {"error": "Request timed out"}
+         except httpx.RequestError as e:
+diff --git a/tools/src/aden_tools/tools/gmail_tool/gmail_tool.py b/tools/src/aden_tools/tools/gmail_tool/gmail_tool.py
+index 9c659a64..74b7893b 100644
+--- a/tools/src/aden_tools/tools/gmail_tool/gmail_tool.py
++++ b/tools/src/aden_tools/tools/gmail_tool/gmail_tool.py
+@@ -21,6 +21,8 @@
+ import httpx
+ from fastmcp import FastMCP
+ 
++from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
++
+ if TYPE_CHECKING:
+     from aden_tools.credentials import CredentialStoreAdapter
+ 
+@@ -58,9 +60,11 @@ def _get_token(account: str = "") -> str | None:
+             if account:
+                 return credentials.get_by_alias("google", account)
+             return credentials.get("google")
+-        return os.getenv("GOOGLE_ACCESS_TOKEN")
++        return get_google_access_token_from_env_or_file()
+ 
+-    def _gmail_request(method: str, path: str, access_token: str, **kwargs: object) -> httpx.Response:
++    def _gmail_request(
++        method: str, path: str, access_token: str, **kwargs: object
++    ) -> httpx.Response:
+         """Make an authenticated Gmail API request."""
+         return httpx.request(
+             method,
+@@ -565,7 +569,9 @@ def gmail_create_draft(
+             orig_from = orig_headers.get("From", "")
+             orig_date = orig_headers.get("Date", "")
+             to = orig_from or to
+-            subject = orig_subject if orig_subject.lower().startswith("re:") else f"Re: {orig_subject}"
++            subject = (
++                orig_subject if orig_subject.lower().startswith("re:") else f"Re: {orig_subject}"
++            )
+ 
+             # Extract body recursively (prefer HTML, fall back to plain text)
+             def _extract_body(part: dict, mime_type: str) -> str | None:
+diff --git a/tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py b/tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py
+index 24a3ae52..6f1f7edd 100644
+--- a/tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py
++++ b/tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py
+@@ -24,6 +24,8 @@
+ import httpx
+ from fastmcp import FastMCP
+ 
++from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
++
+ if TYPE_CHECKING:
+     from aden_tools.credentials import CredentialStoreAdapter
+ 
+@@ -389,9 +391,11 @@ def _get_token(account: str = "") -> str | None:
+                 )
+             token = credentials.get("google")
+             if token is not None and not isinstance(token, str):
+-                raise TypeError(f"Expected string from credentials.get('google'), got {type(token).__name__}")
++                raise TypeError(
++                    f"Expected string from credentials.get('google'), got {type(token).__name__}"
++                )
+             return token
+-        return os.getenv("GOOGLE_ACCESS_TOKEN")
++        return get_google_access_token_from_env_or_file()
+ 
+     def _get_client(account: str = "") -> _GoogleDocsClient | dict[str, str]:
+         """Get a Google Docs client, or return an error dict if no credentials."""
+@@ -399,7 +403,10 @@ def _get_client(account: str = "") -> _GoogleDocsClient | dict[str, str]:
+         if not token:
+             return {
+                 "error": "Google Docs credentials not configured",
+-                "help": ("Set GOOGLE_ACCESS_TOKEN environment variable or configure 'google' via credential store"),
++                "help": (
++                    "Set GOOGLE_ACCESS_TOKEN environment variable "
++                    "or configure 'google' via credential store"
++                ),
+             }
+         return _GoogleDocsClient(token)
+ 
+@@ -601,7 +608,10 @@ def google_docs_format_text(
+             return client
+ 
+         foreground_color = None
+-        if any(c is not None for c in [foreground_color_red, foreground_color_green, foreground_color_blue]):
++        if any(
++            c is not None
++            for c in [foreground_color_red, foreground_color_green, foreground_color_blue]
++        ):
+             foreground_color = {
+                 "red": foreground_color_red or 0.0,
+                 "green": foreground_color_green or 0.0,
+diff --git a/tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py b/tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py
+index 3886ceb0..4d113d08 100644
+--- a/tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py
++++ b/tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py
+@@ -16,6 +16,8 @@
+ import httpx
+ from fastmcp import FastMCP
+ 
++from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
++
+ if TYPE_CHECKING:
+     from aden_tools.credentials import CredentialStoreAdapter
+ 
+@@ -81,7 +83,9 @@ def create_spreadsheet(
+         body: dict[str, Any] = {"properties": {"title": title}}
+ 
+         if sheet_titles:
+-            body["sheets"] = [{"properties": {"title": sheet_title}} for sheet_title in sheet_titles]
++            body["sheets"] = [
++                {"properties": {"title": sheet_title}} for sheet_title in sheet_titles
++            ]
+ 
+         response = httpx.post(
+             GOOGLE_SHEETS_API_BASE,
+@@ -258,9 +262,11 @@ def _get_token() -> str | None:
+             token = credentials.get("google")
+             # Defensive check: ensure we get a string, not a complex object
+             if token is not None and not isinstance(token, str):
+-                raise TypeError(f"Expected string from credentials.get('google'), got {type(token).__name__}")
++                raise TypeError(
++                    f"Expected string from credentials.get('google'), got {type(token).__name__}"
++                )
+             return token
+-        return os.getenv("GOOGLE_ACCESS_TOKEN")
++        return get_google_access_token_from_env_or_file()
+ 
+     def _get_client() -> _GoogleSheetsClient | dict[str, str]:
+         """Get a Google Sheets client, or return an error dict if no credentials."""
+@@ -268,7 +274,10 @@ def _get_client() -> _GoogleSheetsClient | dict[str, str]:
+         if not token:
+             return {
+                 "error": "Google Sheets credentials not configured",
+-                "help": ("Set GOOGLE_ACCESS_TOKEN environment variable or configure 'google' via credential store"),
++                "help": (
++                    "Set GOOGLE_ACCESS_TOKEN environment variable "
++                    "or configure 'google' via credential store"
++                ),
+             }
+         return _GoogleSheetsClient(token)
+ 
+@@ -418,7 +427,9 @@ def google_sheets_update_values(
+             except (json.JSONDecodeError, ValueError):
+                 return {"error": "values is not valid JSON"}
+         if not isinstance(values, list):
+-            return {"error": f"values must be a 2D list or JSON string, got {type(values).__name__}"}
++            return {
++                "error": f"values must be a 2D list or JSON string, got {type(values).__name__}"
++            }
+         try:
+             return client.update_values(spreadsheet_id, range_name, values, value_input_option)
+         except httpx.TimeoutException:
+@@ -464,7 +475,9 @@ def google_sheets_append_values(
+             except (json.JSONDecodeError, ValueError):
+                 return {"error": "values is not valid JSON"}
+         if not isinstance(values, list):
+-            return {"error": f"values must be a 2D list or JSON string, got {type(values).__name__}"}
++            return {
++                "error": f"values must be a 2D list or JSON string, got {type(values).__name__}"
++            }
+         try:
+             return client.append_values(spreadsheet_id, range_name, values, value_input_option)
+         except httpx.TimeoutException:
+diff --git a/tools/src/gcu/__init__.py b/tools/src/gcu/__init__.py
+index 9bcaace2..7017a34c 100644
+--- a/tools/src/gcu/__init__.py
++++ b/tools/src/gcu/__init__.py
+@@ -28,6 +28,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ from typing import TYPE_CHECKING
+ 
+ if TYPE_CHECKING:
+@@ -57,8 +58,17 @@ def register_gcu_tools(
+         from gcu.browser import register_tools as register_browser
+ 
+         register_browser(mcp)
+-        # Get browser tool names
+-        browser_tools = [name for name in mcp._tool_manager._tools.keys() if name.startswith("browser_")]
++        # Get browser tool names (FastMCP v2/v3 compatibility)
++        manager = getattr(mcp, "_tool_manager", None)
++        if manager is not None and hasattr(manager, "_tools"):
++            browser_tools = [name for name in manager._tools.keys() if name.startswith("browser_")]
++        else:
++            tools = asyncio.run(mcp.list_tools())
++            browser_tools = [
++                str(getattr(t, "name", ""))
++                for t in (tools or [])
++                if str(getattr(t, "name", "")).startswith("browser_")
++            ]
+         registered.extend(browser_tools)
+ 
+     # Future capabilities (not yet implemented)
+diff --git a/tools/tests/test_coder_tools_server.py b/tools/tests/test_coder_tools_server.py
+index aec7a4bb..e1ebea9c 100644
+--- a/tools/tests/test_coder_tools_server.py
++++ b/tools/tests/test_coder_tools_server.py
+@@ -18,9 +18,9 @@ def _load_coder_tools_server():
+ 
+ def _install_fake_framework(monkeypatch, tools_by_server: dict[str, list[dict]]) -> None:
+     framework_mod = types.ModuleType("framework")
+-    loader_mod = types.ModuleType("framework.loader")
+-    mcp_client_mod = types.ModuleType("framework.loader.mcp_client")
+-    tool_registry_mod = types.ModuleType("framework.loader.tool_registry")
++    runner_mod = types.ModuleType("framework.runner")
++    mcp_client_mod = types.ModuleType("framework.runner.mcp_client")
++    tool_registry_mod = types.ModuleType("framework.runner.tool_registry")
+ 
+     class FakeMCPServerConfig:
+         def __init__(self, **kwargs):
+@@ -62,14 +62,14 @@ def resolve_mcp_stdio_config(config: dict, _config_dir: Path) -> dict:
+     mcp_client_mod.MCPServerConfig = FakeMCPServerConfig
+     tool_registry_mod.ToolRegistry = FakeToolRegistry
+ 
+-    framework_mod.loader = loader_mod
+-    loader_mod.mcp_client = mcp_client_mod
+-    loader_mod.tool_registry = tool_registry_mod
++    framework_mod.runner = runner_mod
++    runner_mod.mcp_client = mcp_client_mod
++    runner_mod.tool_registry = tool_registry_mod
+ 
+     monkeypatch.setitem(sys.modules, "framework", framework_mod)
+-    monkeypatch.setitem(sys.modules, "framework.loader", loader_mod)
+-    monkeypatch.setitem(sys.modules, "framework.loader.mcp_client", mcp_client_mod)
+-    monkeypatch.setitem(sys.modules, "framework.loader.tool_registry", tool_registry_mod)
++    monkeypatch.setitem(sys.modules, "framework.runner", runner_mod)
++    monkeypatch.setitem(sys.modules, "framework.runner.mcp_client", mcp_client_mod)
++    monkeypatch.setitem(sys.modules, "framework.runner.tool_registry", tool_registry_mod)
+ 
+ 
+ def _call_list_agent_tools(mod, **kwargs) -> str:
+@@ -164,3 +164,178 @@ def test_list_agent_tools_provider_filter_and_legacy_prefix_filter(monkeypatch,
+     legacy_data = json.loads(legacy_raw)
+     assert list(legacy_data["tools_by_provider"].keys()) == ["google"]
+     assert legacy_data["all_tool_names"] == ["gmail_list_messages"]
++
++
++def test_list_agent_tools_summary_all_reports_credentials_status(monkeypatch, tmp_path):
++    _install_fake_framework(
++        monkeypatch,
++        tools_by_server={
++            "fake-server": [
++                {"name": "gmail_list_messages", "description": "Read Gmail"},
++                {"name": "send_email", "description": "Send email"},
++                {"name": "slack_send_message", "description": "Send Slack message"},
++            ]
++        },
++    )
++    mod = _load_coder_tools_server()
++    mod.PROJECT_ROOT = str(tmp_path)
++
++    config_path = tmp_path / "mcp_servers.json"
++    config_path.write_text(
++        json.dumps({"fake-server": {"transport": "stdio", "command": "noop", "args": []}}),
++        encoding="utf-8",
++    )
++
++    monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "test-google")
++    monkeypatch.delenv("RESEND_API_KEY", raising=False)
++    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
++
++    raw = _call_list_agent_tools(
++        mod,
++        server_config_path="mcp_servers.json",
++        output_schema="summary",
++        group="all",
++    )
++    data = json.loads(raw)
++    providers = data["providers"]
++
++    assert "google" in providers
++    assert providers["google"]["credentials_required"] == ["google"]
++    assert providers["google"]["credentials_available"] is True
++
++    assert "resend" in providers
++    assert providers["resend"]["credentials_required"] == ["resend"]
++    assert providers["resend"]["credentials_available"] is False
++
++    assert "slack" in providers
++    assert providers["slack"]["credentials_required"] == ["slack"]
++    assert providers["slack"]["credentials_available"] is False
++
++
++def test_list_agent_tools_available_filter_supports_multi_provider_tools(monkeypatch, tmp_path):
++    _install_fake_framework(
++        monkeypatch,
++        tools_by_server={
++            "fake-server": [
++                {"name": "send_email", "description": "Send email"},
++                {"name": "web_scrape", "description": "Scrape a page"},
++            ]
++        },
++    )
++    mod = _load_coder_tools_server()
++    mod.PROJECT_ROOT = str(tmp_path)
++
++    config_path = tmp_path / "mcp_servers.json"
++    config_path.write_text(
++        json.dumps({"fake-server": {"transport": "stdio", "command": "noop", "args": []}}),
++        encoding="utf-8",
++    )
++
++    monkeypatch.setenv("GOOGLE_ACCESS_TOKEN", "test-google")
++    monkeypatch.delenv("RESEND_API_KEY", raising=False)
++
++    available_raw = _call_list_agent_tools(
++        mod,
++        server_config_path="mcp_servers.json",
++        output_schema="names",
++        credentials="available",
++    )
++    available = json.loads(available_raw)
++    available_names = set()
++    for provider in available["tools_by_provider"].values():
++        available_names.update(provider["tool_names"])
++    assert "send_email" in available_names
++
++    unavailable_raw = _call_list_agent_tools(
++        mod,
++        server_config_path="mcp_servers.json",
++        output_schema="names",
++        credentials="unavailable",
++    )
++    unavailable = json.loads(unavailable_raw)
++    unavailable_names = set()
++    for provider in unavailable["tools_by_provider"].values():
++        unavailable_names.update(provider["tool_names"])
++    assert "send_email" not in unavailable_names
++
++
++def test_list_agent_tools_multi_provider_tool_unavailable_when_no_provider_creds(
++    monkeypatch, tmp_path
++):
++    _install_fake_framework(
++        monkeypatch,
++        tools_by_server={
++            "fake-server": [
++                {"name": "send_email", "description": "Send email"},
++            ]
++        },
++    )
++    mod = _load_coder_tools_server()
++    mod.PROJECT_ROOT = str(tmp_path)
++
++    config_path = tmp_path / "mcp_servers.json"
++    config_path.write_text(
++        json.dumps({"fake-server": {"transport": "stdio", "command": "noop", "args": []}}),
++        encoding="utf-8",
++    )
++
++    monkeypatch.delenv("GOOGLE_ACCESS_TOKEN", raising=False)
++    monkeypatch.delenv("RESEND_API_KEY", raising=False)
++
++    available_raw = _call_list_agent_tools(
++        mod,
++        server_config_path="mcp_servers.json",
++        output_schema="names",
++        credentials="available",
++    )
++    available = json.loads(available_raw)
++    available_names = set()
++    for provider in available["tools_by_provider"].values():
++        available_names.update(provider["tool_names"])
++    assert "send_email" not in available_names
++
++    unavailable_raw = _call_list_agent_tools(
++        mod,
++        server_config_path="mcp_servers.json",
++        output_schema="names",
++        credentials="unavailable",
++    )
++    unavailable = json.loads(unavailable_raw)
++    unavailable_names = set()
++    for provider in unavailable["tools_by_provider"].values():
++        unavailable_names.update(provider["tool_names"])
++    assert "send_email" in unavailable_names
++
++
++def test_resolve_path_allows_extra_roots_from_env(monkeypatch, tmp_path):
++    mod = _load_coder_tools_server()
++    project_root = tmp_path / "project-root"
++    project_root.mkdir(parents=True, exist_ok=True)
++    extra_root = tmp_path / "extra-root"
++    extra_root.mkdir(parents=True, exist_ok=True)
++    target = extra_root / "repo"
++    target.mkdir(parents=True, exist_ok=True)
++
++    mod.PROJECT_ROOT = str(project_root)
++    monkeypatch.setenv("CODER_TOOLS_ALLOWED_PATHS", str(extra_root))
++
++    resolved = mod._resolve_path(str(target))
++    assert resolved == str(target.resolve())
++
++
++def test_resolve_path_denies_outside_roots_without_env(monkeypatch, tmp_path):
++    mod = _load_coder_tools_server()
++    project_root = tmp_path / "project-root"
++    project_root.mkdir(parents=True, exist_ok=True)
++    outside = tmp_path / "outside"
++    outside.mkdir(parents=True, exist_ok=True)
++
++    mod.PROJECT_ROOT = str(project_root)
++    monkeypatch.delenv("CODER_TOOLS_ALLOWED_PATHS", raising=False)
++
++    try:
++        mod._resolve_path(str(outside))
++    except ValueError as e:
++        assert "outside allowed roots" in str(e)
++    else:
++        raise AssertionError("expected ValueError for path outside allowed roots")
+diff --git a/tools/tests/tools/test_github_tool.py b/tools/tests/tools/test_github_tool.py
+index 27f69c98..3f0f1926 100644
+--- a/tools/tests/tools/test_github_tool.py
++++ b/tools/tests/tools/test_github_tool.py
+@@ -172,7 +172,9 @@ def test_create_issue(self, mock_post):
+         }
+         mock_post.return_value = mock_response
+ 
+-        result = self.client.create_issue("owner", "repo", "New Issue", body="Description", labels=["bug"])
++        result = self.client.create_issue(
++            "owner", "repo", "New Issue", body="Description", labels=["bug"]
++        )
+ 
+         assert result["success"] is True
+         assert result["data"]["number"] == 42
+@@ -195,6 +197,30 @@ def test_update_issue(self, mock_patch):
+         assert result["success"] is True
+         assert result["data"]["state"] == "closed"
+ 
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
++    def test_list_issue_comments(self, mock_get):
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.json.return_value = [{"id": 1, "body": "Comment"}]
++        mock_get.return_value = mock_response
++
++        result = self.client.list_issue_comments("owner", "repo", 1)
++
++        assert result["success"] is True
++        assert len(result["data"]) == 1
++
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
++    def test_create_issue_comment(self, mock_post):
++        mock_response = MagicMock()
++        mock_response.status_code = 201
++        mock_response.json.return_value = {"id": 11, "body": "New comment"}
++        mock_post.return_value = mock_response
++
++        result = self.client.create_issue_comment("owner", "repo", 1, "New comment")
++
++        assert result["success"] is True
++        assert result["data"]["id"] == 11
++
+     @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+     def test_list_pull_requests(self, mock_get):
+         mock_response = MagicMock()
+@@ -244,6 +270,68 @@ def test_create_pull_request(self, mock_post):
+         assert result["success"] is True
+         assert result["data"]["number"] == 10
+ 
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
++    def test_list_pull_request_reviews(self, mock_get):
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.json.return_value = [{"id": 1, "state": "COMMENTED"}]
++        mock_get.return_value = mock_response
++
++        result = self.client.list_pull_request_reviews("owner", "repo", 10)
++
++        assert result["success"] is True
++        assert len(result["data"]) == 1
++
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
++    def test_list_pull_request_review_comments(self, mock_get):
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.json.return_value = [{"id": 2, "path": "src/a.ts"}]
++        mock_get.return_value = mock_response
++
++        result = self.client.list_pull_request_review_comments("owner", "repo", 10)
++
++        assert result["success"] is True
++        assert len(result["data"]) == 1
++
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
++    def test_create_pull_request_review(self, mock_post):
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.json.return_value = {"id": 99, "state": "COMMENTED"}
++        mock_post.return_value = mock_response
++
++        result = self.client.create_pull_request_review(
++            "owner",
++            "repo",
++            10,
++            body="Looks good",
++            event="COMMENT",
++        )
++
++        assert result["success"] is True
++        assert result["data"]["id"] == 99
++
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
++    def test_create_pull_request_review_comment(self, mock_post):
++        mock_response = MagicMock()
++        mock_response.status_code = 201
++        mock_response.json.return_value = {"id": 101, "path": "src/main.ts"}
++        mock_post.return_value = mock_response
++
++        result = self.client.create_pull_request_review_comment(
++            "owner",
++            "repo",
++            10,
++            body="Please fix this",
++            commit_id="abc123",
++            path="src/main.ts",
++            line=12,
++        )
++
++        assert result["success"] is True
++        assert result["data"]["id"] == 101
++
+     @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+     def test_search_code(self, mock_get):
+         mock_response = MagicMock()
+@@ -349,6 +437,26 @@ def test_credential_store_token(self, mcp):
+             call_headers = mock_get.call_args.kwargs["headers"]
+             assert call_headers["Authorization"] == "Bearer ghp_store_token"
+ 
++    def test_credential_decrypt_failure_falls_back_to_env(self, mcp):
++        """If credential decryption fails, fallback to GITHUB_TOKEN env."""
++        mock_credentials = MagicMock()
++        mock_credentials.get.side_effect = ValueError("Failed to decrypt credential")
++
++        with patch("os.getenv", return_value="ghp_env_fallback"):
++            with patch("aden_tools.tools.github_tool.github_tool.httpx.get") as mock_get:
++                mock_response = MagicMock()
++                mock_response.status_code = 200
++                mock_response.json.return_value = []
++                mock_get.return_value = mock_response
++
++                register_tools(mcp, credentials=mock_credentials)
++                list_repos = mcp._tool_manager._tools["github_list_repos"].fn
++
++                list_repos()
++
++                call_headers = mock_get.call_args.kwargs["headers"]
++                assert call_headers["Authorization"] == "Bearer ghp_env_fallback"
++
+ 
+ # --- MCP Tool function tests ---
+ 
+@@ -507,6 +615,36 @@ def test_update_issue_success(self, mock_patch, mcp):
+ 
+             assert result["success"] is True
+ 
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
++    def test_list_issue_comments_success(self, mock_get, mcp):
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.json.return_value = [{"id": 1, "body": "comment"}]
++        mock_get.return_value = mock_response
++
++        with patch("os.getenv", return_value="ghp_test"):
++            register_tools(mcp, credentials=None)
++            list_comments = mcp._tool_manager._tools["github_list_issue_comments"].fn
++
++            result = list_comments(owner="owner", repo="repo", issue_number=1)
++
++            assert result["success"] is True
++
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
++    def test_create_issue_comment_success(self, mock_post, mcp):
++        mock_response = MagicMock()
++        mock_response.status_code = 201
++        mock_response.json.return_value = {"id": 1, "body": "comment"}
++        mock_post.return_value = mock_response
++
++        with patch("os.getenv", return_value="ghp_test"):
++            register_tools(mcp, credentials=None)
++            create_comment = mcp._tool_manager._tools["github_create_issue_comment"].fn
++
++            result = create_comment(owner="owner", repo="repo", issue_number=1, body="comment")
++
++            assert result["success"] is True
++
+ 
+ class TestGitHubPullRequests:
+     @pytest.fixture
+@@ -564,6 +702,84 @@ def test_create_pull_request_success(self, mock_post, mcp):
+ 
+             assert result["success"] is True
+ 
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
++    def test_list_pull_request_reviews_success(self, mock_get, mcp):
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.json.return_value = [{"id": 1, "state": "COMMENTED"}]
++        mock_get.return_value = mock_response
++
++        with patch("os.getenv", return_value="ghp_test"):
++            register_tools(mcp, credentials=None)
++            list_reviews = mcp._tool_manager._tools["github_list_pull_request_reviews"].fn
++
++            result = list_reviews(owner="owner", repo="repo", pull_number=1)
++
++            assert result["success"] is True
++
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
++    def test_list_pull_request_review_comments_success(self, mock_get, mcp):
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.json.return_value = [{"id": 2, "path": "src/main.ts"}]
++        mock_get.return_value = mock_response
++
++        with patch("os.getenv", return_value="ghp_test"):
++            register_tools(mcp, credentials=None)
++            list_review_comments = mcp._tool_manager._tools[
++                "github_list_pull_request_review_comments"
++            ].fn
++
++            result = list_review_comments(owner="owner", repo="repo", pull_number=1)
++
++            assert result["success"] is True
++
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
++    def test_create_pull_request_review_success(self, mock_post, mcp):
++        mock_response = MagicMock()
++        mock_response.status_code = 200
++        mock_response.json.return_value = {"id": 9, "state": "COMMENTED"}
++        mock_post.return_value = mock_response
++
++        with patch("os.getenv", return_value="ghp_test"):
++            register_tools(mcp, credentials=None)
++            create_review = mcp._tool_manager._tools["github_create_pull_request_review"].fn
++
++            result = create_review(
++                owner="owner",
++                repo="repo",
++                pull_number=1,
++                body="Looks good",
++                event="COMMENT",
++            )
++
++            assert result["success"] is True
++
++    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
++    def test_create_pull_request_review_comment_success(self, mock_post, mcp):
++        mock_response = MagicMock()
++        mock_response.status_code = 201
++        mock_response.json.return_value = {"id": 12, "path": "src/main.ts"}
++        mock_post.return_value = mock_response
++
++        with patch("os.getenv", return_value="ghp_test"):
++            register_tools(mcp, credentials=None)
++            create_review_comment = mcp._tool_manager._tools[
++                "github_create_pull_request_review_comment"
++            ].fn
++
++            result = create_review_comment(
++                owner="owner",
++                repo="repo",
++                pull_number=1,
++                body="Please update",
++                commit_id="abc123",
++                path="src/main.ts",
++                line=12,
++            )
++
++            assert result["success"] is True
++
+ 
+ class TestGitHubSearch:
+     @pytest.fixture

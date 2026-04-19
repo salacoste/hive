@@ -296,6 +296,9 @@ def create_app(model: str | None = None, model_profile: str | None = None) -> we
         model_profile=model_profile,
         credential_store=credential_store,
     )
+    # Compatibility aliases for routes/entrypoints still using string keys.
+    app["credential_store"] = credential_store
+    app["manager"] = app[APP_KEY_MANAGER]
 
     # Register lifecycle hooks
     app.on_startup.append(_on_startup)

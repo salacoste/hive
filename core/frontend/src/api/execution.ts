@@ -37,13 +37,11 @@ export const executionApi = {
     message: string,
     images?: { type: string; image_url: { url: string } }[],
     displayMessage?: string,
-    clientMessageId?: string,
   ) =>
     api.post<ChatResult>(`/sessions/${sessionId}/chat`, {
       message,
       ...(images?.length ? { images } : {}),
       ...(displayMessage !== undefined ? { display_message: displayMessage } : {}),
-      ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
     }),
 
   /** Queue context for the queen without triggering an LLM response. */

@@ -8,6 +8,35 @@ export interface CredentialInfo {
   updated_at: string | null;
 }
 
+export interface CredentialAccount {
+  provider: string;
+  alias: string;
+  identity: Record<string, string>;
+  source: "aden" | "local" | string;
+  credential_id: string;
+}
+
+export interface CredentialSpec {
+  credential_name: string;
+  credential_id: string;
+  env_var: string;
+  description: string;
+  help_url: string;
+  api_key_instructions: string;
+  tools: string[];
+  aden_supported: boolean;
+  direct_api_key_supported: boolean;
+  credential_key: string;
+  credential_group: string;
+  available: boolean;
+  accounts: CredentialAccount[];
+}
+
+export interface ResyncResponse {
+  synced: boolean;
+  accounts_by_provider: Record<string, CredentialAccount[]>;
+}
+
 export interface AgentCredentialRequirement {
   credential_name: string;
   credential_id: string;
@@ -25,44 +54,10 @@ export interface AgentCredentialRequirement {
   alternative_group: string | null;
 }
 
-export interface CredentialReadinessItem {
-  env_var: string;
-  available: boolean;
-}
-
-export interface CredentialReadinessSummary {
-  ready: boolean;
-  required_total: number;
-  required_available: number;
-  required_missing: number;
-  optional_total: number;
-  optional_available: number;
-  optional_missing: number;
-}
-
-export interface CredentialReadinessProvider {
-  provider: string;
-  credentials_total: number;
-  credentials_available: number;
-  credentials_missing: number;
-  env_vars: string[];
-  missing_env_vars: string[];
-}
-
-export interface CredentialReadinessResponse {
-  bundle: string;
-  required: CredentialReadinessItem[];
-  optional: CredentialReadinessItem[];
-  missing: {
-    required: string[];
-    optional: string[];
-  };
-  summary: CredentialReadinessSummary;
-  providers: CredentialReadinessProvider[];
-  checked_at: string;
-}
-
 export const credentialsApi = {
+  listSpecs: () =>
+    api.get<{ specs: CredentialSpec[]; has_aden_key: boolean }>("/credentials/specs"),
+
   list: () =>
     api.get<{ credentials: CredentialInfo[] }>("/credentials"),
 
@@ -84,8 +79,12 @@ export const credentialsApi = {
       { agent_path: agentPath },
     ),
 
-  readiness: (bundle = "local_pro_stack") =>
-    api.get<CredentialReadinessResponse>(
-      `/credentials/readiness?bundle=${encodeURIComponent(bundle)}`,
+  resync: () =>
+    api.post<ResyncResponse>("/credentials/resync", {}),
+
+  validateKey: (providerId: string, apiKey: string) =>
+    api.post<{ valid: boolean | null; message: string }>(
+      "/credentials/validate-key",
+      { provider_id: providerId, api_key: apiKey },
     ),
 };

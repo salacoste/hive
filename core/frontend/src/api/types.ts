@@ -2,9 +2,8 @@
 
 export interface LiveSession {
   session_id: string;
-  project_id?: string;
-  graph_id: string | null;
-  graph_name: string | null;
+  colony_id: string | null;
+  colony_name: string | null;
   has_worker: boolean;
   agent_path: string;
   description: string;
@@ -13,74 +12,37 @@ export interface LiveSession {
   loaded_at: number;
   uptime_seconds: number;
   intro_message?: string;
-  /** Queen operating phase — "planning", "building", "staging", or "running" */
-  queen_phase?: "planning" | "building" | "staging" | "running";
+  /** Queen operating phase — "independent" (DM), "working" (workers running), or "reviewing" (workers done) */
+  queen_phase?: "independent" | "working" | "reviewing";
   /** Whether the queen's LLM supports image content in messages */
   queen_supports_images?: boolean;
+  /** Selected queen identity ID (e.g. "queen_technology") */
+  queen_id?: string | null;
+  /** Selected queen display name (e.g. "Alexandra") */
+  queen_name?: string | null;
   /** Present in 409 conflict responses when worker is still loading */
   loading?: boolean;
 }
 
 export interface LiveSessionDetail extends LiveSession {
   entry_points?: EntryPoint[];
-  graphs?: string[];
+  colonies?: string[];
   /** True when the session exists on disk but is not live (server restarted). */
   cold?: boolean;
 }
 
-export interface ProjectInfo {
-  id: string;
-  name: string;
-  description?: string;
-  repository?: string;
-  max_concurrent_runs?: number | null;
-  policy_overrides?: {
-    risk_tier?: "low" | "medium" | "high" | "critical";
-    retry_limit_per_stage?: number | null;
-    budget_limit_usd_monthly?: number | null;
-  } | null;
-  policy_binding?: {
-    risk_tier?: "low" | "medium" | "high" | "critical";
-    retry_limit_per_stage?: number | null;
-    budget_limit_usd_monthly?: number | null;
-  } | null;
-  execution_template?: {
-    default_flow?: Array<{
-      stage: string;
-      mode: string;
-      model_profile: string;
-    }>;
-    retry_policy?: {
-      max_retries_per_stage?: number | null;
-      escalate_on?: string[];
-    };
-    github?: {
-      default_ref?: string | null;
-      default_branch?: string | null;
-      ref?: string | null;
-      branch?: string | null;
-      no_checks_policy?: "error" | "success" | "manual_pending" | "manual" | "defer" | "pass" | "ok" | null;
-    };
-    default_ref?: string | null;
-    default_branch?: string | null;
-    ref?: string | null;
-    branch?: string | null;
-    no_checks_policy?: "error" | "success" | "manual_pending" | "manual" | "defer" | "pass" | "ok" | null;
-  } | null;
-  retention_policy?: {
-    history_days?: number | null;
-    min_sessions_to_keep?: number | null;
-    archive_enabled?: boolean;
-    archive_root?: string | null;
-  } | null;
-  toolchain_profile?: {
-    pending_plan?: Record<string, unknown> | null;
-    approved_plan?: Record<string, unknown> | null;
-    last_plan?: Record<string, unknown> | null;
-    updated_at?: number;
-  } | null;
+export interface HistorySession {
+  session_id: string;
+  cold: boolean;
+  live: boolean;
+  has_messages: boolean;
   created_at: number;
-  updated_at: number;
+  last_active_at?: number;
+  agent_name?: string | null;
+  agent_path?: string | null;
+  queen_id?: string | null;
+  last_message?: string | null;
+  message_count?: number;
 }
 
 export interface EntryPoint {
@@ -95,6 +57,17 @@ export interface EntryPoint {
   next_fire_in?: number;
 }
 
+export interface WorkerEntry {
+  name: string;
+  config_path: string;
+  description: string;
+  tool_count: number;
+  task: string;
+  spawned_at: string;
+  queen_name: string;
+  colony_name: string;
+}
+
 export interface DiscoverEntry {
   path: string;
   name: string;
@@ -107,6 +80,7 @@ export interface DiscoverEntry {
   tags: string[];
   last_active: string | null;
   is_loaded: boolean;
+  workers: WorkerEntry[];
 }
 
 /** Keyed by category name. */
@@ -153,7 +127,7 @@ export interface Message {
   [key: string]: unknown;
 }
 
-// --- Graph / Node types ---
+// --- Worker / Node types ---
 
 export interface NodeSpec {
   id: string;
@@ -201,56 +175,6 @@ export interface GraphTopology {
   edges: GraphEdge[];
   entry_node: string;
   entry_points?: EntryPoint[];
-}
-
-// --- Draft graph types (planning phase) ---
-
-export interface DraftNode {
-  id: string;
-  name: string;
-  description: string;
-  node_type: string;
-  tools: string[];
-  input_keys: string[];
-  output_keys: string[];
-  success_criteria: string;
-  sub_agents: string[];
-  /** For decision nodes: the yes/no question evaluated during dissolution. */
-  decision_clause?: string;
-  flowchart_type: string;
-  flowchart_shape: string;
-  flowchart_color: string;
-}
-
-export interface DraftEdge {
-  id: string;
-  source: string;
-  target: string;
-  condition: string;
-  description: string;
-  /** Short label shown on the flowchart edge (e.g. "Yes", "No"). */
-  label?: string;
-}
-
-export interface DraftGraph {
-  agent_name: string;
-  goal: string;
-  description: string;
-  success_criteria: string[];
-  constraints: string[];
-  nodes: DraftNode[];
-  edges: DraftEdge[];
-  entry_node: string;
-  terminal_nodes: string[];
-  flowchart_legend: Record<string, { shape: string; color: string }>;
-}
-
-/** Mapping from runtime graph nodes → original flowchart draft nodes. */
-export interface FlowchartMap {
-  /** runtime_node_id → list of original draft node IDs it absorbed. */
-  map: Record<string, string[]> | null;
-  /** Original draft graph preserved before planning-node dissolution (decision + subagent). */
-  original_draft: DraftGraph | null;
 }
 
 export interface NodeCriteria {
@@ -319,6 +243,7 @@ export type EventTypeName =
   | "node_action_plan"
   | "llm_text_delta"
   | "llm_reasoning_delta"
+  | "llm_turn_complete"
   | "tool_call_started"
   | "tool_call_completed"
   | "client_output_delta"
@@ -329,26 +254,24 @@ export type EventTypeName =
   | "node_stalled"
   | "node_tool_doom_loop"
   | "judge_verdict"
-  | "output_key_set"
   | "node_retry"
-  | "edge_traversed"
   | "context_compacted"
   | "context_usage_updated"
   | "webhook_received"
   | "custom"
   | "escalation_requested"
-  | "worker_graph_loaded"
+  | "worker_colony_loaded"
+  | "colony_created"
   | "credentials_required"
   | "queen_phase_changed"
   | "subagent_report"
-  | "draft_graph_updated"
-  | "flowchart_map_updated"
   | "trigger_available"
   | "trigger_activated"
   | "trigger_deactivated"
   | "trigger_fired"
   | "trigger_removed"
-  | "trigger_updated";
+  | "trigger_updated"
+  | "queen_identity_selected";
 
 export interface AgentEvent {
   type: EventTypeName;
@@ -358,6 +281,6 @@ export interface AgentEvent {
   data: Record<string, unknown>;
   timestamp: string;
   correlation_id: string | null;
-  graph_id: string | null;
+  colony_id: string | null;
   run_id?: string | null;
 }

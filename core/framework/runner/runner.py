@@ -2346,8 +2346,3 @@ class AgentRunner:
     def __del__(self) -> None:
         """Destructor - cleanup temp dir."""
         self.cleanup()
-
-
-# Backward-compatibility shim for loader public surface.
-# Loader package exports AgentLoader, while implementation class remains AgentRunner.
-AgentLoader = AgentRunner

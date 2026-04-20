@@ -73,6 +73,8 @@ export interface ChatMessage {
   streamId?: string;
   /** True when the message was sent while the queen was still processing */
   queued?: boolean;
+  /** Client-side id used to reconcile optimistic user message echoes from SSE */
+  clientMessageId?: string;
 }
 
 interface ChatPanelProps {

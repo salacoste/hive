@@ -325,6 +325,19 @@ export default function ColonyChat() {
           );
         }
         if (options?.reconcileOptimisticUser && chatMsg.type === "user" && prev.length > 0) {
+          const incomingClientMessageId = chatMsg.clientMessageId?.trim();
+          if (incomingClientMessageId) {
+            const byClientIdIdx = prev.findIndex(
+              (m) =>
+                m.type === "user" &&
+                (m.clientMessageId?.trim() || "") === incomingClientMessageId,
+            );
+            if (byClientIdIdx !== -1) {
+              return prev.map((m, i) =>
+                i === byClientIdIdx ? { ...m, id: chatMsg.id, queued: undefined } : m,
+              );
+            }
+          }
           // Match by content + timestamp across the whole list (not just
           // the last slot) so a queued user message still reconciles
           // even when the queen's previous reply slotted in between.
@@ -1194,8 +1207,9 @@ export default function ColonyChat() {
         });
       }
 
+      const clientMessageId = makeId();
       const userMsg: ChatMessage = {
-        id: makeId(),
+        id: clientMessageId,
         agent: "You",
         agentColor: "",
         content: text,
@@ -1204,13 +1218,16 @@ export default function ColonyChat() {
         thread: agentPath,
         createdAt: Date.now(),
         images,
+        clientMessageId,
       };
       setMessages((prev) => [...prev, userMsg]);
       suppressIntroRef.current = false;
       updateState({ isTyping: true, queenIsTyping: true });
 
       if (agentState.sessionId && agentState.ready) {
-        executionApi.chat(agentState.sessionId, text, images).catch((err: unknown) => {
+        executionApi
+          .chat(agentState.sessionId, text, images, undefined, clientMessageId)
+          .catch((err: unknown) => {
           const errMsg = err instanceof Error ? err.message : String(err);
           upsertMessage({
             id: makeId(),
@@ -1223,7 +1240,7 @@ export default function ColonyChat() {
             createdAt: Date.now(),
           });
           updateState({ isTyping: false, isStreaming: false, queenIsTyping: false });
-        });
+          });
       }
     },
     [agentPath, agentState.sessionId, agentState.ready, agentState.pendingQuestionSource, updateState, upsertMessage],

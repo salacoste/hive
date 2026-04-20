@@ -1,0 +1,87 @@
+name: Docker Compose Smoke
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-compose-smoke:
+    name: Docker Compose Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare CI .env
+        run: |
+          cp .env.mcp.example .env
+          cat >> .env <<'EOF'
+          HIVE_CREDENTIAL_KEY=ci-smoke-key
+          HIVE_TELEGRAM_BRIDGE_ENABLED=0
+          HIVE_SCHEDULER_AUTO_START=false
+          HIVE_SCHEDULER_AUTONOMOUS_ENABLED=false
+          OPENAI_API_KEY=ci-smoke-key
+          ANTHROPIC_API_KEY=ci-smoke-key
+          GEMINI_API_KEY=ci-smoke-key
+          ZAI_API_KEY=ci-smoke-key
+          GITHUB_TOKEN=ci-smoke-token
+          BRAVE_SEARCH_API_KEY=ci-smoke-token
+          GOOGLE_ACCESS_TOKEN=ci-smoke-token
+          DATABASE_URL=postgresql://hive:hive@postgres:5432/hive
+          REDIS_URL=redis://redis:6379/0
+          EOF
+
+      - name: Build and start hive-core stack
+        run: |
+          docker compose down --remove-orphans || true
+          docker compose up -d --build hive-core
+
+      - name: Wait for health
+        run: |
+          status=""
+          for _ in $(seq 1 60); do
+            status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' hive-core 2>/dev/null || true)
+            if [ "$status" = "healthy" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$status" != "healthy" ]; then
+            echo "hive-core health status: ${status:-unknown}"
+            docker compose ps
+            docker compose logs --tail=200 hive-core redis postgres || true
+            exit 1
+          fi
+
+      - name: API smoke checks
+        run: |
+          curl -fsS http://localhost:8787/api/health | tee /tmp/hive-health.json >/dev/null
+          jq -e '.status == "ok"' /tmp/hive-health.json >/dev/null
+
+          curl -fsS http://localhost:8787/api/projects | tee /tmp/hive-projects.json >/dev/null
+          jq -e '.projects != null' /tmp/hive-projects.json >/dev/null
+
+          curl -fsS "http://localhost:8787/api/autonomous/ops/status?project_id=default&include_runs=true" | tee /tmp/hive-ops.json >/dev/null
+          jq -e '.summary != null and .alerts != null' /tmp/hive-ops.json >/dev/null
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --tail=300 hive-core redis postgres || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose down --remove-orphans -v

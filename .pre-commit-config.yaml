@@ -16,3 +16,9 @@ repos:
       - id: ruff-format
         name: ruff format (tools)
         files: ^tools/
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.2
+    hooks:
+      - id: gitleaks
+        name: gitleaks staged secrets scan

@@ -1,4 +1,4 @@
-.PHONY: lint format check test test-tools test-live test-all install-hooks help frontend-install frontend-dev frontend-build
+.PHONY: lint format check test test-tools test-live test-all install-hooks hooks-run help frontend-install frontend-dev frontend-build
 
 # ── Ensure uv is findable in Git Bash on Windows ──────────────────────────────
 # uv installs to ~/.local/bin on Windows/Linux/macOS. Git Bash may not include
@@ -43,8 +43,16 @@ test-all: ## Run everything including live tests
 	cd tools && uv run python -m pytest -m live -s -o "addopts=" --log-cli-level=INFO
 
 install-hooks: ## Install pre-commit hooks
-	uv pip install pre-commit
-	pre-commit install
+	@if ! command -v pre-commit >/dev/null 2>&1; then \
+		uv tool install pre-commit; \
+	fi
+	pre-commit install --install-hooks
+
+hooks-run: ## Run pre-commit hooks on all files
+	@if ! command -v pre-commit >/dev/null 2>&1; then \
+		uv tool install pre-commit; \
+	fi
+	pre-commit run --all-files
 
 frontend-install: ## Install frontend npm packages
 	cd core/frontend && npm install

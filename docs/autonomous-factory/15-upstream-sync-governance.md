@@ -41,6 +41,20 @@ No skipping or reordering in one merge batch.
 6. Preferred wrapper:
    - `./scripts/upstream_sync_preflight.sh [target_ref]`
 
+## Automated Drift Watch
+
+Use the automated drift watch before replay planning:
+
+1. Local/manual:
+   - `./scripts/upstream_sync_watch.sh --output /tmp/upstream-sync-watch.md --json /tmp/upstream-sync-watch.json`
+2. CI/scheduled:
+   - GitHub Actions workflow: `.github/workflows/upstream-sync-watch.yml`
+   - runs daily and on manual dispatch, compares `origin/main` vs `upstream/main`,
+     uploads markdown + JSON artifacts.
+3. Optional strict mode:
+   - `HIVE_UPSTREAM_FAIL_IF_BEHIND=1 ./scripts/upstream_sync_watch.sh`
+   - exits non-zero when local base is behind upstream.
+
 ## Merge Execution Rules
 
 1. One backlog item = one bounded merge objective with explicit validation evidence.

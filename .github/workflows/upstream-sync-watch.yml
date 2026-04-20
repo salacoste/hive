@@ -1,0 +1,55 @@
+name: Upstream Sync Watch
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 4 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift-report:
+    name: Upstream Drift Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/aden-hive/hive.git 2>/dev/null || true
+          git fetch --prune origin main
+          git fetch --prune upstream main
+
+      - name: Generate upstream sync report
+        run: |
+          chmod +x ./scripts/upstream_sync_watch.sh
+          ./scripts/upstream_sync_watch.sh \
+            --output /tmp/upstream-sync-watch.md \
+            --json /tmp/upstream-sync-watch.json
+
+      - name: Upload report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync-watch
+          path: |
+            /tmp/upstream-sync-watch.md
+            /tmp/upstream-sync-watch.json

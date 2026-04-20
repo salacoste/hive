@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from framework.server.telegram_bridge import TelegramBridge
+from framework.runtime.event_bus import EventType
 
 
 class _DummyManager:
@@ -1041,3 +1042,50 @@ async def test_client_input_received_auto_binds_fallback_test_chat(
 
     assert bridge._chat_session.get("188207447") == "session-x"
     assert sent == [("188207447", "🌐 Web user: Deploy this repo")]
+
+
+@pytest.mark.asyncio
+async def test_ensure_bound_session_subscribes_immediately_for_mirroring() -> None:
+    class _RecordingEventBus:
+        def __init__(self) -> None:
+            self.calls: list[tuple[EventType, ...]] = []
+
+        def subscribe(self, event_types: list[EventType], handler: Any) -> str:
+            self.calls.append(tuple(event_types))
+            return f"sub-{len(self.calls)}"
+
+    class _Session:
+        def __init__(self) -> None:
+            self.id = "session-a"
+            self.event_bus = _RecordingEventBus()
+
+    class _Manager:
+        def __init__(self, session: _Session) -> None:
+            self._session = session
+
+        def default_project_id(self) -> str:
+            return "default"
+
+        def list_projects(self) -> list[dict[str, str]]:
+            return [{"id": "default", "name": "Default"}]
+
+        def get_session(self, session_id: str) -> Any | None:
+            if session_id == self._session.id:
+                return self._session
+            return None
+
+    session = _Session()
+    bridge = TelegramBridge(_Manager(session))
+    bridge._bind_chat("42", "session-a")
+
+    sid, _ = await bridge._ensure_bound_session("42")
+
+    assert sid == "session-a"
+    assert "session-a" in bridge._subs
+    assert len(bridge._subs["session-a"]) == 4
+    assert session.event_bus.calls == [
+        (EventType.CLIENT_OUTPUT_DELTA,),
+        (EventType.LLM_TURN_COMPLETE,),
+        (EventType.CLIENT_INPUT_REQUESTED,),
+        (EventType.CLIENT_INPUT_RECEIVED,),
+    ]

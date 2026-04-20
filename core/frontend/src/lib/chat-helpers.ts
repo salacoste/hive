@@ -147,6 +147,9 @@ export function sseEventToChatMessage(
     case "client_input_received": {
       const userContent = (event.data?.content as string) || "";
       if (!userContent) return null;
+      const clientMessageIdRaw = event.data?.client_message_id;
+      const clientMessageId =
+        typeof clientMessageIdRaw === "string" ? clientMessageIdRaw.trim() : "";
       return {
         id: `user-input-${event.timestamp}`,
         agent: "You",
@@ -157,6 +160,7 @@ export function sseEventToChatMessage(
         thread,
         createdAt,
         streamId: event.stream_id || undefined,
+        clientMessageId: clientMessageId || undefined,
       };
     }
 

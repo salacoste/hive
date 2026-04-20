@@ -538,6 +538,15 @@ class TelegramBridge:
             session_id = session.id
             self._bind_chat(chat_id, session_id)
 
+        # Ensure this session is subscribed immediately, so Web-originated
+        # user input is mirrored to bound Telegram chats without waiting
+        # for the periodic sync loop.
+        try:
+            if getattr(session, "event_bus", None) is not None:
+                await self._subscribe_session(session)
+        except Exception:
+            logger.exception("Telegram bridge failed to subscribe session=%s", session_id)
+
         return session_id, session
 
     async def _inject_user_input(self, chat_id: str, text: str) -> None:

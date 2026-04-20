@@ -5974,3 +5974,33 @@ Current Focus items:
   - docker deployment green после cutover;
   - Telegram/Web operational smoke подтверждены;
   - backlog wave закрыт evidence-записями.
+
+241. `P1` Telegram/Web Timeline Consistency Hardening (Client Message IDs + Bridge Subscription Race)
+- Status: `done`
+- Scope:
+  - убрать дубли пользовательских сообщений в Web UI при delayed `client_input_received`;
+  - закрыть race, когда Web input может не зеркалиться в Telegram сразу после bind/new session.
+- Progress:
+  - frontend:
+    - `executionApi.chat(...)` расширен полем `client_message_id`;
+    - optimistic user messages в `queen-dm` и `colony-chat` теперь получают локальный `clientMessageId`;
+    - SSE map (`sseEventToChatMessage`) переносит `client_message_id` в `ChatMessage`;
+    - reconciliation логика в `queen-dm`/`colony-chat` сначала матчится по `clientMessageId`,
+      затем fallback по `content+timestamp`.
+  - backend bridge:
+    - `TelegramBridge._ensure_bound_session(...)` теперь делает immediate subscribe
+      к event bus сессии (без ожидания periodic sync loop), чтобы не терять первые
+      `CLIENT_INPUT_RECEIVED` зеркалирования из Web в Telegram.
+  - tests:
+    - добавлен unit test:
+      `test_ensure_bound_session_subscribes_immediately_for_mirroring`.
+    - расширен frontend test:
+      `captures client_message_id for optimistic user reconciliation`.
+  - verification:
+    - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -q` -> `34 passed`;
+    - `npm --prefix core/frontend run test -- src/lib/chat-helpers.test.ts` -> `36 passed`;
+    - `./scripts/check_runtime_parity.sh` -> `runtime parity check passed`.
+- Done when:
+  - Web не дублирует optimistic user rows при echo из backend;
+  - Web->Telegram mirror стабилен сразу после bind/new session;
+  - профильные backend/frontend tests green.

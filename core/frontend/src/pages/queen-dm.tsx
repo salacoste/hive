@@ -526,6 +526,25 @@ export default function QueenDM() {
               // message, so drop the "queued" indicator (it was set when
               // the user sent while the queen was still busy).
               if (chatMsg.type === "user" && prev.length > 0) {
+                const incomingClientMessageId = chatMsg.clientMessageId?.trim();
+                if (incomingClientMessageId) {
+                  const byClientIdIdx = prev.findIndex(
+                    (m) =>
+                      m.type === "user" &&
+                      (m.clientMessageId?.trim() || "") === incomingClientMessageId,
+                  );
+                  if (byClientIdIdx !== -1) {
+                    return prev.map((m, i) =>
+                      i === byClientIdIdx
+                        ? {
+                            ...m,
+                            id: chatMsg.id,
+                            queued: undefined,
+                          }
+                        : m,
+                    );
+                  }
+                }
                 const idx = prev.findIndex(
                   (m) =>
                     m.type === "user" &&
@@ -748,8 +767,9 @@ export default function QueenDM() {
       }
 
       const isQueenBusy = isTyping;
+      const clientMessageId = makeId();
       const userMsg: ChatMessage = {
-        id: makeId(),
+        id: clientMessageId,
         agent: "You",
         agentColor: "",
         content: text,
@@ -759,12 +779,13 @@ export default function QueenDM() {
         createdAt: Date.now(),
         images,
         queued: isQueenBusy || undefined,
+        clientMessageId,
       };
       setMessages((prev) => [...prev, userMsg]);
       setIsTyping(true);
 
       if (sessionId) {
-        executionApi.chat(sessionId, text, images).catch(() => {
+        executionApi.chat(sessionId, text, images, undefined, clientMessageId).catch(() => {
           setIsTyping(false);
           setIsStreaming(false);
         });

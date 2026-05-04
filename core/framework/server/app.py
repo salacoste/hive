@@ -221,6 +221,56 @@ async def handle_telegram_bridge_status(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "bridge": bridge.status()})
 
 
+async def handle_telegram_bridge_bindings(request: web.Request) -> web.Response:
+    """GET /api/telegram/bridge/bindings — inspect chat/project/queen/session bindings."""
+    bridge = request.app.get(APP_KEY_TELEGRAM_BRIDGE)
+    if bridge is None or not hasattr(bridge, "bindings_snapshot"):
+        return web.json_response(
+            {
+                "status": "disabled",
+                "bindings": [],
+                "known_chats_total": 0,
+                "bound_chats_total": 0,
+                "sessions_with_bound_chats_total": 0,
+            }
+        )
+    snapshot = bridge.bindings_snapshot()
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    snapshot.setdefault("bindings", [])
+    snapshot.setdefault("known_chats_total", 0)
+    snapshot.setdefault("bound_chats_total", 0)
+    snapshot.setdefault("sessions_with_bound_chats_total", 0)
+    return web.json_response({"status": "ok", **snapshot})
+
+
+async def handle_telegram_bridge_recover(request: web.Request) -> web.Response:
+    """POST /api/telegram/bridge/recover — operator-triggered recover/reset actions."""
+    bridge = request.app.get(APP_KEY_TELEGRAM_BRIDGE)
+    if bridge is None or not hasattr(bridge, "operator_recover"):
+        return web.json_response(
+            {
+                "status": "disabled",
+                "ok": False,
+                "error": "bridge_not_initialized",
+            }
+        )
+
+    body = await request.json() if request.can_read_body else {}
+    if not isinstance(body, dict):
+        body = {}
+    payload = await bridge.operator_recover(
+        force_delete_webhook=bool(body.get("force_delete_webhook", True)),
+        drop_pending_updates=bool(body.get("drop_pending_updates", False)),
+        reset_conflict_telemetry=bool(body.get("reset_conflict_telemetry", False)),
+        clear_last_error=bool(body.get("clear_last_error", True)),
+    )
+    if not isinstance(payload, dict):
+        payload = {"ok": False, "error": "invalid_bridge_response"}
+    payload.setdefault("status", "ok")
+    return web.json_response(payload)
+
+
 async def handle_browser_status(request: web.Request) -> web.Response:
     """GET /api/browser/status — proxy the GCU bridge status check server-side.
 
@@ -251,6 +301,20 @@ async def handle_browser_status(request: web.Request) -> web.Response:
         pass
 
     return web.json_response({"bridge": False, "connected": False})
+
+
+async def handle_llm_queue_status(request: web.Request) -> web.Response:
+    """GET /api/llm/queue/status — runtime queue/backoff status for LLM calls."""
+    from framework.llm.litellm import get_llm_queue_status
+    from framework.llm.fallback import get_fallback_status
+
+    return web.json_response(
+        {
+            "status": "ok",
+            "queue": get_llm_queue_status(),
+            "fallback": get_fallback_status(),
+        }
+    )
 
 
 def create_app(model: str | None = None, model_profile: str | None = None) -> web.Application:
@@ -296,9 +360,6 @@ def create_app(model: str | None = None, model_profile: str | None = None) -> we
         model_profile=model_profile,
         credential_store=credential_store,
     )
-    # Compatibility aliases for routes/entrypoints still using string keys.
-    app["credential_store"] = credential_store
-    app["manager"] = app[APP_KEY_MANAGER]
 
     # Register lifecycle hooks
     app.on_startup.append(_on_startup)
@@ -307,24 +368,41 @@ def create_app(model: str | None = None, model_profile: str | None = None) -> we
     # Health check
     app.router.add_get("/api/health", handle_health)
     app.router.add_get("/api/telegram/bridge/status", handle_telegram_bridge_status)
+    app.router.add_get("/api/telegram/bridge/bindings", handle_telegram_bridge_bindings)
+    app.router.add_post("/api/telegram/bridge/recover", handle_telegram_bridge_recover)
     app.router.add_get("/api/browser/status", handle_browser_status)
+    app.router.add_get("/api/llm/queue/status", handle_llm_queue_status)
 
     # Register route modules
     from framework.server.routes_credentials import register_routes as register_credential_routes
     from framework.server.routes_autonomous import register_routes as register_autonomous_routes
+    from framework.server.routes_colony_workers import (
+        register_routes as register_colony_worker_routes,
+    )
+    from framework.server.routes_config import register_routes as register_config_routes
     from framework.server.routes_events import register_routes as register_event_routes
     from framework.server.routes_execution import register_routes as register_execution_routes
     from framework.server.routes_graphs import register_routes as register_graph_routes
     from framework.server.routes_logs import register_routes as register_log_routes
+    from framework.server.routes_messages import register_routes as register_message_routes
     from framework.server.routes_projects import register_routes as register_project_routes
+    from framework.server.routes_prompts import register_routes as register_prompt_routes
+    from framework.server.routes_queens import register_routes as register_queen_routes
     from framework.server.routes_sessions import register_routes as register_session_routes
+    from framework.server.routes_workers import register_routes as register_worker_routes
 
     register_credential_routes(app)
     register_autonomous_routes(app)
+    register_config_routes(app)
     register_execution_routes(app)
     register_event_routes(app)
+    register_message_routes(app)
+    register_prompt_routes(app)
     register_project_routes(app)
+    register_queen_routes(app)
     register_session_routes(app)
+    register_worker_routes(app)
+    register_colony_worker_routes(app)
     register_graph_routes(app)
     register_log_routes(app)
 

@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-27T00:24:59Z",
+  "wave": "Wave16-R11K",
+  "title": "Autonomous loop-heartbeat + tick-all + report convergence continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify loop heartbeat updates and tick-all orchestration remain consistent with report/read-model continuity",
+    "verify tick-all dispatch outcomes remain reflected in report surface across mixed project-id inputs"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_tick_updates_execution_heartbeat_while_running",
+    "pipeline_loop_tick_all_endpoint",
+    "pipeline_loop_tick_all_rejects_non_array_project_ids",
+    "pipeline_loop_tick_dispatches_next_when_idle",
+    "pipeline_loop_run_cycle_report_endpoint",
+    "pipeline_report_endpoint"
+  ]
+}

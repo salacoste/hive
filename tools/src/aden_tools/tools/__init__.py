@@ -106,6 +106,7 @@ from .plaid_tool import register_tools as register_plaid
 from .port_scanner import register_tools as register_port_scanner
 from .postgres_tool import register_tools as register_postgres
 from .powerbi_tool import register_tools as register_powerbi
+from .prometheus_tool import register_tools as register_prometheus
 from .pushover_tool import register_tools as register_pushover
 from .quickbooks_tool import register_tools as register_quickbooks
 from .razorpay_tool import register_tools as register_razorpay
@@ -172,11 +173,19 @@ def _list_registered_tool_names(mcp: FastMCP) -> list[str]:
     return []
 
 
+# Tool names registered by `_register_verified()`. Populated on first call.
+# Consumed by the `__aden_verified_manifest` sentinel tool so downstream
+# registries (e.g. the queen's MCP loader) can gate free/credential-less tools
+# on whether they have been promoted to verified status.
+_VERIFIED_TOOL_NAMES: set[str] = set()
+
+
 def _register_verified(
     mcp: FastMCP,
     credentials: CredentialStoreAdapter | None = None,
 ) -> None:
     """Register verified (stable) tools."""
+    _verified_before = set(_list_registered_tool_names(mcp))
     # --- No credentials ---
     register_example(mcp)
     if register_web_scrape:
@@ -253,6 +262,16 @@ def _register_verified(
     register_google_maps(mcp, credentials=credentials)
     register_notion(mcp, credentials=credentials)
     register_account_info(mcp, credentials=credentials)
+    _VERIFIED_TOOL_NAMES.update(set(_list_registered_tool_names(mcp)) - _verified_before)
+
+
+def _register_manifest(mcp: FastMCP) -> None:
+    """Expose the verified-tool manifest as a sentinel MCP tool."""
+
+    @mcp.tool(name="__aden_verified_manifest")
+    def aden_verified_manifest() -> list[str]:
+        """Return tool names registered by `_register_verified()`."""
+        return sorted(_VERIFIED_TOOL_NAMES)
 
 
 def _register_unverified(
@@ -309,6 +328,7 @@ def _register_unverified(
     register_pipedrive(mcp, credentials=credentials)
     register_plaid(mcp, credentials=credentials)
     register_powerbi(mcp, credentials=credentials)
+    register_prometheus(mcp, credentials=credentials)
     register_pushover(mcp, credentials=credentials)
     register_quickbooks(mcp, credentials=credentials)
     register_reddit(mcp, credentials=credentials)
@@ -355,6 +375,8 @@ def register_all_tools(
 
     if include_unverified:
         _register_unverified(mcp, credentials=credentials)
+
+    _register_manifest(mcp)
 
     return _list_registered_tool_names(mcp)
 

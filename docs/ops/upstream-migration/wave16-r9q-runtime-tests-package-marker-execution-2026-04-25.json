@@ -1,0 +1,39 @@
+{
+  "generated_at_utc": "2026-04-25T13:25:40Z",
+  "wave": "Wave16-R9Q",
+  "title": "Runtime tests package marker lane execution",
+  "scope": [
+    "core/framework/runtime/tests/__init__.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local marker file is additive and harmless for runtime test package clarity",
+      "runtime test bundles remain green with current layout"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9Q lane (test package marker retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/runtime/tests -q",
+        "result": "pass",
+        "summary": "69 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_runtime.py -q",
+        "result": "pass",
+        "summary": "15 passed, 2 skipped"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9Q lane closed with explicit keep-local decision",
+      "next residual lane: MCP client env-isolation lane (`core/framework/loader/mcp_client.py`)"
+    ]
+  }
+}

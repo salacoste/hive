@@ -1,0 +1,18 @@
+{
+  "generated_at_utc": "2026-04-26T15:50:39Z",
+  "wave": "Wave16-R10V",
+  "title": "Autonomous loop control input-validation contract lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "delta_summary": [
+    "R10U closed run-cycle reporting continuity checks",
+    "next bounded step verifies loop control endpoints enforce expected input validation for tick-all and run-cycle calls",
+    "lane remains non-destructive and endpoint-contract focused"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_all_rejects_non_array_project_ids or pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_rejects_invalid_max_steps' -q"
+  ],
+  "decision_gate": "close lane only after loop-control input-validation tests remain green for accepted and rejected payloads"
+}

@@ -1,0 +1,27 @@
+{
+  "generated_at_utc": "2026-04-27T01:33:23Z",
+  "wave": "Wave16-R11W",
+  "title": "Autonomous full tick-dispatch/evaluate/auto-next/report policy-enriched convergence lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify full convergence remains stable for tick/dispatch + evaluate/auto-next/report with policy-enriched branches and GitHub feedback paths",
+    "verify report continuity across completion/failure, success/manual_pending/deferred/reject, and comment-publish flows"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_tick_resolves_execution_completed_from_event_log",
+    "pipeline_loop_tick_resolves_execution_failed_from_event_log",
+    "pipeline_loop_tick_all_endpoint",
+    "pipeline_dispatch_next_rejects_when_active_run_exists",
+    "pipeline_evaluate_endpoint_uses_checks_and_updates_report",
+    "pipeline_evaluate_github_includes_pr_review_feedback_in_report",
+    "pipeline_evaluate_github_can_post_review_summary_comment",
+    "pipeline_auto_next_endpoint",
+    "pipeline_auto_next_no_checks_manual_pending_policy",
+    "pipeline_auto_next_deferred_without_token_in_manual_mode",
+    "pipeline_auto_next_rejects_execution_stage",
+    "pipeline_report_endpoint"
+  ]
+}

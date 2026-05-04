@@ -1,0 +1,47 @@
+{
+  "generated_at_utc": "2026-04-24T14:29:10Z",
+  "lane": "ND-2B",
+  "title": "Code-bearing templates bounded replay",
+  "scope_files": [
+    "examples/templates/deep_research_agent/agent.py",
+    "examples/templates/deep_research_agent/nodes/__init__.py",
+    "examples/templates/meeting_scheduler/nodes/__init__.py"
+  ],
+  "apply": {
+    "command": "git apply docs/ops/upstream-migration/wave15-nd2b-code-bearing.patch",
+    "result": "ok"
+  },
+  "scope_verification": {
+    "command": "git diff --numstat -- examples/templates/deep_research_agent/agent.py examples/templates/deep_research_agent/nodes/__init__.py examples/templates/meeting_scheduler/nodes/__init__.py",
+    "files": [
+      {
+        "path": "examples/templates/deep_research_agent/agent.py",
+        "added": 23,
+        "deleted": 62
+      },
+      {
+        "path": "examples/templates/deep_research_agent/nodes/__init__.py",
+        "added": 4,
+        "deleted": 27
+      },
+      {
+        "path": "examples/templates/meeting_scheduler/nodes/__init__.py",
+        "added": 7,
+        "deleted": 1
+      }
+    ]
+  },
+  "regression_gate": {
+    "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "result": "ok",
+    "summary": "ok=7 failed=0",
+    "steps": [
+      "backlog consistency: pass",
+      "server api tests: 193 passed",
+      "telegram bridge tests: 46 passed",
+      "frontend unit tests: 49 passed",
+      "frontend build: pass"
+    ]
+  },
+  "head_short_sha": "7be65f50"
+}

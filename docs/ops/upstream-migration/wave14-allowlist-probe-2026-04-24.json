@@ -1,0 +1,107 @@
+{
+  "date": "2026-04-24",
+  "base_ref": "HEAD",
+  "upstream_ref": "upstream/main",
+  "scenarios": [
+    {
+      "scenario": "strict",
+      "allow_delete_prefixes": [],
+      "exit_code": 1,
+      "ok": false,
+      "delete_total": 354,
+      "flagged_total": 263,
+      "flagged_sample": [
+        ".github/workflows/docker-compose-smoke.yml",
+        ".github/workflows/secret-scan.yml",
+        ".github/workflows/upstream-sync-watch.yml",
+        "ai-proxy-docs/README.md",
+        "ai-proxy-docs/claude-clove.md",
+        "ai-proxy-docs/codex-lb.md",
+        "ai-proxy-docs/gemini-antigravity.md",
+        "ai-proxy-docs/zai-glm.md",
+        "docs/autonomous-factory/01-target-architecture.md",
+        "docs/autonomous-factory/02-access-and-security.md",
+        "docs/autonomous-factory/03-onboarding-repositories.md",
+        "docs/autonomous-factory/04-operations-runbook.md",
+        "docs/autonomous-factory/05-rollout-plan.md",
+        "docs/autonomous-factory/06-mcp-server-bundle.md",
+        "docs/autonomous-factory/07-access-setup-playbook.md",
+        "docs/autonomous-factory/08-official-hive-docs-map.md",
+        "docs/autonomous-factory/09-autonomous-control-plane.md",
+        "docs/autonomous-factory/10-coding-factory-operating-model.md",
+        "docs/autonomous-factory/11-project-scoped-sessions.md",
+        "docs/autonomous-factory/12-backlog-task-list.md"
+      ]
+    },
+    {
+      "scenario": "archives_migration_only",
+      "allow_delete_prefixes": [
+        "docs/autonomous-factory/archive/",
+        "docs/ops/upstream-migration/"
+      ],
+      "exit_code": 1,
+      "ok": false,
+      "delete_total": 354,
+      "flagged_total": 223,
+      "flagged_sample": [
+        ".github/workflows/docker-compose-smoke.yml",
+        ".github/workflows/secret-scan.yml",
+        ".github/workflows/upstream-sync-watch.yml",
+        "ai-proxy-docs/README.md",
+        "ai-proxy-docs/claude-clove.md",
+        "ai-proxy-docs/codex-lb.md",
+        "ai-proxy-docs/gemini-antigravity.md",
+        "ai-proxy-docs/zai-glm.md",
+        "docs/autonomous-factory/01-target-architecture.md",
+        "docs/autonomous-factory/02-access-and-security.md",
+        "docs/autonomous-factory/03-onboarding-repositories.md",
+        "docs/autonomous-factory/04-operations-runbook.md",
+        "docs/autonomous-factory/05-rollout-plan.md",
+        "docs/autonomous-factory/06-mcp-server-bundle.md",
+        "docs/autonomous-factory/07-access-setup-playbook.md",
+        "docs/autonomous-factory/08-official-hive-docs-map.md",
+        "docs/autonomous-factory/09-autonomous-control-plane.md",
+        "docs/autonomous-factory/10-coding-factory-operating-model.md",
+        "docs/autonomous-factory/11-project-scoped-sessions.md",
+        "docs/autonomous-factory/12-backlog-task-list.md"
+      ]
+    },
+    {
+      "scenario": "generated_ops_artifacts",
+      "allow_delete_prefixes": [
+        "docs/autonomous-factory/archive/",
+        "docs/ops/upstream-migration/",
+        "docs/ops/acceptance-reports/",
+        "docs/ops/backlog-status/",
+        "docs/ops/google-canary/",
+        "docs/ops/telegram-signoff/"
+      ],
+      "exit_code": 1,
+      "ok": false,
+      "delete_total": 354,
+      "flagged_total": 218,
+      "flagged_sample": [
+        ".github/workflows/docker-compose-smoke.yml",
+        ".github/workflows/secret-scan.yml",
+        ".github/workflows/upstream-sync-watch.yml",
+        "ai-proxy-docs/README.md",
+        "ai-proxy-docs/claude-clove.md",
+        "ai-proxy-docs/codex-lb.md",
+        "ai-proxy-docs/gemini-antigravity.md",
+        "ai-proxy-docs/zai-glm.md",
+        "docs/autonomous-factory/01-target-architecture.md",
+        "docs/autonomous-factory/02-access-and-security.md",
+        "docs/autonomous-factory/03-onboarding-repositories.md",
+        "docs/autonomous-factory/04-operations-runbook.md",
+        "docs/autonomous-factory/05-rollout-plan.md",
+        "docs/autonomous-factory/06-mcp-server-bundle.md",
+        "docs/autonomous-factory/07-access-setup-playbook.md",
+        "docs/autonomous-factory/08-official-hive-docs-map.md",
+        "docs/autonomous-factory/09-autonomous-control-plane.md",
+        "docs/autonomous-factory/10-coding-factory-operating-model.md",
+        "docs/autonomous-factory/11-project-scoped-sessions.md",
+        "docs/autonomous-factory/12-backlog-task-list.md"
+      ]
+    }
+  ]
+}

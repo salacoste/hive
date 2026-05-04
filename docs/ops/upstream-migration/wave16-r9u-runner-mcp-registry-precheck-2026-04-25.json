@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-25T19:59:13Z",
+  "wave": "Wave16-R9U",
+  "title": "Runner MCP registry baseline lane precheck",
+  "scope": [
+    "core/framework/runner/mcp_registry.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/runner/mcp_registry.py",
+      "add": 982,
+      "del": 0,
+      "total": 982
+    }
+  },
+  "delta_summary": [
+    "local runner-side MCP registry module provides full baseline implementation",
+    "includes canonical default seeding (`hive-tools`, `gcu-tools`, `files-tools`) and stale alias cleanup (`hive_tools` -> `hive-tools`)"
+  ],
+  "risk_signals": [
+    {
+      "type": "large-local-baseline-divergence",
+      "evidence": "entire runner MCP registry module is local additive relative to upstream",
+      "impact": "replay/reconcile must preserve local runner MCP behavior used by runtime contracts"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework python - <<'PY' ... import framework.runner.mcp_registry check ... PY",
+    "uv run --package framework python - <<'PY' ... MCPRegistry.ensure_defaults stale alias cleanup smoke ... PY",
+    "uv run --package framework pytest core/tests/test_mcp_registry.py -q"
+  ],
+  "decision_gate": "prefer keep_local when runner baseline is additive, behaviorally validated, and upstream replacement is non-trivial"
+}

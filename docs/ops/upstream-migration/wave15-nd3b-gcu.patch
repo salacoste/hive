@@ -1,0 +1,449 @@
+diff --git a/tools/src/gcu/__init__.py b/tools/src/gcu/__init__.py
+index 7017a34c0c14fad1e6ea08a7f03a20fd4cf078d9..9bcaace2ea7f4bc8d750b7febdefeda5bc393181 100644
+--- a/tools/src/gcu/__init__.py
++++ b/tools/src/gcu/__init__.py
+@@ -28,7 +28,6 @@
+ 
+ from __future__ import annotations
+ 
+-import asyncio
+ from typing import TYPE_CHECKING
+ 
+ if TYPE_CHECKING:
+@@ -58,17 +57,8 @@ def register_gcu_tools(
+         from gcu.browser import register_tools as register_browser
+ 
+         register_browser(mcp)
+-        # Get browser tool names (FastMCP v2/v3 compatibility)
+-        manager = getattr(mcp, "_tool_manager", None)
+-        if manager is not None and hasattr(manager, "_tools"):
+-            browser_tools = [name for name in manager._tools.keys() if name.startswith("browser_")]
+-        else:
+-            tools = asyncio.run(mcp.list_tools())
+-            browser_tools = [
+-                str(getattr(t, "name", ""))
+-                for t in (tools or [])
+-                if str(getattr(t, "name", "")).startswith("browser_")
+-            ]
++        # Get browser tool names
++        browser_tools = [name for name in mcp._tool_manager._tools.keys() if name.startswith("browser_")]
+         registered.extend(browser_tools)
+ 
+     # Future capabilities (not yet implemented)
+diff --git a/tools/src/gcu/browser/__init__.py b/tools/src/gcu/browser/__init__.py
+index 74adc3c46a2b976134825021fe8c0cb80517889a..d95ddff82896b35d02db60dde0c5aefee94b0823 100644
+--- a/tools/src/gcu/browser/__init__.py
++++ b/tools/src/gcu/browser/__init__.py
+@@ -42,7 +42,7 @@ def register_tools(mcp: FastMCP) -> None:
+ 
+     Tools are organized into categories:
+     - Lifecycle: browser_start, browser_stop, browser_status
+-    - Tabs: browser_tabs, browser_open, browser_close, browser_focus
++    - Tabs: browser_tabs, browser_open, browser_close, browser_activate_tab
+     - Navigation: browser_navigate, browser_go_back, browser_go_forward, browser_reload
+     - Inspection: browser_screenshot, browser_snapshot, browser_console
+     - Interactions: browser_click, browser_click_coordinate, browser_type, browser_type_focused,
+diff --git a/tools/src/gcu/browser/bridge.py b/tools/src/gcu/browser/bridge.py
+index 355ed70d90d96ef34fa33d82ee0332fe9c215c2e..8e77c97feea24b0055e9018db1cab147c89cebe5 100644
+--- a/tools/src/gcu/browser/bridge.py
++++ b/tools/src/gcu/browser/bridge.py
+@@ -469,11 +469,13 @@ def _handle_cdp_event(self, tab_id: int | None, method: str, params: dict) -> No
+                     parsed = json.loads(payload)
+                 except Exception:
+                     parsed = {"_raw": payload}
+-                write_log({
+-                    "type": "viewport_event",
+-                    "tab_id": tab_id,
+-                    **parsed,
+-                })
++                write_log(
++                    {
++                        "type": "viewport_event",
++                        "tab_id": tab_id,
++                        **parsed,
++                    }
++                )
+                 return
+ 
+             # Attach-time canary → attach_canary (proves extension
+@@ -483,11 +485,13 @@ def _handle_cdp_event(self, tab_id: int | None, method: str, params: dict) -> No
+                     parsed = json.loads(payload)
+                 except Exception:
+                     parsed = {"_raw": payload}
+-                write_log({
+-                    "type": "attach_canary",
+-                    "tab_id": tab_id,
+-                    **parsed,
+-                })
++                write_log(
++                    {
++                        "type": "attach_canary",
++                        "tab_id": tab_id,
++                        **parsed,
++                    }
++                )
+                 return
+ 
+             # Everything else — keep a compact row so we can tell
+@@ -503,24 +507,28 @@ def _handle_cdp_event(self, tab_id: int | None, method: str, params: dict) -> No
+                     compact.append(v[:120])
+                 elif v is not None:
+                     compact.append(str(v)[:120])
+-            write_log({
+-                "type": "cdp_event",
+-                "tab_id": tab_id,
+-                "method": method,
+-                "level": params.get("type"),
+-                "args": compact,
+-            })
++            write_log(
++                {
++                    "type": "cdp_event",
++                    "tab_id": tab_id,
++                    "method": method,
++                    "level": params.get("type"),
++                    "args": compact,
++                }
++            )
+             return
+ 
+         # Other forwarded events (Page.lifecycleEvent, frameResized,
+         # frameNavigated, Target.targetInfoChanged) are rare and high
+         # signal — keep the full param dict but truncate strings.
+-        write_log({
+-            "type": "cdp_event",
+-            "tab_id": tab_id,
+-            "method": method,
+-            "params": params,
+-        })
++        write_log(
++            {
++                "type": "cdp_event",
++                "tab_id": tab_id,
++                "method": method,
++                "params": params,
++            }
++        )
+ 
+         # Main-frame navigation wipes the previous document's scripts.
+         # Our [hive_vp] probe's event listeners die with it. Reinstall
+@@ -541,6 +549,7 @@ def _handle_cdp_event(self, tab_id: int | None, method: str, params: dict) -> No
+         if method == "Page.frameResized" and tab_id is not None:
+             try:
+                 from .tools.inspection import _viewport_sizes
++
+                 _viewport_sizes.pop(tab_id, None)
+             except Exception:
+                 pass
+@@ -550,6 +559,7 @@ def _schedule_reinject_probe(self, tab_id: int) -> None:
+         current document of ``tab_id``. Called from sync context
+         inside ``_handle_cdp_event``, so we create a task on the
+         running loop. Failures are silent."""
++
+         async def _do() -> None:
+             try:
+                 # The new document's global scope doesn't have
+@@ -566,6 +576,7 @@ async def _do() -> None:
+                 )
+             except Exception:
+                 pass
++
+         try:
+             asyncio.get_event_loop().create_task(_do())
+         except RuntimeError:
+@@ -868,8 +879,7 @@ async def cdp_attach(self, tab_id: int) -> dict:
+                 {
+                     "expression": (
+                         "console.info('[hive_attach_canary]', "
+-                        "JSON.stringify({tabId: "
+-                        + str(tab_id) + ", ts: Date.now()}))"
++                        "JSON.stringify({tabId: " + str(tab_id) + ", ts: Date.now()}))"
+                     ),
+                     "returnByValue": True,
+                     "awaitPromise": False,
+@@ -1379,9 +1389,7 @@ async def click_coordinate(self, tab_id: int, x: float, y: float, button: str =
+             # `(function(){ return (...)(x,y) })()` and the value
+             # actually comes back — without it the wrapper drops
+             # the result on the floor (returns undefined).
+-            probe_result = await self.evaluate(
+-                tab_id, f"return ({_HIT_ELEMENT_JS})({x}, {y})"
+-            )
++            probe_result = await self.evaluate(tab_id, f"return ({_HIT_ELEMENT_JS})({x}, {y})")
+             hit_probe = (probe_result or {}).get("result")
+         except Exception:
+             hit_probe = None
+@@ -1410,16 +1418,19 @@ async def click_coordinate(self, tab_id: int, x: float, y: float, button: str =
+         if hit_probe is not None:
+             try:
+                 from .telemetry import write_log
+-                write_log({
+-                    "type": "click_hit_probe",
+-                    "tab_id": tab_id,
+-                    "intended": {"x": x, "y": y},
+-                    "viewport": hit_probe.get("viewport"),
+-                    "hit": hit_probe.get("hit"),
+-                    "stack": hit_probe.get("stack"),
+-                    "sweep": hit_probe.get("sweep"),
+-                    "offsetInRect": hit_probe.get("offsetInRect"),
+-                })
++
++                write_log(
++                    {
++                        "type": "click_hit_probe",
++                        "tab_id": tab_id,
++                        "intended": {"x": x, "y": y},
++                        "viewport": hit_probe.get("viewport"),
++                        "hit": hit_probe.get("hit"),
++                        "stack": hit_probe.get("stack"),
++                        "sweep": hit_probe.get("sweep"),
++                        "offsetInRect": hit_probe.get("offsetInRect"),
++                    }
++                )
+             except Exception:
+                 pass
+         return resp
+diff --git a/tools/src/gcu/browser/tools/inspection.py b/tools/src/gcu/browser/tools/inspection.py
+index d5f5209ee0cd3f0b24c1bb9415a0cce0e1a9eea9..80f2d88f05abf13c09e0cc129885cf5a9cbfed91 100644
+--- a/tools/src/gcu/browser/tools/inspection.py
++++ b/tools/src/gcu/browser/tools/inspection.py
+@@ -240,23 +240,22 @@ async def _ensure_viewport_size(tab_id: int, _caller: str = "unknown") -> tuple[
+ 
+     try:
+         from ..telemetry import write_log
+-        write_log({
+-            "type": "viewport_sample",
+-            "tab_id": tab_id,
+-            "caller": _caller,
+-            "live_w": cw,
+-            "live_h": ch,
+-            "cached_w": cached_before[0] if cached_before else None,
+-            "cached_h": cached_before[1] if cached_before else None,
+-            "deltaH_vs_cache": (
+-                (ch - cached_before[1])
+-                if (cached_before and ch > 0)
+-                else None
+-            ),
+-            "returned_w": result_cw,
+-            "returned_h": result_ch,
+-            "evaluate_error": evaluate_error,
+-        })
++
++        write_log(
++            {
++                "type": "viewport_sample",
++                "tab_id": tab_id,
++                "caller": _caller,
++                "live_w": cw,
++                "live_h": ch,
++                "cached_w": cached_before[0] if cached_before else None,
++                "cached_h": cached_before[1] if cached_before else None,
++                "deltaH_vs_cache": ((ch - cached_before[1]) if (cached_before and ch > 0) else None),
++                "returned_w": result_cw,
++                "returned_h": result_ch,
++                "evaluate_error": evaluate_error,
++            }
++        )
+     except Exception:
+         pass
+ 
+@@ -362,31 +361,32 @@ async def browser_screenshot(
+             # physical_scale is derived from pngWidth.
+             try:
+                 from ..telemetry import write_log
++
+                 expected_w = css_width * dpr
+                 expected_h = css_height_raw * dpr
+-                write_log({
+-                    "type": "screenshot_geometry",
+-                    "tab_id": target_tab,
+-                    "url": screenshot_result.get("url", ""),
+-                    "pngWidth": png_w,
+-                    "pngHeight": png_h,
+-                    "cssWidth": css_width,
+-                    "cssHeight": css_height_raw,
+-                    "dpr": dpr,
+-                    "expectedPngWidth": expected_w,
+-                    "expectedPngHeight": expected_h,
+-                    "deltaPngWidthPx": png_w - expected_w,
+-                    "deltaPngHeightPx": png_h - expected_h,
+-                    # If the PNG is taller than cssHeight×dpr (e.g. a
+-                    # devtools-attached banner adds rows above the page
+-                    # in the capture), clicks land BELOW intended at
+-                    # the top of the page and converge to 0 error at
+-                    # the bottom. Reverse signs if PNG is shorter.
+-                    # Worst-case error in CSS px at fy=0:
+-                    "yErrorAtTopCssPx": (
+-                        (png_h - expected_h) / dpr if dpr else 0
+-                    ),
+-                })
++                write_log(
++                    {
++                        "type": "screenshot_geometry",
++                        "tab_id": target_tab,
++                        "url": screenshot_result.get("url", ""),
++                        "pngWidth": png_w,
++                        "pngHeight": png_h,
++                        "cssWidth": css_width,
++                        "cssHeight": css_height_raw,
++                        "dpr": dpr,
++                        "expectedPngWidth": expected_w,
++                        "expectedPngHeight": expected_h,
++                        "deltaPngWidthPx": png_w - expected_w,
++                        "deltaPngHeightPx": png_h - expected_h,
++                        # If the PNG is taller than cssHeight×dpr (e.g. a
++                        # devtools-attached banner adds rows above the page
++                        # in the capture), clicks land BELOW intended at
++                        # the top of the page and converge to 0 error at
++                        # the bottom. Reverse signs if PNG is shorter.
++                        # Worst-case error in CSS px at fy=0:
++                        "yErrorAtTopCssPx": ((png_h - expected_h) / dpr if dpr else 0),
++                    }
++                )
+             except Exception:
+                 pass
+ 
+diff --git a/tools/src/gcu/browser/tools/interactions.py b/tools/src/gcu/browser/tools/interactions.py
+index 53b20178ee3a466a128bd0b40d157944528ba803..0ae83cd9ab77d459becd1353472d702b001e1cd0 100644
+--- a/tools/src/gcu/browser/tools/interactions.py
++++ b/tools/src/gcu/browser/tools/interactions.py
+@@ -64,11 +64,7 @@ async def _build_visual_response(result: dict, bridge, target_tab: int | None) -
+         shot = await bridge.screenshot(target_tab, full_page=False)
+         if not shot.get("ok"):
+             return [text_block]
+-        highlights = (
+-            [_interaction_highlights[target_tab]]
+-            if target_tab in _interaction_highlights
+-            else None
+-        )
++        highlights = [_interaction_highlights[target_tab]] if target_tab in _interaction_highlights else None
+         data, _ = await asyncio.to_thread(
+             _resize_and_annotate,
+             shot["data"],
+diff --git a/tools/src/gcu/browser/tools/tabs.py b/tools/src/gcu/browser/tools/tabs.py
+index f64065fc40df1a36385c36fbdd1e159a4c63bee8..97b6dd0cf349bc8c58fd073e08c97814fe065944 100644
+--- a/tools/src/gcu/browser/tools/tabs.py
++++ b/tools/src/gcu/browser/tools/tabs.py
+@@ -1,5 +1,5 @@
+ """
+-Browser tab management tools - tabs, open, close, focus.
++Browser tab management tools - tabs, open, close, activate.
+ 
+ All operations go through the Beeline extension - no Playwright required.
+ """
+@@ -8,9 +8,10 @@
+ 
+ import logging
+ import time
+-from typing import Any
++from typing import Annotated, Any
+ 
+ from fastmcp import FastMCP
++from pydantic import Field
+ 
+ from ..bridge import get_bridge
+ from ..session import _active_profile
+@@ -232,16 +233,33 @@ async def browser_close(
+             return result
+ 
+     @mcp.tool()
+-    async def browser_focus(tab_id: int, profile: str | None = None) -> dict:
++    async def browser_activate_tab(
++        tab_id: Annotated[
++            int,
++            Field(
++                description=(
++                    "REQUIRED. Integer Chrome tab ID of the tab to switch to. "
++                    "Must be a concrete integer (not null). "
++                    "Call browser_tabs first to list available tabs and their IDs."
++                ),
++            ),
++        ],
++        profile: str | None = None,
++    ) -> dict:
+         """
+-        Focus a browser tab.
++        Switch the active browser tab to the given tab ID.
++
++        Use this to bring an existing tab to the foreground before interacting
++        with it. The ``tab_id`` argument is required and must be an integer
++        returned by ``browser_tabs``; passing null/None is not supported (use
++        ``browser_tabs`` to discover a valid ID first).
+ 
+         Args:
+-            tab_id: Chrome tab ID to focus
++            tab_id: Chrome tab ID to activate. Required integer.
+             profile: Browser profile name (default: "default")
+ 
+         Returns:
+-            Dict with focus status
++            Dict with activation status
+         """
+         start = time.perf_counter()
+         params = {"tab_id": tab_id, "profile": profile}
+@@ -249,13 +267,13 @@ async def browser_focus(tab_id: int, profile: str | None = None) -> dict:
+         bridge = get_bridge()
+         if not bridge or not bridge.is_connected:
+             result = {"ok": False, "error": "Browser extension not connected"}
+-            log_tool_call("browser_focus", params, result=result)
++            log_tool_call("browser_activate_tab", params, result=result)
+             return result
+ 
+         ctx = _get_context(profile)
+         if not ctx:
+             result = {"ok": False, "error": "Browser not started. Call browser_start first."}
+-            log_tool_call("browser_focus", params, result=result)
++            log_tool_call("browser_activate_tab", params, result=result)
+             return result
+ 
+         try:
+@@ -263,7 +281,7 @@ async def browser_focus(tab_id: int, profile: str | None = None) -> dict:
+             ctx["activeTabId"] = tab_id
+             result = {"ok": True, "tabId": tab_id}
+             log_tool_call(
+-                "browser_focus",
++                "browser_activate_tab",
+                 params,
+                 result=result,
+                 duration_ms=(time.perf_counter() - start) * 1000,
+@@ -271,7 +289,12 @@ async def browser_focus(tab_id: int, profile: str | None = None) -> dict:
+             return result
+         except Exception as e:
+             result = {"ok": False, "error": str(e)}
+-            log_tool_call("browser_focus", params, error=e, duration_ms=(time.perf_counter() - start) * 1000)
++            log_tool_call(
++                "browser_activate_tab",
++                params,
++                error=e,
++                duration_ms=(time.perf_counter() - start) * 1000,
++            )
+             return result
+ 
+     @mcp.tool()
+diff --git a/tools/tests/test_browser_tools_comprehensive.py b/tools/tests/test_browser_tools_comprehensive.py
+index b82d9dc845c2c6ca00a329ce9a426d55b432ab8e..c5f45edd703d15635d69f53538bc0eaaffa85cb8 100644
+--- a/tools/tests/test_browser_tools_comprehensive.py
++++ b/tools/tests/test_browser_tools_comprehensive.py
+@@ -411,19 +411,19 @@ async def test_create_and_close_tab(self, mcp: FastMCP, mock_bridge: MagicMock):
+                 assert close_result.get("ok") is True
+ 
+     @pytest.mark.asyncio
+-    async def test_tab_focus_switching(self, mcp: FastMCP, mock_bridge: MagicMock):
+-        """Test switching focus between tabs."""
++    async def test_tab_activate_switching(self, mcp: FastMCP, mock_bridge: MagicMock):
++        """Test switching the active tab."""
+         mock_bridge.activate_tab = AsyncMock(return_value={"ok": True})
+ 
+         register_tab_tools(mcp)
+-        browser_focus = mcp._tool_manager._tools["browser_focus"].fn
++        browser_activate_tab = mcp._tool_manager._tools["browser_activate_tab"].fn
+ 
+         with patch("gcu.browser.tools.tabs.get_bridge", return_value=mock_bridge):
+             with patch(
+                 "gcu.browser.tools.tabs._get_context",
+                 return_value={"groupId": 1, "activeTabId": 100},
+             ):
+-                result = await browser_focus(tab_id=200)
++                result = await browser_activate_tab(tab_id=200)
+ 
+         assert result.get("ok") is True
+         mock_bridge.activate_tab.assert_awaited_once_with(200)

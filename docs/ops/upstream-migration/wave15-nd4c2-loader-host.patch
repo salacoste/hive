@@ -1,0 +1,3839 @@
+diff --git a/core/framework/host/agent_host.py b/core/framework/host/agent_host.py
+index 320e5371..3456641d 100644
+--- a/core/framework/host/agent_host.py
++++ b/core/framework/host/agent_host.py
+@@ -16,20 +16,21 @@
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+ 
+-from framework.graph.checkpoint_config import CheckpointConfig
+-from framework.graph.executor import ExecutionResult
+-from framework.runtime.event_bus import EventBus
+-from framework.runtime.execution_stream import EntryPointSpec, ExecutionStream
+-from framework.runtime.outcome_aggregator import OutcomeAggregator
+-from framework.runtime.runtime_log_store import RuntimeLogStore
+-from framework.runtime.shared_state import SharedBufferManager
++from framework.host.event_bus import EventBus
++from framework.host.execution_manager import EntryPointSpec, ExecutionManager
++from framework.host.outcome_aggregator import OutcomeAggregator
++from framework.host.shared_state import SharedBufferManager
++from framework.orchestrator.checkpoint_config import CheckpointConfig
++from framework.orchestrator.orchestrator import ExecutionResult
+ from framework.storage.concurrent import ConcurrentStorage
+ from framework.storage.session_store import SessionStore
++from framework.tracker.runtime_log_store import RuntimeLogStore
+ 
+ if TYPE_CHECKING:
+-    from framework.graph.edge import GraphSpec
+-    from framework.graph.goal import Goal
+     from framework.llm.provider import LLMProvider, Tool
++    from framework.orchestrator.edge import GraphSpec
++    from framework.orchestrator.goal import Goal
++    from framework.pipeline.stage import PipelineStage
+     from framework.skills.manager import SkillsManagerConfig
+ 
+ logger = logging.getLogger(__name__)
+@@ -37,7 +38,7 @@
+ 
+ @dataclass
+ class AgentRuntimeConfig:
+-    """Configuration for AgentRuntime."""
++    """Configuration for AgentHost."""
+ 
+     max_concurrent_executions: int = 100
+     cache_ttl: float = 60.0
+@@ -62,14 +63,14 @@ class _GraphRegistration:
+     graph: "GraphSpec"
+     goal: "Goal"
+     entry_points: dict[str, EntryPointSpec]
+-    streams: dict[str, ExecutionStream]  # ep_id -> stream (NOT namespaced)
++    streams: dict[str, ExecutionManager]  # ep_id -> stream (NOT namespaced)
+     storage_subpath: str  # relative to session root, e.g. "graphs/email_agent"
+     event_subscriptions: list[str] = field(default_factory=list)
+     timer_tasks: list[asyncio.Task] = field(default_factory=list)
+     timer_next_fire: dict[str, float] = field(default_factory=dict)
+ 
+ 
+-class AgentRuntime:
++class AgentHost:
+     """
+     Top-level runtime that manages agent lifecycle and concurrent executions.
+ 
+@@ -142,6 +143,7 @@ def __init__(
+         skills_catalog_prompt: str = "",
+         protocols_prompt: str = "",
+         skill_dirs: list[str] | None = None,
++        pipeline_stages: "list[PipelineStage] | None" = None,
+     ):
+         """
+         Initialize agent runtime.
+@@ -171,6 +173,7 @@ def __init__(
+             skills_catalog_prompt: Deprecated. Pre-rendered skills catalog.
+             protocols_prompt: Deprecated. Pre-rendered operational protocols.
+         """
++        from framework.pipeline.runner import PipelineRunner
+         from framework.skills.manager import SkillsManager
+ 
+         self.graph = graph
+@@ -180,6 +183,13 @@ def __init__(
+         self._checkpoint_config = checkpoint_config
+         self.accounts_prompt = accounts_prompt
+ 
++        # Pipeline middleware: runs before every trigger() dispatch.
++        # Accepts either pre-built stage objects or loads from config.
++        if pipeline_stages:
++            self._pipeline = PipelineRunner(pipeline_stages)
++        else:
++            self._pipeline = self._load_pipeline_from_config()
++
+         # --- Skill lifecycle: runtime owns the SkillsManager ---
+         if skills_manager_config is not None:
+             # New path: config-driven, runtime handles loading
+@@ -195,9 +205,7 @@ def __init__(
+                 DeprecationWarning,
+                 stacklevel=2,
+             )
+-            self._skills_manager = SkillsManager.from_precomputed(
+-                skills_catalog_prompt, protocols_prompt
+-            )
++            self._skills_manager = SkillsManager.from_precomputed(skills_catalog_prompt, protocols_prompt)
+         else:
+             # Bare constructor: auto-load defaults
+             self._skills_manager = SkillsManager()
+@@ -238,15 +246,13 @@ def __init__(
+         self._tools = tools or []
+         self._tool_executor = tool_executor
+         self._accounts_prompt = accounts_prompt
+-        self._dynamic_memory_provider_factory: Callable[[str], Callable[[], str] | None] | None = (
+-            None
+-        )
++        self._dynamic_memory_provider_factory: Callable[[str], Callable[[], str] | None] | None = None
+         self._accounts_data = accounts_data
+         self._tool_provider_map = tool_provider_map
+ 
+         # Entry points and streams (primary graph)
+         self._entry_points: dict[str, EntryPointSpec] = {}
+-        self._streams: dict[str, ExecutionStream] = {}
++        self._streams: dict[str, ExecutionManager] = {}
+ 
+         # Webhook server (created on start if webhook_routes configured)
+         self._webhook_server: Any = None
+@@ -270,7 +276,7 @@ def __init__(
+         self.intro_message: str = ""
+ 
+     # ------------------------------------------------------------------
+-    # Skill prompt accessors (read by ExecutionStream constructors)
++    # Skill prompt accessors (read by ExecutionManager constructors)
+     # ------------------------------------------------------------------
+ 
+     @property
+@@ -335,9 +341,14 @@ async def start(self) -> None:
+             # Start storage
+             await self._storage.start()
+ 
+-            # Create streams for each entry point
++            # Initialize pipeline stages FIRST -- they inject LLM, tools,
++            # credentials, and skills into the host before streams are created.
++            await self._pipeline.initialize_all()
++            self._apply_pipeline_results()
++
++            # Create streams for each entry point (uses pipeline results)
+             for ep_id, spec in self._entry_points.items():
+-                stream = ExecutionStream(
++                stream = ExecutionManager(
+                     stream_id=ep_id,
+                     entry_spec=spec,
+                     graph=self.graph,
+@@ -370,7 +381,7 @@ async def start(self) -> None:
+ 
+             # Start webhook server if routes are configured
+             if self._config.webhook_routes:
+-                from framework.runtime.webhook_server import (
++                from framework.host.webhook_server import (
+                     WebhookRoute,
+                     WebhookServer,
+                     WebhookServerConfig,
+@@ -394,7 +405,7 @@ async def start(self) -> None:
+                 await self._webhook_server.start()
+ 
+             # Subscribe event-driven entry points to EventBus
+-            from framework.runtime.event_bus import EventType as _ET
++            from framework.host.event_bus import EventType as _ET
+ 
+             for ep_id, spec in self._entry_points.items():
+                 if spec.trigger_type != "event":
+@@ -404,8 +415,7 @@ async def start(self) -> None:
+                 event_types = [_ET(et) for et in tc.get("event_types", [])]
+                 if not event_types:
+                     logger.warning(
+-                        f"Entry point '{ep_id}' has trigger_type='event' "
+-                        "but no event_types in trigger_config"
++                        f"Entry point '{ep_id}' has trigger_type='event' but no event_types in trigger_config"
+                     )
+                     continue
+ 
+@@ -435,9 +445,7 @@ async def _on_event(event):
+                             # Run in the same session as the primary entry
+                             # point so memory (e.g. user-defined rules) is
+                             # shared and logs land in one session directory.
+-                            session_state = self._get_primary_session_state(
+-                                exclude_entry_point=entry_point_id
+-                            )
++                            session_state = self._get_primary_session_state(exclude_entry_point=entry_point_id)
+                         exec_id = await self.trigger(
+                             entry_point_id,
+                             {"event": event.to_dict()},
+@@ -458,316 +466,303 @@ async def _on_event(event):
+                 self._event_subscriptions.append(sub_id)
+ 
+             # Start timer-driven entry points
+-            for ep_id, spec in self._entry_points.items():
+-                if spec.trigger_type != "timer":
++            await self._start_timers()
++
++            # Start skill hot-reload watcher (no-op if watchfiles not installed)
++            await self._skills_manager.start_watching()
++
++            self._running = True
++            self._timers_paused = False
++            n_stages = len(self._pipeline.stages)
++            logger.info(
++                "AgentHost started with %d streams, %d pipeline stages",
++                len(self._streams),
++                n_stages,
++            )
++
++    async def _start_timers(self) -> None:
++        """Start timer-driven entry points (extracted from start())."""
++        for ep_id, spec in self._entry_points.items():
++            if spec.trigger_type != "timer":
++                continue
++
++            tc = spec.trigger_config
++            cron_expr = tc.get("cron")
++            _raw_interval = tc.get("interval_minutes")
++            interval = float(_raw_interval) if _raw_interval is not None else None
++            run_immediately = tc.get("run_immediately", False)
++
++            if cron_expr:
++                # Cron expression mode — takes priority over interval_minutes
++                try:
++                    from croniter import croniter
++                except ImportError as e:
++                    raise RuntimeError(
++                        "croniter is required for cron-based entry points. Install it with: uv pip install croniter"
++                    ) from e
++
++                try:
++                    if not croniter.is_valid(cron_expr):
++                        raise ValueError(f"Invalid cron expression: {cron_expr}")
++                except ValueError as e:
++                    logger.warning(
++                        "Entry point '%s' has invalid cron config: %s",
++                        ep_id,
++                        e,
++                    )
+                     continue
+ 
+-                tc = spec.trigger_config
+-                cron_expr = tc.get("cron")
+-                _raw_interval = tc.get("interval_minutes")
+-                interval = float(_raw_interval) if _raw_interval is not None else None
+-                run_immediately = tc.get("run_immediately", False)
+-
+-                if cron_expr:
+-                    # Cron expression mode — takes priority over interval_minutes
+-                    try:
++                def _make_cron_timer(
++                    entry_point_id: str,
++                    expr: str,
++                    immediate: bool,
++                    idle_timeout: float = 300,
++                ):
++                    async def _cron_loop():
+                         from croniter import croniter
+-                    except ImportError as e:
+-                        raise RuntimeError(
+-                            "croniter is required for cron-based entry points. "
+-                            "Install it with: uv pip install croniter"
+-                        ) from e
+-
+-                    try:
+-                        if not croniter.is_valid(cron_expr):
+-                            raise ValueError(f"Invalid cron expression: {cron_expr}")
+-                    except ValueError as e:
+-                        logger.warning(
+-                            "Entry point '%s' has invalid cron config: %s",
+-                            ep_id,
+-                            e,
+-                        )
+-                        continue
+-
+-                    def _make_cron_timer(
+-                        entry_point_id: str,
+-                        expr: str,
+-                        immediate: bool,
+-                        idle_timeout: float = 300,
+-                    ):
+-                        async def _cron_loop():
+-                            from croniter import croniter
+-
+-                            _persistent_session_id: str | None = None
+-                            if not immediate:
+-                                cron = croniter(expr, datetime.now())
+-                                next_dt = cron.get_next(datetime)
+-                                sleep_secs = (next_dt - datetime.now()).total_seconds()
+-                                self._timer_next_fire[entry_point_id] = (
+-                                    time.monotonic() + sleep_secs
++
++                        _persistent_session_id: str | None = None
++                        if not immediate:
++                            cron = croniter(expr, datetime.now())
++                            next_dt = cron.get_next(datetime)
++                            sleep_secs = (next_dt - datetime.now()).total_seconds()
++                            self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
++                            await asyncio.sleep(max(0, sleep_secs))
++                        while self._running:
++                            # Calculate next fire time upfront (used by skip paths too)
++                            cron = croniter(expr, datetime.now())
++                            next_dt = cron.get_next(datetime)
++                            sleep_secs = (next_dt - datetime.now()).total_seconds()
++
++                            # Gate: skip tick if timers are explicitly paused
++                            if self._timers_paused:
++                                logger.debug(
++                                    "Cron '%s': paused, skipping tick",
++                                    entry_point_id,
+                                 )
++                                self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
+                                 await asyncio.sleep(max(0, sleep_secs))
+-                            while self._running:
+-                                # Calculate next fire time upfront (used by skip paths too)
+-                                cron = croniter(expr, datetime.now())
+-                                next_dt = cron.get_next(datetime)
+-                                sleep_secs = (next_dt - datetime.now()).total_seconds()
+-
+-                                # Gate: skip tick if timers are explicitly paused
+-                                if self._timers_paused:
+-                                    logger.debug(
+-                                        "Cron '%s': paused, skipping tick",
+-                                        entry_point_id,
+-                                    )
+-                                    self._timer_next_fire[entry_point_id] = (
+-                                        time.monotonic() + sleep_secs
+-                                    )
+-                                    await asyncio.sleep(max(0, sleep_secs))
+-                                    continue
+-
+-                                # Gate: skip tick if ANY stream is actively working.
+-                                # If the execution is idle (no LLM/tool activity
+-                                # beyond idle_timeout) let the timer proceed —
+-                                # execute() will cancel the stale execution.
+-                                _any_active = False
+-                                _min_idle = float("inf")
+-                                for _s in self._streams.values():
+-                                    if _s.active_execution_ids:
+-                                        _any_active = True
+-                                        _idle = _s.agent_idle_seconds
+-                                        if _idle < _min_idle:
+-                                            _min_idle = _idle
++                                continue
++
++                            # Gate: skip tick if ANY stream is actively working.
++                            # If the execution is idle (no LLM/tool activity
++                            # beyond idle_timeout) let the timer proceed —
++                            # execute() will cancel the stale execution.
++                            _any_active = False
++                            _min_idle = float("inf")
++                            for _s in self._streams.values():
++                                if _s.active_execution_ids:
++                                    _any_active = True
++                                    _idle = _s.agent_idle_seconds
++                                    if _idle < _min_idle:
++                                        _min_idle = _idle
++                            logger.info(
++                                "Cron '%s': gate — active=%s, idle=%.1fs, timeout=%ds",
++                                entry_point_id,
++                                _any_active,
++                                _min_idle,
++                                idle_timeout,
++                            )
++                            if _any_active and _min_idle < idle_timeout:
+                                 logger.info(
+-                                    "Cron '%s': gate — active=%s, idle=%.1fs, timeout=%ds",
++                                    "Cron '%s': agent actively working, skipping tick",
+                                     entry_point_id,
+-                                    _any_active,
+-                                    _min_idle,
+-                                    idle_timeout,
+                                 )
+-                                if _any_active and _min_idle < idle_timeout:
+-                                    logger.info(
+-                                        "Cron '%s': agent actively working, skipping tick",
+-                                        entry_point_id,
+-                                    )
+-                                    self._timer_next_fire[entry_point_id] = (
+-                                        time.monotonic() + sleep_secs
+-                                    )
+-                                    await asyncio.sleep(max(0, sleep_secs))
+-                                    continue
+-
+-                                self._timer_next_fire.pop(entry_point_id, None)
+-                                try:
+-                                    ep_spec = self._entry_points.get(entry_point_id)
+-                                    is_isolated = ep_spec and ep_spec.isolation_level == "isolated"
+-                                    if is_isolated:
+-                                        if _persistent_session_id:
+-                                            session_state = {
+-                                                "resume_session_id": _persistent_session_id
+-                                            }
+-                                        else:
+-                                            session_state = None
++                                self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
++                                await asyncio.sleep(max(0, sleep_secs))
++                                continue
++
++                            self._timer_next_fire.pop(entry_point_id, None)
++                            try:
++                                ep_spec = self._entry_points.get(entry_point_id)
++                                is_isolated = ep_spec and ep_spec.isolation_level == "isolated"
++                                if is_isolated:
++                                    if _persistent_session_id:
++                                        session_state = {"resume_session_id": _persistent_session_id}
+                                     else:
+-                                        session_state = self._get_primary_session_state(
+-                                            exclude_entry_point=entry_point_id
++                                        session_state = None
++                                else:
++                                    session_state = self._get_primary_session_state(exclude_entry_point=entry_point_id)
++                                    # Gate: skip tick if no active session
++                                    if session_state is None:
++                                        logger.debug(
++                                            "Cron '%s': no active session, skipping",
++                                            entry_point_id,
+                                         )
+-                                        # Gate: skip tick if no active session
+-                                        if session_state is None:
+-                                            logger.debug(
+-                                                "Cron '%s': no active session, skipping",
+-                                                entry_point_id,
+-                                            )
+-                                            self._timer_next_fire[entry_point_id] = (
+-                                                time.monotonic() + sleep_secs
+-                                            )
+-                                            await asyncio.sleep(max(0, sleep_secs))
+-                                            continue
+-
+-                                    exec_id = await self.trigger(
+-                                        entry_point_id,
+-                                        {
+-                                            "event": {
+-                                                "source": "timer",
+-                                                "reason": "scheduled",
+-                                            }
+-                                        },
+-                                        session_state=session_state,
+-                                    )
+-                                    if not _persistent_session_id and is_isolated:
+-                                        _persistent_session_id = exec_id
+-                                    logger.info(
+-                                        "Cron fired for entry point '%s' (expr: %s)",
+-                                        entry_point_id,
+-                                        expr,
+-                                    )
+-                                except Exception:
+-                                    logger.error(
+-                                        "Cron trigger failed for '%s'",
+-                                        entry_point_id,
+-                                        exc_info=True,
+-                                    )
+-                                # Calculate next fire from now
+-                                cron = croniter(expr, datetime.now())
+-                                next_dt = cron.get_next(datetime)
+-                                sleep_secs = (next_dt - datetime.now()).total_seconds()
+-                                self._timer_next_fire[entry_point_id] = (
+-                                    time.monotonic() + sleep_secs
++                                        self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
++                                        await asyncio.sleep(max(0, sleep_secs))
++                                        continue
++
++                                exec_id = await self.trigger(
++                                    entry_point_id,
++                                    {
++                                        "event": {
++                                            "source": "timer",
++                                            "reason": "scheduled",
++                                        }
++                                    },
++                                    session_state=session_state,
+                                 )
+-                                await asyncio.sleep(max(0, sleep_secs))
++                                if not _persistent_session_id and is_isolated:
++                                    _persistent_session_id = exec_id
++                                logger.info(
++                                    "Cron fired for entry point '%s' (expr: %s)",
++                                    entry_point_id,
++                                    expr,
++                                )
++                            except Exception:
++                                logger.error(
++                                    "Cron trigger failed for '%s'",
++                                    entry_point_id,
++                                    exc_info=True,
++                                )
++                            # Calculate next fire from now
++                            cron = croniter(expr, datetime.now())
++                            next_dt = cron.get_next(datetime)
++                            sleep_secs = (next_dt - datetime.now()).total_seconds()
++                            self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
++                            await asyncio.sleep(max(0, sleep_secs))
+ 
+-                        return _cron_loop
++                    return _cron_loop
+ 
+-                    task = asyncio.create_task(
+-                        _make_cron_timer(
+-                            ep_id,
+-                            cron_expr,
+-                            run_immediately,
+-                            idle_timeout=float(tc.get("idle_timeout_seconds", 300)),
+-                        )()
+-                    )
+-                    self._timer_tasks.append(task)
+-                    logger.info(
+-                        "Started cron timer for entry point '%s' with expression '%s'%s",
++                task = asyncio.create_task(
++                    _make_cron_timer(
+                         ep_id,
+                         cron_expr,
+-                        " (immediate first run)" if run_immediately else "",
+-                    )
++                        run_immediately,
++                        idle_timeout=float(tc.get("idle_timeout_seconds", 300)),
++                    )()
++                )
++                self._timer_tasks.append(task)
++                logger.info(
++                    "Started cron timer for entry point '%s' with expression '%s'%s",
++                    ep_id,
++                    cron_expr,
++                    " (immediate first run)" if run_immediately else "",
++                )
+ 
+-                elif interval and interval > 0:
+-                    # Fixed interval mode (original behavior)
+-                    def _make_timer(
+-                        entry_point_id: str,
+-                        mins: float,
+-                        immediate: bool,
+-                        idle_timeout: float = 300,
+-                    ):
+-                        async def _timer_loop():
+-                            interval_secs = mins * 60
+-                            _persistent_session_id: str | None = None
+-                            if not immediate:
+-                                self._timer_next_fire[entry_point_id] = (
+-                                    time.monotonic() + interval_secs
++            elif interval and interval > 0:
++                # Fixed interval mode (original behavior)
++                def _make_timer(
++                    entry_point_id: str,
++                    mins: float,
++                    immediate: bool,
++                    idle_timeout: float = 300,
++                ):
++                    async def _timer_loop():
++                        interval_secs = mins * 60
++                        _persistent_session_id: str | None = None
++                        if not immediate:
++                            self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
++                            await asyncio.sleep(interval_secs)
++                        while self._running:
++                            # Gate: skip tick if timers are explicitly paused
++                            if self._timers_paused:
++                                logger.debug(
++                                    "Timer '%s': paused, skipping tick",
++                                    entry_point_id,
+                                 )
++                                self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
+                                 await asyncio.sleep(interval_secs)
+-                            while self._running:
+-                                # Gate: skip tick if timers are explicitly paused
+-                                if self._timers_paused:
+-                                    logger.debug(
+-                                        "Timer '%s': paused, skipping tick",
+-                                        entry_point_id,
+-                                    )
+-                                    self._timer_next_fire[entry_point_id] = (
+-                                        time.monotonic() + interval_secs
+-                                    )
+-                                    await asyncio.sleep(interval_secs)
+-                                    continue
+-
+-                                # Gate: skip tick if agent is actively working.
+-                                # Gate: skip tick if ANY stream is actively working.
+-                                _any_active = False
+-                                _min_idle = float("inf")
+-                                for _s in self._streams.values():
+-                                    if _s.active_execution_ids:
+-                                        _any_active = True
+-                                        _idle = _s.agent_idle_seconds
+-                                        if _idle < _min_idle:
+-                                            _min_idle = _idle
++                                continue
++
++                            # Gate: skip tick if agent is actively working.
++                            # Gate: skip tick if ANY stream is actively working.
++                            _any_active = False
++                            _min_idle = float("inf")
++                            for _s in self._streams.values():
++                                if _s.active_execution_ids:
++                                    _any_active = True
++                                    _idle = _s.agent_idle_seconds
++                                    if _idle < _min_idle:
++                                        _min_idle = _idle
++                            logger.info(
++                                "Timer '%s': gate — active=%s, idle=%.1fs, timeout=%ds",
++                                entry_point_id,
++                                _any_active,
++                                _min_idle,
++                                idle_timeout,
++                            )
++                            if _any_active and _min_idle < idle_timeout:
+                                 logger.info(
+-                                    "Timer '%s': gate — active=%s, idle=%.1fs, timeout=%ds",
++                                    "Timer '%s': agent actively working, skipping tick",
+                                     entry_point_id,
+-                                    _any_active,
+-                                    _min_idle,
+-                                    idle_timeout,
+                                 )
+-                                if _any_active and _min_idle < idle_timeout:
+-                                    logger.info(
+-                                        "Timer '%s': agent actively working, skipping tick",
+-                                        entry_point_id,
+-                                    )
+-                                    self._timer_next_fire[entry_point_id] = (
+-                                        time.monotonic() + interval_secs
+-                                    )
+-                                    await asyncio.sleep(interval_secs)
+-                                    continue
+-
+-                                self._timer_next_fire.pop(entry_point_id, None)
+-                                try:
+-                                    ep_spec = self._entry_points.get(entry_point_id)
+-                                    is_isolated = ep_spec and ep_spec.isolation_level == "isolated"
+-                                    if is_isolated:
+-                                        if _persistent_session_id:
+-                                            session_state = {
+-                                                "resume_session_id": _persistent_session_id
+-                                            }
+-                                        else:
+-                                            session_state = None
++                                self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
++                                await asyncio.sleep(interval_secs)
++                                continue
++
++                            self._timer_next_fire.pop(entry_point_id, None)
++                            try:
++                                ep_spec = self._entry_points.get(entry_point_id)
++                                is_isolated = ep_spec and ep_spec.isolation_level == "isolated"
++                                if is_isolated:
++                                    if _persistent_session_id:
++                                        session_state = {"resume_session_id": _persistent_session_id}
+                                     else:
+-                                        session_state = self._get_primary_session_state(
+-                                            exclude_entry_point=entry_point_id
++                                        session_state = None
++                                else:
++                                    session_state = self._get_primary_session_state(exclude_entry_point=entry_point_id)
++                                    # Gate: skip tick if no active session
++                                    if session_state is None:
++                                        logger.debug(
++                                            "Timer '%s': no active session, skipping",
++                                            entry_point_id,
+                                         )
+-                                        # Gate: skip tick if no active session
+-                                        if session_state is None:
+-                                            logger.debug(
+-                                                "Timer '%s': no active session, skipping",
+-                                                entry_point_id,
+-                                            )
+-                                            self._timer_next_fire[entry_point_id] = (
+-                                                time.monotonic() + interval_secs
+-                                            )
+-                                            await asyncio.sleep(interval_secs)
+-                                            continue
+-
+-                                    exec_id = await self.trigger(
+-                                        entry_point_id,
+-                                        {
+-                                            "event": {
+-                                                "source": "timer",
+-                                                "reason": "scheduled",
+-                                            }
+-                                        },
+-                                        session_state=session_state,
+-                                    )
+-                                    if not _persistent_session_id and is_isolated:
+-                                        _persistent_session_id = exec_id
+-                                    logger.info(
+-                                        "Timer fired for entry point '%s' (next in %s min)",
+-                                        entry_point_id,
+-                                        mins,
+-                                    )
+-                                except Exception:
+-                                    logger.error(
+-                                        "Timer trigger failed for '%s'",
+-                                        entry_point_id,
+-                                        exc_info=True,
+-                                    )
+-                                self._timer_next_fire[entry_point_id] = (
+-                                    time.monotonic() + interval_secs
++                                        self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
++                                        await asyncio.sleep(interval_secs)
++                                        continue
++
++                                exec_id = await self.trigger(
++                                    entry_point_id,
++                                    {
++                                        "event": {
++                                            "source": "timer",
++                                            "reason": "scheduled",
++                                        }
++                                    },
++                                    session_state=session_state,
+                                 )
+-                                await asyncio.sleep(interval_secs)
++                                if not _persistent_session_id and is_isolated:
++                                    _persistent_session_id = exec_id
++                                logger.info(
++                                    "Timer fired for entry point '%s' (next in %s min)",
++                                    entry_point_id,
++                                    mins,
++                                )
++                            except Exception:
++                                logger.error(
++                                    "Timer trigger failed for '%s'",
++                                    entry_point_id,
++                                    exc_info=True,
++                                )
++                            self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
++                            await asyncio.sleep(interval_secs)
+ 
+-                        return _timer_loop
++                    return _timer_loop
+ 
+-                    task = asyncio.create_task(
+-                        _make_timer(
+-                            ep_id,
+-                            interval,
+-                            run_immediately,
+-                            idle_timeout=float(tc.get("idle_timeout_seconds", 300)),
+-                        )()
+-                    )
+-                    self._timer_tasks.append(task)
+-                    logger.info(
+-                        "Started timer for entry point '%s' every %s min%s",
++                task = asyncio.create_task(
++                    _make_timer(
+                         ep_id,
+                         interval,
+-                        " (immediate first run)" if run_immediately else "",
+-                    )
++                        run_immediately,
++                        idle_timeout=float(tc.get("idle_timeout_seconds", 300)),
++                    )()
++                )
++                self._timer_tasks.append(task)
++                logger.info(
++                    "Started timer for entry point '%s' every %s min%s",
++                    ep_id,
++                    interval,
++                    " (immediate first run)" if run_immediately else "",
++                )
+ 
+-                else:
+-                    logger.warning(
+-                        "Entry point '%s' has trigger_type='timer' "
+-                        "but no 'cron' or valid 'interval_minutes' in trigger_config",
+-                        ep_id,
+-                    )
++            else:
++                logger.warning(
++                    "Entry point '%s' has trigger_type='timer' "
++                    "but no 'cron' or valid 'interval_minutes' in trigger_config",
++                    ep_id,
++                )
+ 
+             # Register primary graph
+             self._graphs[self._graph_id] = _GraphRegistration(
+@@ -781,10 +776,6 @@ async def _timer_loop():
+                 timer_next_fire=self._timer_next_fire,
+             )
+ 
+-            self._running = True
+-            self._timers_paused = False
+-            logger.info(f"AgentRuntime started with {len(self._streams)} streams")
+-
+     async def stop(self) -> None:
+         """Stop the agent runtime and all streams."""
+         if not self._running:
+@@ -818,11 +809,14 @@ async def stop(self) -> None:
+             self._streams.clear()
+             self._graphs.clear()
+ 
++            # Stop skill hot-reload watcher
++            await self._skills_manager.stop_watching()
++
+             # Stop storage
+             await self._storage.stop()
+ 
+             self._running = False
+-            logger.info("AgentRuntime stopped")
++            logger.info("AgentHost stopped")
+ 
+     def pause_timers(self) -> None:
+         """Pause all timer-driven entry points.
+@@ -841,7 +835,7 @@ def _resolve_stream(
+         self,
+         entry_point_id: str,
+         graph_id: str | None = None,
+-    ) -> ExecutionStream | None:
++    ) -> ExecutionManager | None:
+         """Find the stream for an entry point, searching the active graph first.
+ 
+         Lookup order:
+@@ -865,6 +859,56 @@ def _resolve_stream(
+         # Primary graph (also stored in self._streams)
+         return self._streams.get(entry_point_id)
+ 
++    def _apply_pipeline_results(self) -> None:
++        """Read typed attributes from pipeline stages after initialization."""
++        for stage in self._pipeline.stages:
++            name = stage.__class__.__name__
++
++            if stage.tool_registry is not None:
++                tools = list(stage.tool_registry.get_tools().values())
++                if tools:
++                    self._tools = tools
++                    self._tool_executor = stage.tool_registry.get_executor()
++                    logger.info("Pipeline: %d tools from %s", len(tools), name)
++
++            if stage.llm is not None and self._llm is None:
++                self._llm = stage.llm
++                logger.info("Pipeline: LLM from %s", name)
++
++            if stage.accounts_prompt:
++                self._accounts_prompt = stage.accounts_prompt
++                self._accounts_data = stage.accounts_data
++                self._tool_provider_map = stage.tool_provider_map
++
++            if stage.skills_manager is not None:
++                self._skills_manager = stage.skills_manager
++
++    @staticmethod
++    def _load_pipeline_from_config():
++        """Build pipeline from ``~/.hive/configuration.json`` ``pipeline`` key.
++
++        Returns an empty pipeline if no config is set.
++        """
++        from framework.config import get_hive_config
++        from framework.pipeline.registry import build_pipeline_from_config
++        from framework.pipeline.runner import PipelineRunner
++
++        config = get_hive_config()
++        stages_config = config.get("pipeline", {}).get("stages", [])
++        if not stages_config:
++            return PipelineRunner([])
++        return build_pipeline_from_config(stages_config)
++
++    async def _reload_pipeline(self) -> None:
++        """Hot-reload pipeline from config.  Atomic swap."""
++        new_pipeline = self._load_pipeline_from_config()
++        await new_pipeline.initialize_all()
++        self._pipeline = new_pipeline
++        logger.info(
++            "Pipeline reloaded: %d stages",
++            len(new_pipeline.stages),
++        )
++
+     def _prune_idempotency_keys(self) -> None:
+         """Prune expired idempotency keys based on TTL and max size."""
+         ttl = self._config.idempotency_ttl_seconds
+@@ -915,7 +959,7 @@ async def trigger(
+             RuntimeError: If runtime not running
+         """
+         if not self._running:
+-            raise RuntimeError("AgentRuntime is not running")
++            raise RuntimeError("AgentHost is not running")
+ 
+         # Idempotency check: return cached execution_id for duplicate keys.
+         if idempotency_key is not None:
+@@ -929,6 +973,21 @@ async def trigger(
+                 )
+                 return cached
+ 
++        # Run pipeline middleware (rate limiting, validation, cost guards, ...)
++        # Raises PipelineRejectedError if any stage rejects.
++        if self._pipeline.stages:
++            from framework.pipeline.stage import PipelineContext
++
++            pipeline_ctx = PipelineContext(
++                entry_point_id=entry_point_id,
++                input_data=input_data,
++                correlation_id=correlation_id,
++                session_state=session_state,
++            )
++            pipeline_ctx = await self._pipeline.run(pipeline_ctx)
++            # Stages may have transformed the input_data.
++            input_data = pipeline_ctx.input_data
++
+         stream = self._resolve_stream(entry_point_id, graph_id)
+         if stream is None:
+             raise ValueError(f"Entry point '{entry_point_id}' not found")
+@@ -1023,9 +1082,9 @@ async def add_graph(
+         graph_log_store = RuntimeLogStore(graph_base / "runtime_logs")
+ 
+         # Create streams for each entry point
+-        streams: dict[str, ExecutionStream] = {}
++        streams: dict[str, ExecutionManager] = {}
+         for ep_id, spec in entry_points.items():
+-            stream = ExecutionStream(
++            stream = ExecutionManager(
+                 stream_id=f"{graph_id}::{ep_id}",
+                 entry_spec=spec,
+                 graph=graph,
+@@ -1055,7 +1114,7 @@ async def add_graph(
+             streams[ep_id] = stream
+ 
+         # Set up event-driven subscriptions
+-        from framework.runtime.event_bus import EventType as _ET
++        from framework.host.event_bus import EventType as _ET
+ 
+         event_subs: list[str] = []
+         for ep_id, spec in entry_points.items():
+@@ -1065,8 +1124,7 @@ async def add_graph(
+             event_types = [_ET(et) for et in tc.get("event_types", [])]
+             if not event_types:
+                 logger.warning(
+-                    "Entry point '%s::%s' has trigger_type='event' "
+-                    "but no event_types in trigger_config",
++                    "Entry point '%s::%s' has trigger_type='event' but no event_types in trigger_config",
+                     graph_id,
+                     ep_id,
+                 )
+@@ -1214,24 +1272,18 @@ async def _timer_loop():
+                                     break
+                                 stream = reg.streams.get(local_ep)
+                                 if not stream:
+-                                    logger.warning(
+-                                        "Timer: no stream '%s' in '%s', stopping", local_ep, gid
+-                                    )
++                                    logger.warning("Timer: no stream '%s' in '%s', stopping", local_ep, gid)
+                                     break
+                                 # Isolated entry points get their own session;
+                                 # shared ones join the primary session.
+                                 ep_spec = reg.entry_points.get(local_ep)
+                                 if ep_spec and ep_spec.isolation_level == "isolated":
+                                     if _persistent_session_id:
+-                                        session_state = {
+-                                            "resume_session_id": _persistent_session_id
+-                                        }
++                                        session_state = {"resume_session_id": _persistent_session_id}
+                                     else:
+                                         session_state = None
+                                 else:
+-                                    session_state = self._get_primary_session_state(
+-                                        local_ep, source_graph_id=gid
+-                                    )
++                                    session_state = self._get_primary_session_state(local_ep, source_graph_id=gid)
+                                     # Gate: skip tick if no active session
+                                     if session_state is None:
+                                         logger.debug(
+@@ -1248,11 +1300,7 @@ async def _timer_loop():
+                                     session_state=session_state,
+                                 )
+                                 # Remember session ID for reuse on next tick
+-                                if (
+-                                    not _persistent_session_id
+-                                    and ep_spec
+-                                    and ep_spec.isolation_level == "isolated"
+-                                ):
++                                if not _persistent_session_id and ep_spec and ep_spec.isolation_level == "isolated":
+                                     _persistent_session_id = exec_id
+                             except Exception:
+                                 logger.error(
+@@ -1352,6 +1400,26 @@ def graph_id(self) -> str:
+         """The primary graph's ID."""
+         return self._graph_id
+ 
++    @property
++    def colony_id(self) -> str:
++        """Colony compatibility — returns the primary graph ID."""
++        return self._graph_id
++
++    def list_workers(self) -> list[str]:
++        """Colony compatibility — returns registered graph IDs."""
++        return self.list_graphs()
++
++    def get_worker_registration(self, graph_id: str):
++        """Colony compatibility — returns self for the matching graph."""
++        if graph_id in self._graphs:
++            return self
++        return None
++
++    @property
++    def streams(self) -> dict:
++        """Colony compatibility — returns _streams dict."""
++        return self._streams
++
+     @property
+     def active_graph_id(self) -> str:
+         """The currently focused graph (for TUI routing)."""
+@@ -1437,6 +1505,17 @@ async def cancel_all_tasks_async(self) -> bool:
+                             cancelled = True
+         return cancelled
+ 
++    async def stop_all_workers(self) -> bool:
++        """Alias for ``cancel_all_tasks_async`` used by queen-lifecycle tools.
++
++        Queen tools (``stop_worker``, ``switch_to_reviewing``, etc.) call
++        ``runtime.stop_all_workers()`` which is the :class:`ColonyRuntime`
++        idiom. In the current architecture the session's runtime is an
++        :class:`AgentHost`, which stops workers by cancelling their
++        execution tasks. This alias bridges the two interfaces.
++        """
++        return await self.cancel_all_tasks_async()
++
+     def _get_primary_session_state(
+         self,
+         exclude_entry_point: str,
+@@ -1479,9 +1558,7 @@ def _get_primary_session_state(
+         src_graph_id = source_graph_id or self._graph_id
+         src_reg = self._graphs.get(src_graph_id)
+         ep_spec = (
+-            src_reg.entry_points.get(exclude_entry_point)
+-            if src_reg
+-            else self._entry_points.get(exclude_entry_point)
++            src_reg.entry_points.get(exclude_entry_point) if src_reg else self._entry_points.get(exclude_entry_point)
+         )
+         if ep_spec:
+             graph = src_reg.graph if src_reg else self.graph
+@@ -1492,7 +1569,7 @@ def _get_primary_session_state(
+         # Search primary graph's streams for an active session.
+         # Skip isolated streams — they have their own session directories
+         # and must never be used as a shared session.
+-        all_streams: list[tuple[str, ExecutionStream]] = []
++        all_streams: list[tuple[str, ExecutionManager]] = []
+         for _gid, reg in self._graphs.items():
+             for ep_id, stream in reg.streams.items():
+                 # Skip isolated entry points — they run in their own namespace
+@@ -1515,9 +1592,7 @@ def _get_primary_session_state(
+                         # Filter to only input keys so stale outputs
+                         # from previous triggers don't leak through.
+                         if allowed_keys is not None:
+-                            buffer_data = {
+-                                k: v for k, v in full_buffer.items() if k in allowed_keys
+-                            }
++                            buffer_data = {k: v for k, v in full_buffer.items() if k in allowed_keys}
+                         else:
+                             buffer_data = full_buffer
+                         if buffer_data:
+@@ -1597,7 +1672,7 @@ async def cancel_execution(
+         entry_point_id: str,
+         execution_id: str,
+         graph_id: str | None = None,
+-    ) -> bool:
++    ) -> str:
+         """
+         Cancel a running execution.
+ 
+@@ -1607,11 +1682,11 @@ async def cancel_execution(
+             graph_id: Graph to search (defaults to active graph)
+ 
+         Returns:
+-            True if cancelled, False if not found
++            Cancellation outcome from the stream.
+         """
+         stream = self._resolve_stream(entry_point_id, graph_id)
+         if stream is None:
+-            return False
++            return "not_found"
+         return await stream.cancel_execution(execution_id)
+ 
+     # === QUERY OPERATIONS ===
+@@ -1653,7 +1728,7 @@ def get_timer_next_fire_in(self, entry_point_id: str) -> float | None:
+                 return max(0.0, mono - time.monotonic())
+         return None
+ 
+-    def get_stream(self, entry_point_id: str) -> ExecutionStream | None:
++    def get_stream(self, entry_point_id: str) -> ExecutionManager | None:
+         """Get a specific execution stream."""
+         return self._streams.get(entry_point_id)
+ 
+@@ -1818,96 +1893,3 @@ def is_running(self) -> bool:
+ 
+ 
+ # === CONVENIENCE FACTORY ===
+-
+-
+-def create_agent_runtime(
+-    graph: "GraphSpec",
+-    goal: "Goal",
+-    storage_path: str | Path,
+-    entry_points: list[EntryPointSpec],
+-    llm: "LLMProvider | None" = None,
+-    tools: list["Tool"] | None = None,
+-    tool_executor: Callable | None = None,
+-    config: AgentRuntimeConfig | None = None,
+-    runtime_log_store: Any = None,
+-    enable_logging: bool = True,
+-    checkpoint_config: CheckpointConfig | None = None,
+-    graph_id: str | None = None,
+-    accounts_prompt: str = "",
+-    accounts_data: list[dict] | None = None,
+-    tool_provider_map: dict[str, str] | None = None,
+-    event_bus: "EventBus | None" = None,
+-    skills_manager_config: "SkillsManagerConfig | None" = None,
+-    # Deprecated — pass skills_manager_config instead.
+-    skills_catalog_prompt: str = "",
+-    protocols_prompt: str = "",
+-    skill_dirs: list[str] | None = None,
+-) -> AgentRuntime:
+-    """
+-    Create and configure an AgentRuntime with entry points.
+-
+-    Convenience factory that creates runtime and registers entry points.
+-    Runtime logging is enabled by default for observability.
+-
+-    Args:
+-        graph: Graph specification
+-        goal: Goal driving execution
+-        storage_path: Path for persistent storage
+-        entry_points: Entry point specifications
+-        llm: LLM provider
+-        tools: Available tools
+-        tool_executor: Tool executor function
+-        config: Runtime configuration
+-        runtime_log_store: Optional RuntimeLogStore for per-execution logging.
+-            If None and enable_logging=True, creates one automatically.
+-        enable_logging: Whether to enable runtime logging (default: True).
+-            Set to False to disable logging entirely.
+-        checkpoint_config: Optional checkpoint configuration for resumable sessions.
+-            If None, uses default checkpointing behavior.
+-        graph_id: Optional identifier for the primary graph (defaults to "primary").
+-        accounts_data: Raw account data for per-node prompt generation.
+-        tool_provider_map: Tool name to provider name mapping for account routing.
+-        event_bus: Optional external EventBus to share with other components.
+-        skills_catalog_prompt: Available skills catalog for system prompt.
+-        protocols_prompt: Default skill operational protocols for system prompt.
+-        skill_dirs: Skill base directories for Tier 3 resource access.
+-        skills_manager_config: Skill configuration — the runtime owns
+-            discovery, loading, and prompt renderation internally.
+-        skills_catalog_prompt: Deprecated. Pre-rendered skills catalog.
+-        protocols_prompt: Deprecated. Pre-rendered operational protocols.
+-
+-    Returns:
+-        Configured AgentRuntime (not yet started)
+-    """
+-    # Auto-create runtime log store if logging is enabled and not provided
+-    if enable_logging and runtime_log_store is None:
+-        from framework.runtime.runtime_log_store import RuntimeLogStore
+-
+-        storage_path_obj = Path(storage_path) if isinstance(storage_path, str) else storage_path
+-        runtime_log_store = RuntimeLogStore(storage_path_obj / "runtime_logs")
+-
+-    runtime = AgentRuntime(
+-        graph=graph,
+-        goal=goal,
+-        storage_path=storage_path,
+-        llm=llm,
+-        tools=tools,
+-        tool_executor=tool_executor,
+-        config=config,
+-        runtime_log_store=runtime_log_store,
+-        checkpoint_config=checkpoint_config,
+-        graph_id=graph_id,
+-        accounts_prompt=accounts_prompt,
+-        accounts_data=accounts_data,
+-        tool_provider_map=tool_provider_map,
+-        event_bus=event_bus,
+-        skills_manager_config=skills_manager_config,
+-        skills_catalog_prompt=skills_catalog_prompt,
+-        protocols_prompt=protocols_prompt,
+-        skill_dirs=skill_dirs,
+-    )
+-
+-    for spec in entry_points:
+-        runtime.register_entry_point(spec)
+-
+-    return runtime
+diff --git a/core/framework/host/colony_metadata.py b/core/framework/host/colony_metadata.py
+new file mode 100644
+index 00000000..2c0020da
+--- /dev/null
++++ b/core/framework/host/colony_metadata.py
+@@ -0,0 +1,95 @@
++"""Read/write helpers for per-colony metadata.json.
++
++A colony's metadata.json lives at ``{COLONIES_DIR}/{colony_name}/metadata.json``
++and holds immutable provenance: the queen that created it, the forked
++session id, creation/update timestamps, and the list of workers.
++
++Mutable user-editable tool configuration lives in a sibling
++``tools.json`` sidecar — see :mod:`framework.host.colony_tools_config`
++— so identity and tool gating evolve independently.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++from pathlib import Path
++from typing import Any
++
++from framework.config import COLONIES_DIR
++
++logger = logging.getLogger(__name__)
++
++
++def colony_metadata_path(colony_name: str) -> Path:
++    """Return the on-disk path to a colony's metadata.json."""
++    return COLONIES_DIR / colony_name / "metadata.json"
++
++
++def load_colony_metadata(colony_name: str) -> dict[str, Any]:
++    """Load metadata.json for ``colony_name``.
++
++    Returns an empty dict if the file is missing or malformed — callers
++    are expected to treat missing fields as defaults.
++    """
++    path = colony_metadata_path(colony_name)
++    if not path.exists():
++        return {}
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except (json.JSONDecodeError, OSError):
++        logger.warning("Failed to read colony metadata at %s", path)
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def update_colony_metadata(colony_name: str, updates: dict[str, Any]) -> dict[str, Any]:
++    """Shallow-merge ``updates`` into metadata.json and persist.
++
++    Returns the full updated dict. Raises ``FileNotFoundError`` if the
++    colony does not exist. Writes atomically via ``os.replace`` to
++    minimize the window where a reader could see a half-written file.
++    """
++    import os
++    import tempfile
++
++    path = colony_metadata_path(colony_name)
++    if not path.parent.exists():
++        raise FileNotFoundError(f"Colony '{colony_name}' not found")
++
++    data = load_colony_metadata(colony_name) if path.exists() else {}
++    for key, value in updates.items():
++        data[key] = value
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, tmp_path = tempfile.mkstemp(
++        prefix=".metadata.",
++        suffix=".json.tmp",
++        dir=str(path.parent),
++    )
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as fh:
++            json.dump(data, fh, indent=2)
++            fh.flush()
++            os.fsync(fh.fileno())
++        os.replace(tmp_path, path)
++    except BaseException:
++        try:
++            os.unlink(tmp_path)
++        except OSError:
++            pass
++        raise
++    return data
++
++
++def list_colony_names() -> list[str]:
++    """Return the names of every colony that has a metadata.json on disk."""
++    if not COLONIES_DIR.is_dir():
++        return []
++    names: list[str] = []
++    for entry in sorted(COLONIES_DIR.iterdir()):
++        if not entry.is_dir():
++            continue
++        if (entry / "metadata.json").exists():
++            names.append(entry.name)
++    return names
+diff --git a/core/framework/host/colony_runtime.py b/core/framework/host/colony_runtime.py
+index bc639e3d..698292b2 100644
+--- a/core/framework/host/colony_runtime.py
++++ b/core/framework/host/colony_runtime.py
+@@ -185,6 +185,8 @@ def __init__(
+         protocols_prompt: str = "",
+         skill_dirs: list[str] | None = None,
+         pipeline_stages: list | None = None,
++        queen_id: str | None = None,
++        colony_name: str | None = None,
+     ):
+         from framework.pipeline.runner import PipelineRunner
+         from framework.skills.manager import SkillsManager
+@@ -193,14 +195,27 @@ def __init__(
+         self._goal = goal
+         self._config = config or ColonyConfig()
+         self._runtime_log_store = runtime_log_store
++        self._queen_id: str | None = queen_id
++        # ``colony_id`` is the event-bus scope (session.id in DM sessions);
++        # ``colony_name`` is the on-disk identity under ~/.hive/colonies/.
++        # They coincide for forked colonies but diverge for queen DM
++        # sessions, so separate them explicitly.
++        self._colony_name: str | None = colony_name
+ 
+         if pipeline_stages:
+             self._pipeline = PipelineRunner(pipeline_stages)
+         else:
+             self._pipeline = self._load_pipeline_from_config()
+ 
+-        if skills_manager_config is not None:
+-            self._skills_manager = SkillsManager(skills_manager_config)
++        # Resolve per-colony override paths so UI toggles can reach this
++        # runtime. Callers that build their own SkillsManagerConfig stay
++        # in charge; bare construction auto-wires the standard paths.
++        _effective_cfg = skills_manager_config
++        if _effective_cfg is None and not (skills_catalog_prompt or protocols_prompt):
++            _effective_cfg = self._build_default_skills_config(colony_name, queen_id)
++
++        if _effective_cfg is not None:
++            self._skills_manager = SkillsManager(_effective_cfg)
+             self._skills_manager.load()
+         elif skills_catalog_prompt or protocols_prompt:
+             import warnings
+@@ -242,6 +257,19 @@ def __init__(
+         self._tools = tools or []
+         self._tool_executor = tool_executor
+ 
++        # Per-colony MCP tool allowlist — applied when spawning workers. A
++        # value of ``None`` means "allow every MCP tool" (default), an empty
++        # list disables every MCP tool, and a list of names only enables
++        # those. Lifecycle / synthetic tools always pass through the filter
++        # because their names are absent from ``_mcp_tool_names_all``. The
++        # allowlist is re-read on every ``spawn`` so a PATCH that mutates
++        # this attribute via ``set_tool_allowlist`` takes effect on the
++        # NEXT worker spawn without a runtime restart. In-flight workers
++        # keep the tool list they booted with — workers have no dynamic
++        # tools provider today.
++        self._enabled_mcp_tools: list[str] | None = None
++        self._mcp_tool_names_all: set[str] = set()
++
+         # Worker management
+         self._workers: dict[str, Worker] = {}
+         # The persistent client-facing overseer (optional). Set by
+@@ -384,6 +412,128 @@ def _load_pipeline_from_config():
+             return PipelineRunner([])
+         return build_pipeline_from_config(stages_config)
+ 
++    @staticmethod
++    def _build_default_skills_config(
++        colony_name: str | None,
++        queen_id: str | None,
++    ) -> SkillsManagerConfig:
++        """Assemble a ``SkillsManagerConfig`` that wires in the per-colony /
++        per-queen override files and the ``queen_ui`` / ``colony_ui`` scope
++        dirs based on the standard ``~/.hive`` layout.
++
++        ``colony_name`` must be an actual on-disk colony name
++        (``~/.hive/colonies/{name}/``). DM sessions where the ``colony_id``
++        is a session UUID should pass ``None`` so we don't create a stray
++        override file under a session identifier.
++        """
++        from framework.config import COLONIES_DIR, QUEENS_DIR
++        from framework.skills.discovery import ExtraScope
++        from framework.skills.manager import SkillsManagerConfig
++
++        extras: list[ExtraScope] = []
++        queen_overrides_path: Path | None = None
++        if queen_id:
++            queen_home = QUEENS_DIR / queen_id
++            queen_overrides_path = queen_home / "skills_overrides.json"
++            extras.append(ExtraScope(directory=queen_home / "skills", label="queen_ui", priority=2))
++
++        colony_overrides_path: Path | None = None
++        if colony_name:
++            colony_home = COLONIES_DIR / colony_name
++            colony_overrides_path = colony_home / "skills_overrides.json"
++            # Colony-scope SKILL.md dir is the project-scope from discovery's
++            # point of view (colony_dir is the project_root). Add it also as
++            # a tagged ``colony_ui`` scope so UI-created entries resolve with
++            # correct provenance.
++            extras.append(
++                ExtraScope(
++                    directory=colony_home / ".hive" / "skills",
++                    label="colony_ui",
++                    priority=3,
++                )
++            )
++
++        return SkillsManagerConfig(
++            queen_id=queen_id,
++            queen_overrides_path=queen_overrides_path,
++            colony_name=colony_name,
++            colony_overrides_path=colony_overrides_path,
++            extra_scope_dirs=extras,
++            interactive=False,  # HTTP-driven runtimes never prompt for consent
++        )
++
++    @property
++    def queen_id(self) -> str | None:
++        """The queen that owns this runtime, if known."""
++        return self._queen_id
++
++    @property
++    def colony_name(self) -> str | None:
++        """The on-disk colony name (distinct from event-bus scope ``colony_id``)."""
++        return self._colony_name
++
++    @property
++    def skills_manager(self):
++        """Access the live :class:`SkillsManager` (for HTTP handlers)."""
++        return self._skills_manager
++
++    async def reload_skills(self) -> dict[str, Any]:
++        """Rebuild the catalog after an override change; in-flight workers
++        pick up the new catalog on their next iteration via
++        ``dynamic_skills_catalog_provider``.
++
++        Returns a small stats dict that HTTP handlers can echo back to
++        the UI ("applied — N skills now in catalog").
++        """
++        async with self._skills_manager.mutation_lock:
++            self._skills_manager.reload()
++            self.skill_dirs = self._skills_manager.allowlisted_dirs
++            self.batch_init_nudge = self._skills_manager.batch_init_nudge
++            self.context_warn_ratio = self._skills_manager.context_warn_ratio
++            catalog_prompt = self._skills_manager.skills_catalog_prompt
++            return {
++                "catalog_chars": len(catalog_prompt),
++                "skill_dirs": list(self.skill_dirs),
++            }
++
++    # ── Per-colony tool allowlist ───────────────────────────────
++
++    def set_tool_allowlist(
++        self,
++        enabled_mcp_tools: list[str] | None,
++        mcp_tool_names_all: set[str] | None = None,
++    ) -> None:
++        """Configure the per-colony MCP tool allowlist.
++
++        Called at construction time (from SessionManager) and again from
++        the ``/api/colony/{name}/tools`` PATCH handler when a user edits
++        the allowlist. The change applies to the NEXT worker spawn — we
++        never mutate the tool list of a worker that is already running
++        (workers have no dynamic tools provider, so hot-reloading their
++        tool set would diverge from the list the LLM was already using).
++        """
++        self._enabled_mcp_tools = list(enabled_mcp_tools) if enabled_mcp_tools is not None else None
++        if mcp_tool_names_all is not None:
++            self._mcp_tool_names_all = set(mcp_tool_names_all)
++
++    def _apply_tool_allowlist(self, tools: list) -> list:
++        """Filter ``tools`` against the colony's MCP allowlist.
++
++        Lifecycle / synthetic tools (those whose names are NOT in
++        ``_mcp_tool_names_all``) are never gated. MCP tools are kept only
++        when ``_enabled_mcp_tools`` is None (default allow) or contains
++        their name. Input list order is preserved so downstream cache
++        keys and logs stay stable.
++        """
++        if self._enabled_mcp_tools is None:
++            return tools
++        allowed = set(self._enabled_mcp_tools)
++        return [
++            t
++            for t in tools
++            if getattr(t, "name", None) not in self._mcp_tool_names_all or getattr(t, "name", None) in allowed
++        ]
++
+     # ── Lifecycle ───────────────────────────────────────────────
+ 
+     async def start(self) -> None:
+@@ -658,6 +808,14 @@ async def spawn(
+         spawn_tools = tools if tools is not None else self._tools
+         spawn_executor = tool_executor or self._tool_executor
+ 
++        # Apply the per-colony MCP tool allowlist (if any). Done HERE —
++        # after spawn_tools is resolved but before it's frozen into the
++        # worker's AgentContext — so the next spawn reflects any PATCH
++        # that happened since the last spawn. A value of ``None`` on
++        # ``_enabled_mcp_tools`` is a no-op so the default path is
++        # unchanged.
++        spawn_tools = self._apply_tool_allowlist(spawn_tools)
++
+         # Colony progress tracker: when the caller supplied a db_path
+         # in input_data, this worker is part of a SQLite task queue
+         # and must see the hive.colony-progress-tracker skill body in
+@@ -740,6 +898,17 @@ async def spawn(
+                 conversation_store=worker_conv_store,
+             )
+ 
++            # Workers pick up UI-driven override changes via this provider,
++            # which reads the live catalog on each iteration. The db_path
++            # pre-activated catalog stays static because its contents are
++            # built for *this* worker's task (a tombstone toggle from the
++            # UI should not yank it mid-run).
++            _db_path_pre_activated = bool(isinstance(input_data, dict) and input_data.get("db_path"))
++            # Default-bind the manager into the closure so each loop iteration
++            # captures the same manager instance — pyflakes B023 would flag a
++            # free-variable capture here.
++            _provider = None if _db_path_pre_activated else (lambda mgr=self._skills_manager: mgr.skills_catalog_prompt)
++
+             agent_context = AgentContext(
+                 runtime=self._make_runtime_adapter(worker_id),
+                 agent_id=worker_id,
+@@ -753,6 +922,7 @@ async def spawn(
+                 skills_catalog_prompt=_spawn_catalog,
+                 protocols_prompt=self.protocols_prompt,
+                 skill_dirs=_spawn_skill_dirs,
++                dynamic_skills_catalog_provider=_provider,
+                 execution_id=worker_id,
+                 stream_id=explicit_stream_id or f"worker:{worker_id}",
+             )
+@@ -997,6 +1167,7 @@ async def start_overseer(
+             conversation_store=overseer_conv_store,
+         )
+ 
++        _overseer_skills_mgr = self._skills_manager
+         overseer_ctx = AgentContext(
+             runtime=self._make_runtime_adapter(overseer_id),
+             agent_id=overseer_id,
+@@ -1010,6 +1181,7 @@ async def start_overseer(
+             skills_catalog_prompt=self.skills_catalog_prompt,
+             protocols_prompt=self.protocols_prompt,
+             skill_dirs=self.skill_dirs,
++            dynamic_skills_catalog_provider=lambda: _overseer_skills_mgr.skills_catalog_prompt,
+             execution_id=overseer_id,
+             stream_id="overseer",
+         )
+diff --git a/core/framework/host/colony_tools_config.py b/core/framework/host/colony_tools_config.py
+new file mode 100644
+index 00000000..96c19510
+--- /dev/null
++++ b/core/framework/host/colony_tools_config.py
+@@ -0,0 +1,162 @@
++"""Per-colony tool configuration sidecar (``tools.json``).
++
++Lives at ``~/.hive/colonies/{colony_name}/tools.json`` alongside
++``metadata.json``. Kept separate so provenance (queen_name,
++created_at, workers) stays in metadata while the user-editable tool
++allowlist gets its own file.
++
++Schema::
++
++    {
++      "enabled_mcp_tools": ["read_file", ...] | null,
++      "updated_at": "2026-04-21T12:34:56+00:00"
++    }
++
++- ``null`` / missing file → default "allow every MCP tool".
++- ``[]`` → explicitly disable every MCP tool.
++- ``["foo", "bar"]`` → only those MCP tool names pass the filter.
++
++Atomic writes via ``os.replace`` mirror
++``framework.host.colony_metadata.update_colony_metadata``.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import tempfile
++from datetime import UTC, datetime
++from pathlib import Path
++from typing import Any
++
++from framework.config import COLONIES_DIR
++
++logger = logging.getLogger(__name__)
++
++
++def tools_config_path(colony_name: str) -> Path:
++    """Return the on-disk path to a colony's ``tools.json``."""
++    return COLONIES_DIR / colony_name / "tools.json"
++
++
++def _metadata_path(colony_name: str) -> Path:
++    return COLONIES_DIR / colony_name / "metadata.json"
++
++
++def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, tmp = tempfile.mkstemp(
++        prefix=".tools.",
++        suffix=".json.tmp",
++        dir=str(path.parent),
++    )
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as fh:
++            json.dump(data, fh, indent=2)
++            fh.flush()
++            os.fsync(fh.fileno())
++        os.replace(tmp, path)
++    except BaseException:
++        try:
++            os.unlink(tmp)
++        except OSError:
++            pass
++        raise
++
++
++def _migrate_from_metadata_if_needed(colony_name: str) -> list[str] | None:
++    """Hoist a legacy ``enabled_mcp_tools`` field out of ``metadata.json``.
++
++    Returns the migrated value (or ``None`` if nothing to migrate). After
++    migration the sidecar exists and ``metadata.json`` no longer contains
++    ``enabled_mcp_tools``. Safe to call repeatedly.
++    """
++    meta_path = _metadata_path(colony_name)
++    if not meta_path.exists():
++        return None
++    try:
++        data = json.loads(meta_path.read_text(encoding="utf-8"))
++    except (json.JSONDecodeError, OSError):
++        logger.warning("Could not read metadata.json during tools migration: %s", colony_name)
++        return None
++    if not isinstance(data, dict) or "enabled_mcp_tools" not in data:
++        return None
++
++    raw = data.pop("enabled_mcp_tools")
++    enabled: list[str] | None
++    if raw is None:
++        enabled = None
++    elif isinstance(raw, list) and all(isinstance(x, str) for x in raw):
++        enabled = raw
++    else:
++        logger.warning(
++            "Legacy enabled_mcp_tools on colony %s had unexpected shape %r; dropping",
++            colony_name,
++            raw,
++        )
++        enabled = None
++
++    # Sidecar first so a partial failure leaves the config recoverable.
++    _atomic_write_json(
++        tools_config_path(colony_name),
++        {
++            "enabled_mcp_tools": enabled,
++            "updated_at": datetime.now(UTC).isoformat(),
++        },
++    )
++    _atomic_write_json(meta_path, data)
++    logger.info(
++        "Migrated enabled_mcp_tools for colony %s from metadata.json to tools.json",
++        colony_name,
++    )
++    return enabled
++
++
++def load_colony_tools_config(colony_name: str) -> list[str] | None:
++    """Return the colony's MCP tool allowlist, or ``None`` for default-allow.
++
++    Order of resolution:
++    1. ``tools.json`` sidecar (authoritative).
++    2. Legacy ``metadata.json`` field (migrated and deleted on first read).
++    3. ``None`` — default "allow every MCP tool".
++    """
++    path = tools_config_path(colony_name)
++    if path.exists():
++        try:
++            data = json.loads(path.read_text(encoding="utf-8"))
++        except (json.JSONDecodeError, OSError):
++            logger.warning("Invalid %s; treating as default-allow", path)
++            return None
++        if not isinstance(data, dict):
++            return None
++        raw = data.get("enabled_mcp_tools")
++        if raw is None:
++            return None
++        if isinstance(raw, list) and all(isinstance(x, str) for x in raw):
++            return raw
++        logger.warning("Unexpected enabled_mcp_tools shape in %s; ignoring", path)
++        return None
++
++    return _migrate_from_metadata_if_needed(colony_name)
++
++
++def update_colony_tools_config(
++    colony_name: str,
++    enabled_mcp_tools: list[str] | None,
++) -> list[str] | None:
++    """Persist a colony's MCP allowlist to ``tools.json``.
++
++    Raises ``FileNotFoundError`` if the colony's directory is missing.
++    """
++    colony_dir = COLONIES_DIR / colony_name
++    if not colony_dir.exists():
++        raise FileNotFoundError(f"Colony directory not found: {colony_name}")
++    _atomic_write_json(
++        tools_config_path(colony_name),
++        {
++            "enabled_mcp_tools": enabled_mcp_tools,
++            "updated_at": datetime.now(UTC).isoformat(),
++        },
++    )
++    return enabled_mcp_tools
+diff --git a/core/framework/host/event_bus.py b/core/framework/host/event_bus.py
+index 2d556e2a..9c17dad4 100644
+--- a/core/framework/host/event_bus.py
++++ b/core/framework/host/event_bus.py
+@@ -809,16 +809,28 @@ async def emit_llm_turn_complete(
+         input_tokens: int,
+         output_tokens: int,
+         cached_tokens: int = 0,
++        cache_creation_tokens: int = 0,
++        cost_usd: float = 0.0,
+         execution_id: str | None = None,
+         iteration: int | None = None,
+     ) -> None:
+-        """Emit LLM turn completion with stop reason and model metadata."""
++        """Emit LLM turn completion with stop reason and model metadata.
++
++        ``cached_tokens`` and ``cache_creation_tokens`` are subsets of
++        ``input_tokens`` (already inside provider ``prompt_tokens``).
++        Subscribers should display them, not add them to a total.
++
++        ``cost_usd`` is the USD cost for this turn when known (Anthropic,
++        OpenAI, OpenRouter). 0.0 means unreported (not free).
++        """
+         data: dict = {
+             "stop_reason": stop_reason,
+             "model": model,
+             "input_tokens": input_tokens,
+             "output_tokens": output_tokens,
+             "cached_tokens": cached_tokens,
++            "cache_creation_tokens": cache_creation_tokens,
++            "cost_usd": cost_usd,
+         }
+         if iteration is not None:
+             data["iteration"] = iteration
+@@ -914,24 +926,22 @@ async def emit_client_input_requested(
+         self,
+         stream_id: str,
+         node_id: str,
+-        prompt: str = "",
+         execution_id: str | None = None,
+-        options: list[str] | None = None,
+         questions: list[dict] | None = None,
+     ) -> None:
+         """Emit a user-input request for interactive queen turns.
+ 
+         Args:
+-            options: Optional predefined choices for the user (1-3 items).
+-                     The frontend appends an "Other" free-text option
+-                     automatically.
+-            questions: Optional list of question dicts for multi-question
+-                       batches (from ask_user_multiple). Each dict has id,
+-                       prompt, and optional options.
++            questions: Optional list of question dicts from ``ask_user``.
++                Each dict has ``id``, ``prompt``, and optional ``options``
++                (2-3 predefined choices). The frontend renders the
++                QuestionWidget for a single-entry list and the
++                MultiQuestionWidget for 2+ entries. Free-text asks (no
++                options) stream the prompt separately as a chat message;
++                auto-block turns have no questions at all and fall back
++                to the normal text input.
+         """
+-        data: dict[str, Any] = {"prompt": prompt}
+-        if options:
+-            data["options"] = options
++        data: dict[str, Any] = {}
+         if questions:
+             data["questions"] = questions
+         await self.publish(
+diff --git a/core/framework/loader/agent_loader.py b/core/framework/loader/agent_loader.py
+index 2649a85e..f18c6f25 100644
+--- a/core/framework/loader/agent_loader.py
++++ b/core/framework/loader/agent_loader.py
+@@ -9,27 +9,23 @@
+ from pathlib import Path
+ from typing import Any
+ 
+-from framework.config import get_hive_config, get_max_context_tokens, get_preferred_model
++from framework.config import get_hive_config, get_preferred_model
+ from framework.credentials.validation import (
+     ensure_credential_key_env as _ensure_credential_key_env,
+ )
+-from framework.graph import Goal
+-from framework.graph.edge import (
+-    DEFAULT_MAX_TOKENS,
++from framework.host.agent_host import AgentHost, AgentRuntimeConfig
++from framework.host.execution_manager import EntryPointSpec
++from framework.llm.provider import LLMProvider, Tool
++from framework.loader.preload_validation import run_preload_validation
++from framework.loader.tool_registry import ToolRegistry
++from framework.orchestrator import Goal
++from framework.orchestrator.edge import (
+     EdgeCondition,
+     EdgeSpec,
+     GraphSpec,
+ )
+-from framework.graph.executor import ExecutionResult
+-from framework.graph.node import NodeSpec
+-from framework.llm.provider import LLMProvider, Tool
+-from framework.model_routing import resolve_model_chain, resolve_model_connection
+-from framework.runner.preload_validation import run_preload_validation
+-from framework.runner.tool_registry import ToolRegistry
+-from framework.runtime.agent_runtime import AgentRuntime, AgentRuntimeConfig, create_agent_runtime
+-from framework.runtime.execution_stream import EntryPointSpec
+-from framework.runtime.runtime_log_store import RuntimeLogStore
+-from framework.tools.flowchart_utils import generate_fallback_flowchart
++from framework.orchestrator.node import NodeSpec
++from framework.orchestrator.orchestrator import ExecutionResult
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -557,18 +553,10 @@ def get_kimi_code_token() -> str | None:
+ # VSCode-style SQLite state database under the key
+ # "antigravityUnifiedStateSync.oauthToken" as a base64-encoded protobuf blob.
+ ANTIGRAVITY_IDE_STATE_DB = (
+-    Path.home()
+-    / "Library"
+-    / "Application Support"
+-    / "Antigravity"
+-    / "User"
+-    / "globalStorage"
+-    / "state.vscdb"
++    Path.home() / "Library" / "Application Support" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
+ )
+ # Linux fallback for the IDE state DB
+-ANTIGRAVITY_IDE_STATE_DB_LINUX = (
+-    Path.home() / ".config" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
+-)
++ANTIGRAVITY_IDE_STATE_DB_LINUX = Path.home() / ".config" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
+ # Antigravity credentials stored by native OAuth implementation
+ ANTIGRAVITY_AUTH_FILE = Path.home() / ".hive" / "antigravity-accounts.json"
+ 
+@@ -712,9 +700,7 @@ def _is_antigravity_token_expired(auth_data: dict) -> bool:
+             return True
+     elif isinstance(last_refresh_val, str):
+         try:
+-            last_refresh_val = datetime.fromisoformat(
+-                last_refresh_val.replace("Z", "+00:00")
+-            ).timestamp()
++            last_refresh_val = datetime.fromisoformat(last_refresh_val.replace("Z", "+00:00")).timestamp()
+         except (ValueError, TypeError):
+             return True
+ 
+@@ -845,8 +831,7 @@ def get_antigravity_token() -> str | None:
+         return token_data["access_token"]
+ 
+     logger.warning(
+-        "Antigravity token refresh failed. "
+-        "Re-open the Antigravity IDE or run 'antigravity-auth accounts add'."
++        "Antigravity token refresh failed. Re-open the Antigravity IDE or run 'antigravity-auth accounts add'."
+     )
+     return access_token
+ 
+@@ -882,6 +867,167 @@ class ValidationResult:
+     missing_credentials: list[str] = field(default_factory=list)
+ 
+ 
++def _resolve_template_vars(text: str | None, variables: dict[str, str]) -> str | None:
++    """Resolve ``{{variable_name}}`` placeholders in *text*."""
++    if text is None or not variables:
++        return text
++    import re
++
++    def _replace(m: re.Match) -> str:
++        key = m.group(1).strip()
++        return variables.get(key, m.group(0))
++
++    return re.sub(r"\{\{(.+?)\}\}", _replace, text)
++
++
++def load_agent_config(data: str | dict) -> tuple[GraphSpec, Goal]:
++    """Load ``GraphSpec`` and ``Goal`` from a declarative :class:`AgentConfig`.
++
++    The declarative format uses a ``name`` key at the top level, unlike the
++    legacy export format which uses ``graph``/``goal`` keys.  The runner
++    auto-detects the format in :meth:`AgentLoader.load`.
++
++    Template variables in ``config.variables`` are resolved in all
++    ``system_prompt`` and ``identity_prompt`` fields via ``{{var_name}}``.
++
++    Returns:
++        Tuple of (GraphSpec, Goal)
++    """
++    from framework.orchestrator.edge import EdgeCondition, EdgeSpec
++    from framework.orchestrator.goal import Constraint, Goal as GoalModel, SuccessCriterion
++    from framework.schemas.agent_config import AgentConfig
++
++    if isinstance(data, str):
++        data = json.loads(data)
++
++    config = AgentConfig.model_validate(data)
++    tvars = config.variables
++
++    # Build Goal
++    success_criteria = [
++        SuccessCriterion(
++            id=f"sc-{i}",
++            description=sc,
++            metric="llm_judge",
++            target="",
++        )
++        for i, sc in enumerate(config.goal.success_criteria)
++    ]
++    constraints = [
++        Constraint(
++            id=f"c-{i}",
++            description=c,
++            constraint_type="hard",
++            category="general",
++        )
++        for i, c in enumerate(config.goal.constraints)
++    ]
++    goal = GoalModel(
++        id=f"{config.name}-goal",
++        name=config.name,
++        description=config.goal.description,
++        success_criteria=success_criteria,
++        constraints=constraints,
++    )
++
++    # Build nodes
++    condition_map = {
++        "always": EdgeCondition.ALWAYS,
++        "on_success": EdgeCondition.ON_SUCCESS,
++        "on_failure": EdgeCondition.ON_FAILURE,
++        "conditional": EdgeCondition.CONDITIONAL,
++        "llm_decide": EdgeCondition.LLM_DECIDE,
++    }
++
++    nodes = []
++    for nc in config.nodes:
++        # Resolve tool access: node-level config -> agent-level fallback
++        if nc.tools.policy == "explicit" and nc.tools.allowed:
++            tools_list = nc.tools.allowed
++            tool_policy = "explicit"
++        elif nc.tools.policy == "none":
++            tools_list = []
++            tool_policy = "none"
++        else:
++            # Inherit agent-level tool config
++            if config.tools.policy == "explicit" and config.tools.allowed:
++                tools_list = config.tools.allowed
++            else:
++                tools_list = []
++            tool_policy = config.tools.policy
++
++        node_kwargs: dict = {
++            "id": nc.id,
++            "name": nc.name or nc.id,
++            "description": nc.description or "",
++            "node_type": nc.node_type,
++            "system_prompt": _resolve_template_vars(nc.system_prompt, tvars),
++            "tools": tools_list,
++            "tool_access_policy": tool_policy,
++            "model": nc.model,
++            "input_keys": nc.input_keys,
++            "output_keys": nc.output_keys,
++            "nullable_output_keys": nc.nullable_output_keys,
++            "max_iterations": nc.max_iterations,
++            "success_criteria": nc.success_criteria,
++            "skip_judge": nc.skip_judge,
++        }
++        # Optional fields -- only pass when set (avoids overriding defaults)
++        if nc.client_facing:
++            node_kwargs["client_facing"] = nc.client_facing
++        if nc.max_node_visits != 1:
++            node_kwargs["max_node_visits"] = nc.max_node_visits
++        if nc.failure_criteria:
++            node_kwargs["failure_criteria"] = nc.failure_criteria
++        if nc.max_retries is not None:
++            node_kwargs["max_retries"] = nc.max_retries
++
++        nodes.append(NodeSpec(**node_kwargs))
++
++    # Build edges
++    edges = []
++    for i, ec in enumerate(config.edges):
++        edges.append(
++            EdgeSpec(
++                id=f"e-{i}-{ec.from_node}-{ec.to_node}",
++                source=ec.from_node,
++                target=ec.to_node,
++                condition=condition_map.get(ec.condition, EdgeCondition.ON_SUCCESS),
++                condition_expr=ec.condition_expr,
++                priority=ec.priority,
++                input_mapping=ec.input_mapping,
++            )
++        )
++
++    # Build entry_points dict for GraphSpec
++    entry_points_dict: dict = {}
++    if config.entry_points:
++        for ep in config.entry_points:
++            entry_points_dict[ep.id] = ep.entry_node or config.entry_node
++    else:
++        entry_points_dict = {"default": config.entry_node}
++
++    # Build GraphSpec
++    graph_kwargs: dict = {
++        "id": f"{config.name}-graph",
++        "goal_id": goal.id,
++        "version": config.version,
++        "entry_node": config.entry_node,
++        "entry_points": entry_points_dict,
++        "terminal_nodes": config.terminal_nodes,
++        "pause_nodes": config.pause_nodes,
++        "nodes": nodes,
++        "edges": edges,
++        "max_tokens": config.max_tokens,
++        "loop_config": dict(config.loop_config),
++        "conversation_mode": config.conversation_mode,
++        "identity_prompt": _resolve_template_vars(config.identity_prompt, tvars) or "",
++    }
++
++    graph = GraphSpec(**graph_kwargs)
++    return graph, goal
++
++
+ def load_agent_export(data: str | dict) -> tuple[GraphSpec, Goal]:
+     """
+     Load GraphSpec and Goal from export_graph() output.
+@@ -943,7 +1089,7 @@ def load_agent_export(data: str | dict) -> tuple[GraphSpec, Goal]:
+     )
+ 
+     # Build Goal
+-    from framework.graph.goal import Constraint, SuccessCriterion
++    from framework.orchestrator.goal import Constraint, SuccessCriterion
+ 
+     success_criteria = []
+     for sc_data in goal_data.get("success_criteria", []):
+@@ -980,7 +1126,7 @@ def load_agent_export(data: str | dict) -> tuple[GraphSpec, Goal]:
+     return graph, goal
+ 
+ 
+-class AgentRunner:
++class AgentLoader:
+     """
+     Loads and runs exported agents with minimal boilerplate.
+ 
+@@ -992,25 +1138,22 @@ class AgentRunner:
+ 
+     Usage:
+         # Simple usage
+-        runner = AgentRunner.load("exports/outbound-sales-agent")
++        runner = AgentLoader.load("exports/outbound-sales-agent")
+         result = await runner.run({"lead_id": "123"})
+ 
+         # With context manager
+-        async with AgentRunner.load("exports/outbound-sales-agent") as runner:
++        async with AgentLoader.load("exports/outbound-sales-agent") as runner:
+             result = await runner.run({"lead_id": "123"})
+ 
+         # With custom tools
+-        runner = AgentRunner.load("exports/outbound-sales-agent")
++        runner = AgentLoader.load("exports/outbound-sales-agent")
+         runner.register_tool("my_tool", my_tool_func)
+         result = await runner.run({"lead_id": "123"})
+     """
+ 
+     @staticmethod
+-    def _resolve_default_model(task_profile: str | None = None) -> str:
+-        """Resolve default model from profile routing first, then global config."""
+-        chain = resolve_model_chain(profile=task_profile)
+-        if chain:
+-            return chain[0]
++    def _resolve_default_model() -> str:
++        """Resolve the default model from ~/.hive/configuration.json."""
+         return get_preferred_model()
+ 
+     def __init__(
+@@ -1021,7 +1164,6 @@ def __init__(
+         mock_mode: bool = False,
+         storage_path: Path | None = None,
+         model: str | None = None,
+-        task_profile: str | None = None,
+         intro_message: str = "",
+         runtime_config: "AgentRuntimeConfig | None" = None,
+         interactive: bool = True,
+@@ -1032,7 +1174,7 @@ def __init__(
+         credential_store: Any | None = None,
+     ):
+         """
+-        Initialize the runner (use AgentRunner.load() instead).
++        Initialize the runner (use AgentLoader.load() instead).
+ 
+         Args:
+             agent_path: Path to agent folder
+@@ -1055,8 +1197,7 @@ def __init__(
+         self.graph = graph
+         self.goal = goal
+         self.mock_mode = mock_mode
+-        self.task_profile = task_profile
+-        self.model = model or self._resolve_default_model(task_profile)
++        self.model = model or self._resolve_default_model()
+         self.intro_message = intro_message
+         self.runtime_config = runtime_config
+         self._interactive = interactive
+@@ -1071,7 +1212,6 @@ def __init__(
+             self._storage_path = storage_path
+             self._temp_dir = None
+         else:
+-            # Use persistent storage in ~/.hive/agents/{agent_name}/ per RUNTIME_LOGGING.md spec
+             home = Path.home()
+             default_storage = home / ".hive" / "agents" / agent_path.name
+             default_storage.mkdir(parents=True, exist_ok=True)
+@@ -1088,7 +1228,7 @@ def __init__(
+         self._approval_callback: Callable | None = None
+ 
+         # AgentRuntime — unified execution path for all agents
+-        self._agent_runtime: AgentRuntime | None = None
++        self._agent_runtime: AgentHost | None = None
+         # Pre-load validation: structural checks + credentials.
+         # Fails fast with actionable guidance — no MCP noise on screen.
+         run_preload_validation(
+@@ -1102,18 +1242,18 @@ def __init__(
+         if tools_path.exists():
+             self._tool_registry.discover_from_module(tools_path)
+ 
+-        # Set environment variables for MCP subprocesses
+-        # These are inherited by MCP servers (e.g., GCU browser tools)
+-        os.environ["HIVE_AGENT_NAME"] = agent_path.name
+-        os.environ["HIVE_STORAGE_PATH"] = str(self._storage_path)
+-
+-        # Auto-discover MCP servers from mcp_servers.json
+-        mcp_config_path = agent_path / "mcp_servers.json"
+-        if mcp_config_path.exists():
+-            self._load_mcp_servers_from_config(mcp_config_path)
++        # Per-agent env for MCP subprocesses. Stored on the registry so
++        # parallel workers in the same process don't clobber each other
++        # via the shared os.environ dict — the registry merges these
++        # into every MCPServerConfig.env at registration time.
++        self._tool_registry.set_mcp_extra_env(
++            {
++                "HIVE_AGENT_NAME": agent_path.name,
++                "HIVE_STORAGE_PATH": str(self._storage_path),
++            }
++        )
+ 
+-        # Auto-discover registry-selected MCP servers from mcp_registry.json
+-        self._load_registry_mcp_servers(agent_path)
++        # MCP tools are loaded by McpRegistryStage in the pipeline during AgentHost.start()
+ 
+     @staticmethod
+     def _import_agent_module(agent_path: Path):
+@@ -1144,11 +1284,7 @@ def _import_agent_module(agent_path: Path):
+         # Evict cached submodules first (e.g. deep_research_agent.nodes,
+         # deep_research_agent.agent) so the top-level reload picks up
+         # changes in the entire package — not just __init__.py.
+-        stale = [
+-            name
+-            for name in sys.modules
+-            if name == package_name or name.startswith(f"{package_name}.")
+-        ]
++        stale = [name for name in sys.modules if name == package_name or name.startswith(f"{package_name}.")]
+         for name in stale:
+             del sys.modules[name]
+ 
+@@ -1161,172 +1297,100 @@ def load(
+         mock_mode: bool = False,
+         storage_path: Path | None = None,
+         model: str | None = None,
+-        task_profile: str | None = None,
+         interactive: bool = True,
+         skip_credential_validation: bool | None = None,
+         credential_store: Any | None = None,
+-    ) -> "AgentRunner":
++    ) -> "AgentLoader":
+         """
+-        Load an agent from an export folder.
++        Load a colony worker from its config directory.
+ 
+-        Imports the agent's Python package and reads module-level variables
+-        (goal, nodes, edges, etc.) to build a GraphSpec. Falls back to
+-        agent.json if no Python module is found.
++        Finds {worker_name}.json files in the directory and builds a
++        minimal GraphSpec from the first one found.
+ 
+         Args:
+-            agent_path: Path to agent folder
++            agent_path: Path to colony directory containing worker config JSONs
+             mock_mode: If True, use mock LLM responses
+-            storage_path: Path for runtime storage (defaults to ~/.hive/agents/{name})
+-            model: LLM model to use (reads from agent's default_config if None)
+-            task_profile: Optional model routing profile (heavy, implementation,
+-                documentation, review_validation). Applied only when model is None.
++            storage_path: Path for runtime storage
++            model: LLM model to use
+             interactive: If True (default), offer interactive credential setup.
+-                Set to False from TUI callers that handle setup via their own UI.
+-            skip_credential_validation: If True, skip credential checks at load time.
+-                When None (default), uses the agent module's setting.
+-            credential_store: Optional shared CredentialStore (avoids creating redundant stores).
++            skip_credential_validation: If True, skip credential checks.
++            credential_store: Optional shared CredentialStore.
+ 
+         Returns:
+-            AgentRunner instance ready to run
++            AgentLoader instance ready to run
+         """
+         agent_path = Path(agent_path)
+ 
+-        # Try loading from Python module first (code-based agents)
+-        agent_py = agent_path / "agent.py"
+-        if agent_py.exists():
+-            agent_module = cls._import_agent_module(agent_path)
++        # Find {worker_name}.json worker config files in the colony directory
++        worker_jsons = sorted(
++            p
++            for p in agent_path.iterdir()
++            if p.is_file()
++            and p.suffix == ".json"
++            and p.stem not in ("agent", "flowchart", "triggers", "configuration", "metadata")
++        )
+ 
+-            goal = getattr(agent_module, "goal", None)
+-            nodes = getattr(agent_module, "nodes", None)
+-            edges = getattr(agent_module, "edges", None)
++        if not worker_jsons:
++            raise FileNotFoundError(f"No worker config found in {agent_path}")
+ 
+-            if goal is None or nodes is None or edges is None:
+-                raise ValueError(
+-                    f"Agent at {agent_path} must define 'goal', 'nodes', and 'edges' "
+-                    f"in agent.py (or __init__.py)"
+-                )
+-
+-            # Read model and max_tokens from agent's config if not explicitly provided
+-            agent_config = getattr(agent_module, "default_config", None)
+-            if model is None:
+-                if agent_config and hasattr(agent_config, "model"):
+-                    model = agent_config.model
+-
+-            if agent_config and hasattr(agent_config, "max_tokens"):
+-                max_tokens = agent_config.max_tokens
+-                logger.info(
+-                    "Agent default_config overrides max_tokens: %d "
+-                    "(configuration.json value ignored)",
+-                    max_tokens,
+-                )
+-            else:
+-                hive_config = get_hive_config()
+-                max_tokens = hive_config.get("llm", {}).get("max_tokens", DEFAULT_MAX_TOKENS)
+-
+-            # Resolve max_context_tokens with priority:
+-            #   1. agent loop_config["max_context_tokens"] (explicit, wins silently)
+-            #   2. agent default_config.max_context_tokens (logged)
+-            #   3. configuration.json llm.max_context_tokens
+-            #   4. hardcoded default (32_000)
+-            agent_loop_config: dict = dict(getattr(agent_module, "loop_config", {}))
+-            if "max_context_tokens" not in agent_loop_config:
+-                if agent_config and hasattr(agent_config, "max_context_tokens"):
+-                    agent_loop_config["max_context_tokens"] = agent_config.max_context_tokens
+-                    logger.info(
+-                        "Agent default_config overrides max_context_tokens: %d"
+-                        " (configuration.json value ignored)",
+-                        agent_config.max_context_tokens,
+-                    )
+-                else:
+-                    agent_loop_config["max_context_tokens"] = get_max_context_tokens()
+-
+-            # Read intro_message from agent metadata (shown on TUI load)
+-            agent_metadata = getattr(agent_module, "metadata", None)
+-            intro_message = ""
+-            if agent_metadata and hasattr(agent_metadata, "intro_message"):
+-                intro_message = agent_metadata.intro_message
+-
+-            # Build GraphSpec from module-level variables
+-            graph_kwargs: dict = {
+-                "id": f"{agent_path.name}-graph",
+-                "goal_id": goal.id,
+-                "version": "1.0.0",
+-                "entry_node": getattr(agent_module, "entry_node", nodes[0].id),
+-                "entry_points": getattr(agent_module, "entry_points", {}),
+-                "terminal_nodes": getattr(agent_module, "terminal_nodes", []),
+-                "pause_nodes": getattr(agent_module, "pause_nodes", []),
+-                "nodes": nodes,
+-                "edges": edges,
+-                "max_tokens": max_tokens,
+-                "loop_config": agent_loop_config,
+-            }
+-            # Only pass optional fields if explicitly defined by the agent module
+-            conversation_mode = getattr(agent_module, "conversation_mode", None)
+-            if conversation_mode is not None:
+-                graph_kwargs["conversation_mode"] = conversation_mode
+-            identity_prompt = getattr(agent_module, "identity_prompt", None)
+-            if identity_prompt is not None:
+-                graph_kwargs["identity_prompt"] = identity_prompt
+-
+-            graph = GraphSpec(**graph_kwargs)
+-
+-            # Generate flowchart.json if missing (for template/legacy agents)
+-            generate_fallback_flowchart(graph, goal, agent_path)
+-            # Read skill configuration from agent module
+-            agent_default_skills = getattr(agent_module, "default_skills", None)
+-            agent_skills = getattr(agent_module, "skills", None)
+-
+-            # Read runtime config (webhook settings, etc.) if defined
+-            agent_runtime_config = getattr(agent_module, "runtime_config", None)
+-
+-            # Read pre-run hooks (e.g., credential_tester needs account selection)
+-            skip_cred = getattr(agent_module, "skip_credential_validation", False)
+-            if skip_credential_validation is not None:
+-                skip_cred = skip_credential_validation
+-            needs_acct = getattr(agent_module, "requires_account_selection", False)
+-            configure_fn = getattr(agent_module, "configure_for_account", None)
+-            list_accts_fn = getattr(agent_module, "list_connected_accounts", None)
+-
+-            runner = cls(
+-                agent_path=agent_path,
+-                graph=graph,
+-                goal=goal,
+-                mock_mode=mock_mode,
+-                storage_path=storage_path,
+-                model=model,
+-                task_profile=task_profile,
+-                intro_message=intro_message,
+-                runtime_config=agent_runtime_config,
+-                interactive=interactive,
+-                skip_credential_validation=skip_cred,
+-                requires_account_selection=needs_acct,
+-                configure_for_account=configure_fn,
+-                list_accounts=list_accts_fn,
+-                credential_store=credential_store,
+-            )
+-            # Stash skill config for use in _setup()
+-            runner._agent_default_skills = agent_default_skills
+-            runner._agent_skills = agent_skills
+-            return runner
++        from framework.orchestrator.edge import GraphSpec
++        from framework.orchestrator.goal import Constraint, Goal as GoalModel, SuccessCriterion
++        from framework.orchestrator.node import NodeSpec
+ 
+-        # Fallback: load from agent.json (legacy JSON-based agents)
+-        agent_json_path = agent_path / "agent.json"
+-        if not agent_json_path.is_file():
+-            raise FileNotFoundError(f"No agent.py or agent.json found in {agent_path}")
++        # Load the first worker config
++        first_worker = json.loads(worker_jsons[0].read_text(encoding="utf-8"))
++        worker_name = first_worker.get("name", worker_jsons[0].stem)
++        system_prompt = first_worker.get("system_prompt", "")
++        tool_names = first_worker.get("tools", [])
++        goal_data = first_worker.get("goal", {})
++        loop_config = first_worker.get("loop_config", {})
+ 
+-        with open(agent_json_path, encoding="utf-8") as f:
+-            export_data = f.read()
++        success_criteria = [
++            SuccessCriterion(id=f"sc-{i}", description=sc, metric="llm_judge", target="")
++            for i, sc in enumerate(goal_data.get("success_criteria", []))
++        ]
++        constraints = [
++            Constraint(id=f"c-{i}", description=c, constraint_type="hard", category="general")
++            for i, c in enumerate(goal_data.get("constraints", []))
++        ]
++        goal = GoalModel(
++            id=f"{agent_path.name}-goal",
++            name=goal_data.get("description", worker_name),
++            description=goal_data.get("description", ""),
++            success_criteria=success_criteria,
++            constraints=constraints,
++        )
+ 
+-        if not export_data.strip():
+-            raise ValueError(f"Empty agent export file: {agent_json_path}")
++        node = NodeSpec(
++            id=worker_name,
++            name=worker_name.replace("_", " ").title(),
++            description=first_worker.get("description", ""),
++            node_type="event_loop",
++            tools=tool_names,
++            system_prompt=system_prompt,
++        )
++        graph = GraphSpec(
++            id=f"{agent_path.name}-graph",
++            goal_id=goal.id,
++            entry_node=worker_name,
++            nodes=[node],
++            edges=[],
++            max_tokens=loop_config.get("max_tokens", 4096),
++            loop_config=loop_config,
++            identity_prompt=first_worker.get("identity_prompt", ""),
++            conversation_mode="continuous",
++        )
+ 
+-        try:
+-            graph, goal = load_agent_export(export_data)
+-        except json.JSONDecodeError as exc:
+-            raise ValueError(f"Invalid JSON in agent export file: {agent_json_path}") from exc
++        logger.info(
++            "Loaded colony worker config from %s (name=%s, tools=%d)",
++            worker_jsons[0].name,
++            worker_name,
++            len(tool_names),
++        )
+ 
+-        # Generate flowchart.json if missing (for legacy JSON-based agents)
+-        generate_fallback_flowchart(graph, goal, agent_path)
++        if storage_path is None:
++            storage_path = Path.home() / ".hive" / "agents" / agent_path.name / worker_name
++            storage_path.mkdir(parents=True, exist_ok=True)
+ 
+         runner = cls(
+             agent_path=agent_path,
+@@ -1335,13 +1399,23 @@ def load(
+             mock_mode=mock_mode,
+             storage_path=storage_path,
+             model=model,
+-            task_profile=task_profile,
+             interactive=interactive,
+             skip_credential_validation=skip_credential_validation or False,
+             credential_store=credential_store,
+         )
+         runner._agent_default_skills = None
+-        runner._agent_skills = None
++        # Colony workers attached to a SQLite task queue get the
++        # colony-progress-tracker skill pre-activated so its full
++        # claim / step / SOP-gate protocol lands in the system prompt
++        # on turn 0, bypassing the progressive-disclosure catalog
++        # lookup. Triggered by the presence of ``input_data.db_path``
++        # in worker.json (written by fork_session_into_colony and
++        # backfilled by ensure_progress_db for pre-existing colonies).
++        _preactivate: list[str] = []
++        _input_data = first_worker.get("input_data") or {}
++        if isinstance(_input_data, dict) and _input_data.get("db_path"):
++            _preactivate.append("hive.colony-progress-tracker")
++        runner._agent_skills = _preactivate or None
+         return runner
+ 
+     def register_tool(
+@@ -1407,60 +1481,6 @@ def register_mcp_server(
+         }
+         return self._tool_registry.register_mcp_server(server_config)
+ 
+-    def _load_mcp_servers_from_config(self, config_path: Path) -> None:
+-        """Load and register MCP servers from a configuration file."""
+-        self._tool_registry.load_mcp_config(config_path)
+-
+-    def _load_registry_mcp_servers(self, agent_path: Path) -> None:
+-        """Load and register MCP servers selected via ``mcp_registry.json``."""
+-        registry_json = agent_path / "mcp_registry.json"
+-        if registry_json.is_file():
+-            self._tool_registry.set_mcp_registry_agent_path(agent_path)
+-        else:
+-            self._tool_registry.set_mcp_registry_agent_path(None)
+-
+-        from framework.runner.mcp_registry import MCPRegistry
+-
+-        try:
+-            registry = MCPRegistry()
+-            registry.initialize()
+-            server_configs, selection_max_tools = registry.load_agent_selection(agent_path)
+-        except Exception as exc:
+-            logger.warning(
+-                "Failed to load MCP registry servers for '%s': %s",
+-                agent_path.name,
+-                exc,
+-            )
+-            return
+-
+-        if not server_configs:
+-            return
+-
+-        results = self._tool_registry.load_registry_servers(
+-            server_configs,
+-            preserve_existing_tools=True,
+-            log_collisions=True,
+-            max_tools=selection_max_tools,
+-        )
+-        loaded = [result for result in results if result["status"] == "loaded"]
+-        skipped = [result for result in results if result["status"] != "loaded"]
+-
+-        logger.info(
+-            "Loaded %d/%d MCP registry server(s) for agent '%s'",
+-            len(loaded),
+-            len(results),
+-            agent_path.name,
+-        )
+-        if skipped:
+-            logger.info(
+-                "Skipped MCP registry servers for agent '%s': %s",
+-                agent_path.name,
+-                [
+-                    {"server": result["server"], "reason": result["skipped_reason"]}
+-                    for result in skipped
+-                ],
+-            )
+-
+     def set_approval_callback(self, callback: Callable) -> None:
+         """
+         Set a callback for human-in-the-loop approval during execution.
+@@ -1471,274 +1491,116 @@ def set_approval_callback(self, callback: Callable) -> None:
+         self._approval_callback = callback
+ 
+     def _setup(self, event_bus=None) -> None:
+-        """Set up runtime, LLM, and executor."""
+-        # Configure structured logging (auto-detects JSON vs human-readable)
++        """Set up runtime via pipeline stages.
++
++        Builds a pipeline with the default stages (LLM, credentials, MCP,
++        skills) and passes it to AgentHost.  The stages initialize during
++        ``AgentHost.start()`` and inject tools/LLM/credentials/skills.
++        """
+         from framework.observability import configure_logging
++        from framework.pipeline.stages.credential_resolver import CredentialResolverStage
++        from framework.pipeline.stages.llm_provider import LlmProviderStage
++        from framework.pipeline.stages.mcp_registry import McpRegistryStage
++        from framework.pipeline.stages.skill_registry import SkillRegistryStage
++        from framework.skills.config import SkillsConfig
+ 
+         configure_logging(level="INFO", format="auto")
+ 
+-        # Set up session context for tools (agent_id)
++        # Set up session context for tools
+         agent_id = self.graph.id or "unknown"
++        self._tool_registry.set_session_context(agent_id=agent_id)
+ 
+-        self._tool_registry.set_session_context(
+-            agent_id=agent_id,
+-        )
+-
+-        # Create LLM provider
+-        # Uses LiteLLM which auto-detects the provider from model name
+-        # Skip if already injected (e.g. worker agents with a pre-built LLM)
+-        if self._llm is not None:
+-            pass  # LLM already configured externally
+-        elif self.mock_mode:
+-            # Use mock LLM for testing without real API calls
+-            from framework.llm.mock import MockLLMProvider
+-
+-            self._llm = MockLLMProvider(model=self.model)
+-        else:
+-            from framework.llm.litellm import LiteLLMProvider
+-
+-            # Check if a subscription mode is configured
+-            config = get_hive_config()
+-            llm_config = config.get("llm", {})
+-            use_claude_code = llm_config.get("use_claude_code_subscription", False)
+-            use_codex = llm_config.get("use_codex_subscription", False)
+-            use_kimi_code = llm_config.get("use_kimi_code_subscription", False)
+-            use_antigravity = llm_config.get("use_antigravity_subscription", False)
+-            api_base = llm_config.get("api_base")
+-
+-            api_key = None
+-            if use_claude_code:
+-                # Get OAuth token from Claude Code subscription
+-                api_key = get_claude_code_token()
+-                if not api_key:
+-                    logger.warning(
+-                        "Claude Code subscription configured but no token found. "
+-                        "Run 'claude' to authenticate, then try again."
+-                    )
+-            elif use_codex:
+-                # Get OAuth token from Codex subscription
+-                api_key = get_codex_token()
+-                if not api_key:
+-                    logger.warning(
+-                        "Codex subscription configured but no token found. "
+-                        "Run 'codex' to authenticate, then try again."
+-                    )
+-            elif use_kimi_code:
+-                # Get API key from Kimi Code CLI config (~/.kimi/config.toml)
+-                api_key = get_kimi_code_token()
+-                if not api_key:
+-                    logger.warning(
+-                        "Kimi Code subscription configured but no key found. "
+-                        "Run 'kimi /login' to authenticate, then try again."
+-                    )
+-            elif use_antigravity:
+-                pass  # AntigravityProvider handles credentials internally
+-
+-            if api_key and use_claude_code:
+-                # Use litellm's built-in Anthropic OAuth support.
+-                # The lowercase "authorization" key triggers OAuth detection which
+-                # adds the required anthropic-beta and browser-access headers.
+-                self._llm = LiteLLMProvider(
+-                    model=self.model,
+-                    api_key=api_key,
+-                    api_base=api_base,
+-                    extra_headers={"authorization": f"Bearer {api_key}"},
+-                )
+-            elif api_key and use_codex:
+-                # OpenAI Codex subscription routes through the ChatGPT backend
+-                # (chatgpt.com/backend-api/codex/responses), NOT the standard
+-                # OpenAI API.  The consumer OAuth token lacks platform API scopes.
+-                extra_headers: dict[str, str] = {
+-                    "Authorization": f"Bearer {api_key}",
+-                    "User-Agent": "CodexBar",
+-                }
+-                account_id = get_codex_account_id()
+-                if account_id:
+-                    extra_headers["ChatGPT-Account-Id"] = account_id
+-                self._llm = LiteLLMProvider(
+-                    model=self.model,
+-                    api_key=api_key,
+-                    api_base="https://chatgpt.com/backend-api/codex",
+-                    extra_headers=extra_headers,
+-                    store=False,
+-                    allowed_openai_params=["store"],
+-                )
+-            elif api_key and use_kimi_code:
+-                # Kimi Code subscription uses the Kimi coding API (OpenAI-compatible).
+-                # The api_base is set automatically by LiteLLMProvider for kimi/ models.
+-                self._llm = LiteLLMProvider(
+-                    model=self.model,
+-                    api_key=api_key,
+-                    api_base=api_base,
+-                )
+-            elif use_antigravity:
+-                # Direct OAuth to Google's internal Cloud Code Assist gateway.
+-                # No local proxy required — AntigravityProvider handles token
+-                # refresh and Gemini-format request/response conversion natively.
+-                from framework.llm.antigravity import AntigravityProvider  # noqa: PLC0415
+-
+-                provider = AntigravityProvider(model=self.model)
+-                if not provider.has_credentials():
+-                    print(
+-                        "Warning: Antigravity credentials not found. "
+-                        "Run: uv run python core/antigravity_auth.py auth account add"
+-                    )
+-                self._llm = provider
+-            else:
+-                # Local models (e.g. Ollama) don't need an API key
+-                if self._is_local_model(self.model):
+-                    self._llm = LiteLLMProvider(
+-                        model=self.model,
+-                        api_base=api_base,
+-                    )
+-                else:
+-                    # Fall back to environment variable
+-                    # First check api_key_env_var from config (set by quickstart)
+-                    api_key_env = llm_config.get("api_key_env_var") or self._get_api_key_env_var(
+-                        self.model
+-                    )
+-                    if api_key_env and os.environ.get(api_key_env):
+-                        self._llm = LiteLLMProvider(
+-                            model=self.model,
+-                            api_key=os.environ[api_key_env],
+-                            api_base=api_base,
+-                        )
+-                    else:
+-                        # Fall back to credential store
+-                        api_key = self._get_api_key_from_credential_store()
+-                        if api_key:
+-                            self._llm = LiteLLMProvider(
+-                                model=self.model, api_key=api_key, api_base=api_base
+-                            )
+-                            # Set env var so downstream code (e.g. cleanup LLM in
+-                            # node._extract_json) can also find it
+-                            if api_key_env:
+-                                os.environ[api_key_env] = api_key
+-                        elif api_key_env:
+-                            logger.warning(
+-                                "%s not set. LLM calls will fail. "
+-                                "Set it with: export %s=your-api-key",
+-                                api_key_env,
+-                                api_key_env,
+-                            )
+-
+-            # Fail fast if the agent needs an LLM but none was configured
+-            if self._llm is None:
+-                has_llm_nodes = any(
+-                    node.node_type in ("event_loop", "gcu") for node in self.graph.nodes
+-                )
+-                if has_llm_nodes:
+-                    from framework.credentials.models import CredentialError
+-
+-                    if self._is_local_model(self.model):
+-                        raise CredentialError(
+-                            f"Failed to initialize LLM for local model '{self.model}'. "
+-                            f"Ensure your local LLM server is running "
+-                            f"(e.g. 'ollama serve' for Ollama)."
+-                        )
+-                    api_key_env = self._get_api_key_env_var(self.model)
+-                    hint = (
+-                        f"Set it with: export {api_key_env}=your-api-key"
+-                        if api_key_env
+-                        else "Configure an API key for your LLM provider."
+-                    )
+-                    raise CredentialError(f"LLM API key not found for model '{self.model}'. {hint}")
+-
+-            self._apply_model_fallback_chain()
+-
+-        # For GCU nodes: auto-register GCU MCP server if needed, then expand tool lists
+-        has_gcu_nodes = any(node.node_type == "gcu" for node in self.graph.nodes)
+-        if has_gcu_nodes:
+-            from framework.graph.gcu import GCU_MCP_SERVER_CONFIG, GCU_SERVER_NAME
+-
+-            # Auto-register GCU MCP server if tools aren't loaded yet
+-            gcu_tool_names = self._tool_registry.get_server_tool_names(GCU_SERVER_NAME)
+-            if not gcu_tool_names:
+-                # Resolve cwd to repo-level tools/ (not relative to agent_path)
+-                gcu_config = dict(GCU_MCP_SERVER_CONFIG)
+-                _repo_root = Path(__file__).resolve().parent.parent.parent.parent
+-                gcu_config["cwd"] = str(_repo_root / "tools")
+-                self._tool_registry.register_mcp_server(gcu_config)
+-                gcu_tool_names = self._tool_registry.get_server_tool_names(GCU_SERVER_NAME)
+-
+-            # Expand each GCU node's tools list to include all GCU server tools
+-            if gcu_tool_names:
+-                for node in self.graph.nodes:
+-                    if node.node_type == "gcu":
+-                        existing = set(node.tools)
+-                        for tool_name in sorted(gcu_tool_names):
+-                            if tool_name not in existing:
+-                                node.tools.append(tool_name)
+-
+-        # For event_loop/gcu nodes: auto-register file tools MCP server, then expand tool lists
+-        has_loop_nodes = any(node.node_type in ("event_loop", "gcu") for node in self.graph.nodes)
+-        if has_loop_nodes:
+-            from framework.graph.files import FILES_MCP_SERVER_CONFIG, FILES_MCP_SERVER_NAME
+-
+-            files_tool_names = self._tool_registry.get_server_tool_names(FILES_MCP_SERVER_NAME)
+-            if not files_tool_names:
+-                # Resolve cwd to repo-level tools/ (not relative to agent_path)
+-                files_config = dict(FILES_MCP_SERVER_CONFIG)
+-                _repo_root = Path(__file__).resolve().parent.parent.parent.parent
+-                files_config["cwd"] = str(_repo_root / "tools")
+-                self._tool_registry.register_mcp_server(files_config)
+-                files_tool_names = self._tool_registry.get_server_tool_names(FILES_MCP_SERVER_NAME)
+-
+-            if files_tool_names:
+-                for node in self.graph.nodes:
+-                    if node.node_type in ("event_loop", "gcu"):
+-                        existing = set(node.tools)
+-                        for tool_name in sorted(files_tool_names):
+-                            if tool_name not in existing:
+-                                node.tools.append(tool_name)
+-
+-        # Get tools for runtime
+-        tools = list(self._tool_registry.get_tools().values())
+-        tool_executor = self._tool_registry.get_executor()
+-
+-        # Collect connected account info for system prompt injection
+-        accounts_prompt = ""
+-        accounts_data: list[dict] | None = None
+-        tool_provider_map: dict[str, str] | None = None
+-        try:
+-            from aden_tools.credentials.store_adapter import CredentialStoreAdapter
+-
+-            if self._credential_store is not None:
+-                adapter = CredentialStoreAdapter(store=self._credential_store)
+-            else:
+-                adapter = CredentialStoreAdapter.default()
+-            accounts_data = adapter.get_all_account_info()
+-            tool_provider_map = adapter.get_tool_provider_map()
+-            if accounts_data:
+-                from framework.graph.prompting import build_accounts_prompt
++        # Read MCP server refs from agent.json
++        mcp_refs = []
++        agent_json = self.agent_path / "agent.json"
++        if agent_json.exists():
++            try:
++                import json as _json
++
++                data = _json.loads(agent_json.read_text(encoding="utf-8"))
++                mcp_refs = data.get("mcp_servers", [])
++            except Exception:
++                pass
++
++        # Build default pipeline stages
++        # Default infrastructure stages (always present)
++        pipeline_stages = [
++            LlmProviderStage(
++                model=self.model,
++                mock_mode=self.mock_mode,
++                llm=self._llm,
++            ),
++            CredentialResolverStage(
++                credential_store=self._credential_store,
++            ),
++            McpRegistryStage(
++                server_refs=mcp_refs,
++                agent_path=self.agent_path,
++                tool_registry=self._tool_registry,
++            ),
++            SkillRegistryStage(
++                project_root=self.agent_path,
++                interactive=self._interactive,
++                skills_config=SkillsConfig.from_agent_vars(
++                    default_skills=getattr(self, "_agent_default_skills", None),
++                    skills=getattr(self, "_agent_skills", None),
++                ),
++            ),
++        ]
+ 
+-                accounts_prompt = build_accounts_prompt(accounts_data, tool_provider_map)
+-        except Exception:
+-            pass  # Best-effort — agent works without account info
++        # Merge user-configured stages from ~/.hive/configuration.json
++        from framework.pipeline.registry import build_pipeline_from_config
+ 
+-        # Skill configuration — the runtime handles discovery, loading, trust-gating and
+-        # prompt rasterization.  The runner just builds the config.
+-        from framework.skills.config import SkillsConfig
+-        from framework.skills.manager import SkillsManagerConfig
++        hive_config = get_hive_config()
++        user_stages_config = hive_config.get("pipeline", {}).get("stages", [])
++        if user_stages_config:
++            user_pipeline = build_pipeline_from_config(user_stages_config)
++            pipeline_stages.extend(user_pipeline.stages)
+ 
+-        skills_manager_config = SkillsManagerConfig(
+-            skills_config=SkillsConfig.from_agent_vars(
+-                default_skills=getattr(self, "_agent_default_skills", None),
+-                skills=getattr(self, "_agent_skills", None),
++        # Merge agent-level overrides from agent.json pipeline field
++        if agent_json.exists():
++            try:
++                agent_pipeline = (
++                    _json.loads(agent_json.read_text(encoding="utf-8")).get("pipeline", {}).get("stages", [])
++                )
++                if agent_pipeline:
++                    agent_stages = build_pipeline_from_config(agent_pipeline)
++                    pipeline_stages.extend(agent_stages.stages)
++            except Exception:
++                pass
++
++        # Create AgentHost directly (no wrapper)
++        from framework.host.execution_manager import EntryPointSpec
++        from framework.orchestrator.checkpoint_config import CheckpointConfig
++        from framework.tracker.runtime_log_store import RuntimeLogStore
++
++        self._agent_runtime = AgentHost(
++            graph=self.graph,
++            goal=self.goal,
++            storage_path=self._storage_path,
++            runtime_log_store=RuntimeLogStore(
++                base_path=self._storage_path / "runtime_logs",
+             ),
+-            project_root=self.agent_path,
+-            interactive=self._interactive,
+-        )
+-
+-        self._setup_agent_runtime(
+-            tools,
+-            tool_executor,
+-            accounts_prompt=accounts_prompt,
+-            accounts_data=accounts_data,
+-            tool_provider_map=tool_provider_map,
++            checkpoint_config=CheckpointConfig(
++                enabled=True,
++                checkpoint_on_node_complete=True,
++                checkpoint_max_age_days=7,
++                async_checkpoint=True,
++            ),
++            graph_id=self.graph.id or self.agent_path.name,
+             event_bus=event_bus,
+-            skills_manager_config=skills_manager_config,
++            pipeline_stages=pipeline_stages,
+         )
++        self._agent_runtime.register_entry_point(
++            EntryPointSpec(
++                id="default",
++                name="Default",
++                entry_node=self.graph.entry_node,
++                trigger_type="manual",
++                isolation_level="shared",
++            ),
++        )
++        self._agent_runtime.intro_message = self.intro_message
+ 
+     def _get_api_key_env_var(self, model: str) -> str | None:
+         """Get the environment variable name for the API key based on model name."""
+@@ -1770,12 +1632,6 @@ def _get_api_key_env_var(self, model: str) -> str | None:
+             return "REPLICATE_API_KEY"
+         elif model_lower.startswith("together/"):
+             return "TOGETHER_API_KEY"
+-        elif (
+-            model_lower.startswith("glm-")
+-            or model_lower.startswith("zai-glm")
+-            or model_lower.startswith("z-ai/")
+-        ):
+-            return "ZAI_API_KEY"
+         elif model_lower.startswith("minimax/") or model_lower.startswith("minimax-"):
+             return "MINIMAX_API_KEY"
+         elif model_lower.startswith("kimi/"):
+@@ -1800,13 +1656,28 @@ def _get_api_key_from_credential_store(self) -> str | None:
+         cred_id = None
+         if model_lower.startswith("anthropic/") or model_lower.startswith("claude"):
+             cred_id = "anthropic"
++        elif model_lower.startswith("openai/") or model_lower.startswith("gpt"):
++            cred_id = "openai"
++        elif model_lower.startswith("gemini/") or model_lower.startswith("gemini"):
++            cred_id = "gemini"
+         elif model_lower.startswith("minimax/") or model_lower.startswith("minimax-"):
+             cred_id = "minimax"
++        elif model_lower.startswith("groq/"):
++            cred_id = "groq"
++        elif model_lower.startswith("cerebras/"):
++            cred_id = "cerebras"
++        elif model_lower.startswith("openrouter/"):
++            cred_id = "openrouter"
++        elif model_lower.startswith("mistral/"):
++            cred_id = "mistral"
++        elif model_lower.startswith("together_ai/") or model_lower.startswith("together/"):
++            cred_id = "together"
++        elif model_lower.startswith("deepseek/"):
++            cred_id = "deepseek"
+         elif model_lower.startswith("kimi/"):
+             cred_id = "kimi"
+         elif model_lower.startswith("hive/"):
+             cred_id = "hive"
+-        # Add more mappings as providers are added to LLM_CREDENTIALS
+ 
+         if cred_id is None:
+             return None
+@@ -1837,128 +1708,6 @@ def _is_local_model(model: str) -> bool:
+         )
+         return model.lower().startswith(LOCAL_PREFIXES)
+ 
+-    def _apply_model_fallback_chain(self) -> None:
+-        """Wrap current provider with fallback providers from task profile routing."""
+-        if self._llm is None:
+-            return
+-        if not self.task_profile:
+-            return
+-        from framework.llm.fallback import FallbackLLMProvider
+-        from framework.llm.litellm import LiteLLMProvider
+-
+-        chain = resolve_model_chain(explicit_model=self.model, profile=self.task_profile)
+-        # Need at least one fallback beyond the primary.
+-        if len(chain) <= 1:
+-            return
+-
+-        providers = [self._llm]
+-        seen_provider_signatures: set[tuple[str, str]] = {
+-            (
+-                str(getattr(self._llm, "model", "")).strip().lower(),
+-                str(getattr(self._llm, "api_base", "") or "").strip().rstrip("/"),
+-            )
+-        }
+-        cfg = get_hive_config()
+-        for backup_model in chain[1:]:
+-            conn = resolve_model_connection(backup_model, cfg)
+-            api_key_env = conn.get("api_key_env_var")
+-            api_base = conn.get("api_base")
+-            api_base_env = conn.get("api_base_env_var")
+-            if api_base_env and not api_base:
+-                api_base = os.environ.get(api_base_env)
+-            api_key = os.environ.get(str(api_key_env)) if api_key_env else None
+-            candidate = LiteLLMProvider(
+-                model=backup_model,
+-                api_key=api_key,
+-                api_base=api_base,
+-            )
+-            signature = (
+-                str(getattr(candidate, "model", "")).strip().lower(),
+-                str(getattr(candidate, "api_base", "") or "").strip().rstrip("/"),
+-            )
+-            if signature in seen_provider_signatures:
+-                continue
+-            seen_provider_signatures.add(signature)
+-            providers.append(candidate)
+-        self._llm = FallbackLLMProvider(providers)
+-
+-    def _setup_agent_runtime(
+-        self,
+-        tools: list,
+-        tool_executor: Callable | None,
+-        accounts_prompt: str = "",
+-        accounts_data: list[dict] | None = None,
+-        tool_provider_map: dict[str, str] | None = None,
+-        event_bus=None,
+-        skills_catalog_prompt: str = "",
+-        protocols_prompt: str = "",
+-        skill_dirs: list[str] | None = None,
+-        skills_manager_config=None,
+-    ) -> None:
+-        """Set up multi-entry-point execution using AgentRuntime."""
+-        entry_points = []
+-
+-        # Always create a primary entry point for the graph's entry node.
+-        # For multi-entry-point agents this ensures the primary path (e.g.
+-        # user-facing rule setup) is reachable alongside async entry points.
+-        if self.graph.entry_node:
+-            entry_points.insert(
+-                0,
+-                EntryPointSpec(
+-                    id="default",
+-                    name="Default",
+-                    entry_node=self.graph.entry_node,
+-                    trigger_type="manual",
+-                    isolation_level="shared",
+-                ),
+-            )
+-
+-        # Create AgentRuntime with all entry points
+-        log_store = RuntimeLogStore(base_path=self._storage_path / "runtime_logs")
+-
+-        # Enable checkpointing by default for resumable sessions
+-        from framework.graph.checkpoint_config import CheckpointConfig
+-
+-        checkpoint_config = CheckpointConfig(
+-            enabled=True,
+-            checkpoint_on_node_start=False,  # Only checkpoint after nodes complete
+-            checkpoint_on_node_complete=True,
+-            checkpoint_max_age_days=7,
+-            async_checkpoint=True,  # Non-blocking
+-        )
+-
+-        # Handle runtime_config - only pass through if it's actually an AgentRuntimeConfig.
+-        # Agents may export a RuntimeConfig (LLM settings) or queen-generated custom classes
+-        # that would crash AgentRuntime if passed through.
+-        runtime_config = None
+-        if self.runtime_config is not None:
+-            from framework.runtime.agent_runtime import AgentRuntimeConfig
+-
+-            if isinstance(self.runtime_config, AgentRuntimeConfig):
+-                runtime_config = self.runtime_config
+-
+-        self._agent_runtime = create_agent_runtime(
+-            graph=self.graph,
+-            goal=self.goal,
+-            storage_path=self._storage_path,
+-            entry_points=entry_points,
+-            llm=self._llm,
+-            tools=tools,
+-            tool_executor=tool_executor,
+-            runtime_log_store=log_store,
+-            checkpoint_config=checkpoint_config,
+-            config=runtime_config,
+-            graph_id=self.graph.id or self.agent_path.name,
+-            accounts_prompt=accounts_prompt,
+-            accounts_data=accounts_data,
+-            tool_provider_map=tool_provider_map,
+-            event_bus=event_bus,
+-            skills_manager_config=skills_manager_config,
+-        )
+-
+-        # Pass intro_message through for TUI display
+-        self._agent_runtime.intro_message = self.intro_message
+-
+     # ------------------------------------------------------------------
+     # Execution modes
+     #
+@@ -2039,7 +1788,7 @@ async def _run_with_agent_runtime(
+         sub_ids: list[str] = []
+ 
+         if has_queen and sys.stdin.isatty():
+-            from framework.runtime.event_bus import EventType
++            from framework.host.event_bus import EventType
+ 
+             runtime = self._agent_runtime
+ 
+@@ -2228,8 +1977,7 @@ def info(self) -> AgentInfo:
+                 for sc in self.goal.success_criteria
+             ],
+             constraints=[
+-                {"id": c.id, "description": c.description, "type": c.constraint_type}
+-                for c in self.goal.constraints
++                {"id": c.id, "description": c.description, "type": c.constraint_type} for c in self.goal.constraints
+             ],
+             required_tools=sorted(required_tools),
+             has_tools_module=(self.agent_path / "tools.py").exists(),
+@@ -2294,17 +2042,13 @@ def validate(self) -> ValidationResult:
+                 warnings.append(warning_msg)
+         except ImportError:
+             # aden_tools not installed - fall back to direct check
+-            has_llm_nodes = any(
+-                node.node_type in ("event_loop", "gcu") for node in self.graph.nodes
+-            )
++            has_llm_nodes = any(node.node_type == "event_loop" for node in self.graph.nodes)
+             if has_llm_nodes:
+                 api_key_env = self._get_api_key_env_var(self.model)
+                 if api_key_env and not os.environ.get(api_key_env):
+                     if api_key_env not in missing_credentials:
+                         missing_credentials.append(api_key_env)
+-                    warnings.append(
+-                        f"Agent has LLM nodes but {api_key_env} not set (model: {self.model})"
+-                    )
++                    warnings.append(f"Agent has LLM nodes but {api_key_env} not set (model: {self.model})")
+ 
+         return ValidationResult(
+             valid=len(errors) == 0,
+@@ -2316,8 +2060,8 @@ def validate(self) -> ValidationResult:
+ 
+     def cleanup(self) -> None:
+         """Clean up resources (synchronous)."""
+-        # Clean up MCP client connections
+-        self._tool_registry.cleanup()
++        if hasattr(self, "_tool_registry"):
++            self._tool_registry.cleanup()
+ 
+         if self._temp_dir:
+             self._temp_dir.cleanup()
+@@ -2332,7 +2076,7 @@ async def cleanup_async(self) -> None:
+         # Run synchronous cleanup
+         self.cleanup()
+ 
+-    async def __aenter__(self) -> "AgentRunner":
++    async def __aenter__(self) -> "AgentLoader":
+         """Context manager entry."""
+         self._setup()
+         if self._agent_runtime is not None:
+@@ -2346,8 +2090,3 @@ async def __aexit__(self, *args) -> None:
+     def __del__(self) -> None:
+         """Destructor - cleanup temp dir."""
+         self.cleanup()
+-
+-
+-# Backward-compatibility shim for loader public surface.
+-# Loader package exports AgentLoader, while implementation class remains AgentRunner.
+-AgentLoader = AgentRunner
+diff --git a/core/framework/loader/mcp_client.py b/core/framework/loader/mcp_client.py
+index 2ba368c8..308d2c45 100644
+--- a/core/framework/loader/mcp_client.py
++++ b/core/framework/loader/mcp_client.py
+@@ -648,12 +648,6 @@ def _reconnect(self) -> None:
+     _CLEANUP_TIMEOUT = 10
+     _THREAD_JOIN_TIMEOUT = 12
+ 
+-    @staticmethod
+-    def _is_known_anyio_teardown_quirk(exc: Exception) -> bool:
+-        """Best-effort classifier for benign anyio cross-task teardown errors."""
+-        msg = str(exc).lower()
+-        return "cancel scope" in msg or "different task" in msg
+-
+     async def _cleanup_stdio_async(self) -> None:
+         """Async cleanup for persistent MCP session and context managers.
+ 
+@@ -672,10 +666,7 @@ async def _cleanup_stdio_async(self) -> None:
+         except asyncio.CancelledError:
+             logger.warning("MCP session cleanup was cancelled; proceeding with best-effort shutdown")
+         except Exception as e:
+-            if self._is_known_anyio_teardown_quirk(e):
+-                logger.debug("MCP session teardown (known anyio quirk): %s", e)
+-            else:
+-                logger.warning(f"Error closing MCP session: {e}")
++            logger.warning(f"Error closing MCP session: {e}")
+         finally:
+             self._session = None
+ 
+@@ -686,7 +677,8 @@ async def _cleanup_stdio_async(self) -> None:
+         except asyncio.CancelledError:
+             logger.debug("STDIO context cleanup was cancelled; proceeding with best-effort shutdown")
+         except Exception as e:
+-            if self._is_known_anyio_teardown_quirk(e):
++            msg = str(e).lower()
++            if "cancel scope" in msg or "different task" in msg:
+                 logger.debug("STDIO context teardown (known anyio quirk): %s", e)
+             else:
+                 logger.warning(f"Error closing STDIO context: {e}")
+@@ -699,10 +691,7 @@ async def _cleanup_stdio_async(self) -> None:
+         except asyncio.CancelledError:
+             logger.debug("SSE context cleanup was cancelled; proceeding with best-effort shutdown")
+         except Exception as e:
+-            if self._is_known_anyio_teardown_quirk(e):
+-                logger.debug("SSE context teardown (known anyio quirk): %s", e)
+-            else:
+-                logger.warning(f"Error closing SSE context: {e}")
++            logger.warning(f"Error closing SSE context: {e}")
+         finally:
+             self._sse_context = None
+ 
+diff --git a/core/framework/loader/tool_registry.py b/core/framework/loader/tool_registry.py
+index 472dedcd..e80dffa3 100644
+--- a/core/framework/loader/tool_registry.py
++++ b/core/framework/loader/tool_registry.py
+@@ -7,6 +7,7 @@
+ import json
+ import logging
+ import os
++import re
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -18,6 +19,16 @@
+ 
+ _INPUT_LOG_MAX_LEN = 500
+ 
++# Tools whose names match this pattern are assumed to return ImageContent.
++# Matched against the bare tool name (case-insensitive). Used to mark MCP
++# tools with produces_image=True so they can be filtered out for text-only
++# models before the schema is ever shown to the LLM (avoids wasted calls
++# and "screenshot failed" entries polluting memory).
++_IMAGE_TOOL_NAME_RE = re.compile(
++    r"(screenshot|screen_capture|capture_image|render_image|get_image|snapshot_image)",
++    re.IGNORECASE,
++)
++
+ # Per-execution context overrides.  Each asyncio task (and thus each
+ # concurrent graph execution) gets its own copy, so there are no races
+ # when multiple ExecutionStreams run in parallel.
+@@ -50,6 +61,33 @@ class ToolRegistry:
+     # and auto-injected at call time for tools that accept them.
+     CONTEXT_PARAMS = frozenset({"agent_id", "data_dir", "profile"})
+ 
++    # Tools that perform no filesystem/process/network writes and are safe
++    # to run concurrently with other safe tools in the same assistant turn.
++    # Unknown tools default to unsafe (serialized) - adding a name here is
++    # an explicit promise about that tool's side effects. Keep this list
++    # conservative: anything that mutates state, writes to disk, issues
++    # POST/PUT/DELETE requests, or drives a browser MUST NOT be listed.
++    CONCURRENCY_SAFE_TOOLS = frozenset(
++        {
++            # File system reads
++            "read_file",
++            "list_directory",
++            "grep",
++            "glob",
++            # Web reads
++            "web_search",
++            "web_fetch",
++            # Browser read-only snapshots (mutate-free observations)
++            "browser_screenshot",
++            "browser_snapshot",
++            "browser_console",
++            "browser_get_text",
++            # Background bash polling - reads output buffers only, does
++            # not touch the subprocess itself.
++            "bash_output",
++        }
++    )
++
+     # Credential directory used for change detection
+     _CREDENTIAL_DIR = Path("~/.hive/credentials/credentials").expanduser()
+ 
+@@ -66,151 +104,23 @@ def __init__(self):
+         self._mcp_cred_snapshot: set[str] = set()  # Credential filenames at MCP load time
+         self._mcp_aden_key_snapshot: str | None = None  # ADEN_API_KEY value at MCP load time
+         self._mcp_server_tools: dict[str, set[str]] = {}  # server name -> tool names
++        # tool name -> owning MCPClient (for force-kill on timeout)
++        self._mcp_tool_clients: dict[str, Any] = {}
++        # Per-agent env injected into every MCP server config.env. Kept
++        # here (not on the process-wide os.environ) so parallel workers
++        # in the same interpreter don't clobber each other's identity.
++        self._mcp_extra_env: dict[str, str] = {}
+         # Agent dir for re-loading registry MCP after credential resync.
+         self._mcp_registry_agent_path: Path | None = None
+-        self._register_builtin_data_tools()
+-
+-    @staticmethod
+-    def _resolve_data_path(data_dir: str | Path | None, filename: str) -> tuple[Path, Path]:
+-        """Resolve *filename* under *data_dir* and prevent path traversal."""
+-        exec_ctx = _execution_context.get() or {}
+-        ctx_data_dir = str(exec_ctx.get("data_dir") or "").strip()
+-
+-        chosen_data_dir = str(data_dir or "").strip()
+-        # LLMs frequently pass "." or "/app" despite explicit prompt guidance.
+-        # Prefer the execution-scoped data_dir when available.
+-        if not chosen_data_dir or chosen_data_dir in {".", "./", "/app", "/app/data"}:
+-            chosen_data_dir = ctx_data_dir or chosen_data_dir
+-
+-        if not chosen_data_dir:
+-            raise ValueError("data_dir is required")
+-        base_path = Path(chosen_data_dir).expanduser()
+-        if not base_path.is_absolute() and ctx_data_dir:
+-            base = (Path(ctx_data_dir).expanduser() / base_path).resolve()
+-        else:
+-            base = base_path.resolve()
+-        base.mkdir(parents=True, exist_ok=True)
+-        candidate = (base / str(filename or "")).resolve()
+-        if not str(candidate).startswith(str(base)):
+-            raise ValueError("filename must stay within data_dir")
+-        return base, candidate
+-
+-    def _register_builtin_data_tools(self) -> None:
+-        """Register framework data/file tools used by template agents."""
+-
+-        def save_data(filename: str, data: Any, data_dir: str = "") -> dict[str, Any]:
+-            _, path = self._resolve_data_path(data_dir, filename)
+-            payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, indent=2)
+-            path.parent.mkdir(parents=True, exist_ok=True)
+-            path.write_text(payload, encoding="utf-8")
+-            return {
+-                "ok": True,
+-                "filename": path.name,
+-                "file_path": str(path),
+-                "uri": path.as_uri(),
+-                "bytes_written": len(payload.encode("utf-8")),
+-            }
+ 
+-        def append_data(filename: str, data: Any, data_dir: str = "") -> dict[str, Any]:
+-            _, path = self._resolve_data_path(data_dir, filename)
+-            payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+-            path.parent.mkdir(parents=True, exist_ok=True)
+-            with open(path, "a", encoding="utf-8") as f:
+-                f.write(payload)
+-            return {
+-                "ok": True,
+-                "filename": path.name,
+-                "file_path": str(path),
+-                "uri": path.as_uri(),
+-                "bytes_appended": len(payload.encode("utf-8")),
+-            }
+-
+-        def edit_data(filename: str, old_text: str, new_text: str, data_dir: str = "") -> dict[str, Any]:
+-            _, path = self._resolve_data_path(data_dir, filename)
+-            if not path.exists():
+-                raise FileNotFoundError(f"File not found: {filename}")
+-            content = path.read_text(encoding="utf-8")
+-            updated = content.replace(old_text or "", new_text or "")
+-            path.write_text(updated, encoding="utf-8")
+-            return {
+-                "ok": True,
+-                "filename": path.name,
+-                "file_path": str(path),
+-                "uri": path.as_uri(),
+-                "bytes_written": len(updated.encode("utf-8")),
+-            }
+-
+-        def load_data(
+-            filename: str,
+-            data_dir: str = "",
+-            offset_bytes: int = 0,
+-            limit_bytes: int = 200000,
+-        ) -> dict[str, Any]:
+-            _, path = self._resolve_data_path(data_dir, filename)
+-            if not path.exists():
+-                raise FileNotFoundError(f"File not found: {filename}")
+-            raw = path.read_bytes()
+-            total = len(raw)
+-            start = max(0, int(offset_bytes or 0))
+-            end = min(total, start + max(1, int(limit_bytes or 1)))
+-            chunk = raw[start:end]
+-            return {
+-                "ok": True,
+-                "filename": path.name,
+-                "file_path": str(path),
+-                "uri": path.as_uri(),
+-                "content": chunk.decode("utf-8", errors="replace"),
+-                "offset_bytes": start,
+-                "returned_bytes": len(chunk),
+-                "total_bytes": total,
+-                "has_more": end < total,
+-                "next_offset_bytes": end if end < total else None,
+-            }
+-
+-        def list_data_files(data_dir: str = "") -> dict[str, Any]:
+-            base, _ = self._resolve_data_path(data_dir, ".")
+-            files = []
+-            for entry in sorted(base.rglob("*")):
+-                if not entry.is_file():
+-                    continue
+-                rel = entry.relative_to(base)
+-                files.append(
+-                    {
+-                        "filename": str(rel),
+-                        "file_path": str(entry),
+-                        "uri": entry.as_uri(),
+-                        "size_bytes": entry.stat().st_size,
+-                    }
+-                )
+-            return {"ok": True, "data_dir": str(base), "files": files}
+-
+-        def serve_file_to_user(
+-            filename: str,
+-            data_dir: str = "",
+-            label: str = "",
+-            open_in_browser: bool = False,
+-        ) -> dict[str, Any]:
+-            _, path = self._resolve_data_path(data_dir, filename)
+-            if not path.exists():
+-                raise FileNotFoundError(f"File not found: {filename}")
+-            return {
+-                "ok": True,
+-                "filename": path.name,
+-                "label": (label or path.name).strip(),
+-                "file_path": str(path),
+-                "uri": path.as_uri(),
+-                "open_in_browser": bool(open_in_browser),
+-            }
++    def set_mcp_extra_env(self, env: dict[str, str]) -> None:
++        """Attach per-agent env vars to every MCPServerConfig this registry builds.
+ 
+-        self.register_function(save_data, description="Save data to a file in the execution data directory.")
+-        self.register_function(append_data, description="Append data to a file in the execution data directory.")
+-        self.register_function(edit_data, description="Replace text in a data file in the execution data directory.")
+-        self.register_function(load_data, description="Load data from a file with byte-range pagination support.")
+-        self.register_function(list_data_files, description="List data files available in the execution data directory.")
+-        self.register_function(
+-            serve_file_to_user,
+-            description="Return a local file path/URI for user download or opening.",
+-        )
++        Use this instead of mutating ``os.environ`` — the global env dict
++        is shared across all workers in a single interpreter, so writes
++        from one worker race with MCP spawns from another.
++        """
++        self._mcp_extra_env = dict(env)
+ 
+     def register(
+         self,
+@@ -280,6 +190,7 @@ def register_function(
+                 "properties": properties,
+                 "required": required,
+             },
++            concurrency_safe=tool_name in self.CONCURRENCY_SAFE_TOOLS,
+         )
+ 
+         def executor(inputs: dict) -> Any:
+@@ -346,10 +257,7 @@ def executor(inputs: dict) -> Any:
+                                         str(e),
+                                     )
+                                     return {
+-                                        "error": (
+-                                            f"Invalid JSON response from tool '{tool_name}': "
+-                                            f"{str(e)}"
+-                                        ),
++                                        "error": (f"Invalid JSON response from tool '{tool_name}': {str(e)}"),
+                                         "raw_content": result.content,
+                                     }
+                             return result
+@@ -405,15 +313,21 @@ def _wrap_result(tool_use_id: str, result: Any) -> ToolResult:
+                 is_error=False,
+             )
+ 
++        registry_ref = self
++
+         def executor(tool_use: ToolUse) -> ToolResult:
+-            if tool_use.name not in self._tools:
++            # Check if credential files changed (lightweight dir listing).
++            # If new OAuth tokens appeared, restarts MCP servers to pick them up.
++            registry_ref.resync_mcp_servers_if_needed()
++
++            if tool_use.name not in registry_ref._tools:
+                 return ToolResult(
+                     tool_use_id=tool_use.id,
+                     content=json.dumps({"error": f"Unknown tool: {tool_use.name}"}),
+                     is_error=True,
+                 )
+ 
+-            registered = self._tools[tool_use.name]
++            registered = registry_ref._tools[tool_use.name]
+             try:
+                 result = registered.executor(tool_use.input)
+ 
+@@ -463,6 +377,9 @@ async def _await_and_wrap():
+                     is_error=True,
+                 )
+ 
++        # Expose force-kill hook so the timeout handler can tear down a
++        # hung MCP subprocess (asyncio.wait_for alone cannot).
++        executor.kill_for_tool = registry_ref.kill_mcp_for_tool  # type: ignore[attr-defined]
+         return executor
+ 
+     def get_registered_names(self) -> list[str]:
+@@ -509,15 +426,13 @@ def resolve_mcp_stdio_config(server_config: dict[str, Any], base_dir: Path) -> d
+         """Resolve cwd and script paths for MCP stdio config (Windows compatibility).
+ 
+         Use this when building MCPServerConfig from a config file (e.g. in
+-        list_agent_tools, discover_mcp_tools) so hive-tools and other servers
++        list_agent_tools, discover_mcp_tools) so hive_tools and other servers
+         work on Windows. Call with base_dir = directory containing the config.
+         """
+         registry = ToolRegistry()
+         return registry._resolve_mcp_server_config(server_config, base_dir)
+ 
+-    def _resolve_mcp_server_config(
+-        self, server_config: dict[str, Any], base_dir: Path
+-    ) -> dict[str, Any]:
++    def _resolve_mcp_server_config(self, server_config: dict[str, Any], base_dir: Path) -> dict[str, Any]:
+         """Resolve cwd and script paths for MCP stdio servers (Windows compatibility).
+ 
+         On Windows, passing cwd to subprocess can cause WinError 267. We use cwd=None
+@@ -582,12 +497,22 @@ def _resolve_mcp_server_config(
+             config["cwd"] = str(resolved_cwd)
+             return config
+ 
+-        # For coder_tools_server, inject --project-root so writes go to the expected workspace
++        # For coder_tools_server, inject --project-root so reads land
++        # in the expected workspace (hive repo, for framework skills
++        # and docs), and inject --write-root so writes land under
++        # ~/.hive/workspace/ instead of polluting the git checkout
++        # with queen-authored skills, ledgers, and scripts. Without
++        # the split, every ``write_file`` call from the queen landed
++        # in the hive repo root.
+         if script_name and "coder_tools" in script_name:
+             project_root = str(resolved_cwd.parent.resolve())
+             args = list(args)
+             if "--project-root" not in args:
+                 args.extend(["--project-root", project_root])
++            if "--write-root" not in args:
++                _write_root = Path.home() / ".hive" / "workspace"
++                _write_root.mkdir(parents=True, exist_ok=True)
++                args.extend(["--write-root", str(_write_root)])
+             config["args"] = args
+ 
+         if os.name == "nt":
+@@ -632,8 +557,7 @@ def load_mcp_config(self, config_path: Path) -> None:
+             server_list = [{"name": name, **cfg} for name, cfg in config.items()]
+ 
+         resolved_server_list = [
+-            self._resolve_mcp_server_config(server_config, base_dir)
+-            for server_config in server_list
++            self._resolve_mcp_server_config(server_config, base_dir) for server_config in server_list
+         ]
+         # Ordered first-wins for duplicate tool names across servers; keep tools.py tools.
+         self.load_registry_servers(
+@@ -647,6 +571,8 @@ def load_mcp_config(self, config_path: Path) -> None:
+         self._mcp_cred_snapshot = self._snapshot_credentials()
+         self._mcp_aden_key_snapshot = os.environ.get("ADEN_API_KEY")
+ 
++        self._log_registry_snapshot("after load_mcp_config")
++
+     def _register_mcp_server_with_retry(
+         self,
+         server_config: dict[str, Any],
+@@ -655,8 +581,18 @@ def _register_mcp_server_with_retry(
+         tool_cap: int | None = None,
+         log_collisions: bool = False,
+     ) -> tuple[bool, int, str | None]:
+-        """Register a single MCP server with one retry for transient failures."""
++        """Register a single MCP server with one retry for transient failures.
++
++        When ``preserve_existing_tools=True`` and the server's tools are
++        already present from a prior registration, ``register_mcp_server``
++        returns ``count=0`` because every tool was shadowed. That's a
++        no-op success, not a failure — don't retry / warn in that case.
++        Otherwise a duplicate-init path (e.g. a worker spawn re-loading
++        the MCP servers the queen already registered) spams shadow
++        warnings, sleeps 2s, and retries for no reason.
++        """
+         name = server_config.get("name", "unknown")
++        already_loaded = bool(self._mcp_server_tools.get(name))
+         last_error: str | None = None
+ 
+         for attempt in range(2):
+@@ -669,7 +605,9 @@ def _register_mcp_server_with_retry(
+                 )
+                 if count > 0:
+                     return True, count, None
+-                if bool(server_config.get("allow_zero_tools", False)):
++                if already_loaded and preserve_existing_tools:
++                    # All tools shadowed by the prior registration of
++                    # the same server — nothing to do, server is usable.
+                     return True, 0, None
+                 last_error = "registered 0 tools"
+             except Exception as exc:
+@@ -780,16 +718,20 @@ def register_mcp_server(
+             Number of tools registered from this server
+         """
+         try:
+-            from framework.runner.mcp_client import MCPClient, MCPServerConfig
+-            from framework.runner.mcp_connection_manager import MCPConnectionManager
+-
+-            # Build config object
++            from framework.loader.mcp_client import MCPClient, MCPServerConfig
++            from framework.loader.mcp_connection_manager import MCPConnectionManager
++
++            # Build config object. Merge per-agent env on top of the
++            # server's own env so MCP subprocesses receive the identity
++            # of the worker that spawned them (instead of whichever
++            # worker most recently wrote to os.environ).
++            merged_env = {**self._mcp_extra_env, **(server_config.get("env") or {})}
+             config = MCPServerConfig(
+                 name=server_config["name"],
+                 transport=server_config["transport"],
+                 command=server_config.get("command"),
+                 args=server_config.get("args", []),
+-                env=server_config.get("env", {}),
++                env=merged_env,
+                 cwd=server_config.get("cwd"),
+                 url=server_config.get("url"),
+                 headers=server_config.get("headers", {}),
+@@ -815,28 +757,37 @@ def register_mcp_server(
+             server_name = server_config["name"]
+             if server_name not in self._mcp_server_tools:
+                 self._mcp_server_tools[server_name] = set()
++
++            # Build admission gate: only admit MCP tools that are either
++            # (a) credential-backed *and* have a configured account, or
++            # (b) credential-less *and* listed in the verified manifest.
++            # Servers that don't expose `__aden_verified_manifest` (third-party
++            # MCP servers) bypass the gate entirely — preserves prior behavior.
++            admit = self._build_mcp_admission_gate(client)
++
+             count = 0
+-            skipped_existing = 0
+-            skipped_cap = 0
+-            mcp_tools = list(client.list_tools())
+-            discovered_total = len(mcp_tools)
+-            for idx, mcp_tool in enumerate(mcp_tools):
++            admitted_names: list[str] = []
++            for mcp_tool in client.list_tools():
++                if not admit(mcp_tool.name):
++                    continue
+                 if tool_cap is not None and count >= tool_cap:
+-                    skipped_cap = max(0, discovered_total - idx)
+                     break
+ 
+                 if preserve_existing_tools and mcp_tool.name in self._tools:
+-                    skipped_existing += 1
+                     if log_collisions:
+-                        origin_server = (
+-                            self._find_mcp_origin_server_for_tool(mcp_tool.name) or "<existing>"
+-                        )
+-                        logger.warning(
+-                            "MCP tool '%s' from '%s' shadowed by '%s' (loaded first)",
+-                            mcp_tool.name,
+-                            server_name,
+-                            origin_server,
+-                        )
++                        origin_server = self._find_mcp_origin_server_for_tool(mcp_tool.name) or "<existing>"
++                        # Don't warn when a server is being re-registered
++                        # by itself — that's a redundant-init case (e.g.
++                        # the same tool_registry seeing the same server
++                        # twice via pooled reconnect), not a real
++                        # cross-server shadow worth flagging.
++                        if origin_server != server_name:
++                            logger.warning(
++                                "MCP tool '%s' from '%s' shadowed by '%s' (loaded first)",
++                                mcp_tool.name,
++                                server_name,
++                                origin_server,
++                            )
+                     # Skip registration; do not update MCP tool bookkeeping for this server.
+                     continue
+ 
+@@ -859,17 +810,11 @@ def executor(inputs: dict) -> Any:
+                                 base_context.update(exec_ctx)
+ 
+                             # Only inject context params the tool accepts
+-                            filtered_context = {
+-                                k: v for k, v in base_context.items() if k in tool_params
+-                            }
++                            filtered_context = {k: v for k, v in base_context.items() if k in tool_params}
+                             # Strip context params from LLM inputs — the framework
+                             # values are authoritative (prevents the LLM from passing
+                             # e.g. data_dir="/data" and overriding the real path).
+-                            clean_inputs = {
+-                                k: v
+-                                for k, v in inputs.items()
+-                                if k not in registry_ref.CONTEXT_PARAMS
+-                            }
++                            clean_inputs = {k: v for k, v in inputs.items() if k not in registry_ref.CONTEXT_PARAMS}
+                             merged_inputs = {**clean_inputs, **filtered_context}
+                             result = client_ref.call_tool(tool_name, merged_inputs)
+                             # MCP client already extracts content (returns str
+@@ -902,7 +847,9 @@ def executor(inputs: dict) -> Any:
+                     make_mcp_executor(client, mcp_tool.name, self, tool_params),
+                 )
+                 self._mcp_tool_names.add(mcp_tool.name)
++                self._mcp_tool_clients[mcp_tool.name] = client
+                 self._mcp_server_tools[server_name].add(mcp_tool.name)
++                admitted_names.append(mcp_tool.name)
+                 count += 1
+ 
+             logger.info(
+@@ -910,20 +857,16 @@ def executor(inputs: dict) -> Any:
+                 extra={
+                     "server": config.name,
+                     "status": "success",
+-                    "tools_discovered": discovered_total,
+                     "tools_loaded": count,
+-                    "tools_skipped_existing": skipped_existing,
+-                    "tools_skipped_cap": skipped_cap,
+                     "skipped_reason": None,
+                 },
+             )
+-            if discovered_total > 0 and count == 0 and skipped_existing == discovered_total:
+-                logger.info(
+-                    "MCP server '%s' registered 0 new tools; all %d discovered tools "
+-                    "were already present in registry (first-wins)",
+-                    server_name,
+-                    discovered_total,
+-                )
++            logger.info(
++                "MCP server '%s' admitted %d tool(s): %s",
++                config.name,
++                len(admitted_names),
++                sorted(admitted_names),
++            )
+             return count
+ 
+         except Exception as e:
+@@ -949,6 +892,104 @@ def _find_mcp_origin_server_for_tool(self, tool_name: str) -> str | None:
+                 return server_name
+         return None
+ 
++    def _log_registry_snapshot(self, context: str) -> None:
++        """Emit a one-line summary of the current tool registry.
++
++        Called after every tool-list mutation (initial load + resync) so that
++        operators can correlate "what tools does the queen have right now"
++        with credential changes and MCP server lifecycle events. Per-server
++        contents are already logged by `register_mcp_server`; this is just the
++        rollup so the resync path also gets a single anchor line.
++        """
++        per_server_counts = {server: len(names) for server, names in self._mcp_server_tools.items()}
++        non_mcp_count = len(self._tools) - len(self._mcp_tool_names)
++        logger.info(
++            "ToolRegistry snapshot (%s): total=%d, mcp=%d, non_mcp=%d, per_server=%s",
++            context,
++            len(self._tools),
++            len(self._mcp_tool_names),
++            non_mcp_count,
++            per_server_counts,
++        )
++
++    _MCP_VERIFIED_MANIFEST_TOOL = "__aden_verified_manifest"
++
++    def _build_mcp_admission_gate(self, client: Any) -> Callable[[str], bool]:
++        """Build a per-server predicate that filters MCP tools at registration.
++
++        Rules:
++          * The sentinel manifest tool itself is never admitted.
++          * Credential-backed tools (provider in `tool_provider_map`) are
++            admitted only when at least one account exists for that provider.
++          * Credential-less tools are admitted only when they appear in the
++            server's verified manifest.
++          * Servers that don't expose a manifest bypass the verified gate
++            entirely (third-party MCP servers behave as before).
++        """
++        verified_names: set[str] = set()
++        manifest_present = False
++        # Only probe the sentinel when the server actually advertises it.
++        # Calling ``__aden_verified_manifest`` unconditionally on every
++        # MCP server at registration time (a) causes a bogus tool call
++        # round-trip to every third-party server, (b) pollutes any
++        # call-capturing fakes in tests, and (c) risks side effects on
++        # servers that eagerly execute unknown tool names. Listing is
++        # cheap and cached by the client; this keeps the manifest gate
++        # active for aden-flavoured servers without penalising others.
++        sentinel_advertised = False
++        try:
++            for t in client.list_tools():
++                if getattr(t, "name", None) == self._MCP_VERIFIED_MANIFEST_TOOL:
++                    sentinel_advertised = True
++                    break
++        except Exception:
++            sentinel_advertised = False
++
++        if sentinel_advertised:
++            try:
++                raw = client.call_tool(self._MCP_VERIFIED_MANIFEST_TOOL, {})
++                parsed: Any = raw
++                if isinstance(raw, str):
++                    try:
++                        parsed = json.loads(raw)
++                    except json.JSONDecodeError:
++                        parsed = None
++                # Only treat the response as a manifest when it's a list
++                # of strings. A malformed response shouldn't flip the gate
++                # on and silently hide every real tool from the server.
++                if isinstance(parsed, list) and all(isinstance(n, str) for n in parsed):
++                    verified_names = set(parsed)
++                    manifest_present = True
++            except Exception:
++                # Server advertised the sentinel but errored when called
++                # — treat as no manifest; fall back to third-party bypass.
++                pass
++
++        tool_provider_map: dict[str, str] = {}
++        live_providers: set[str] = set()
++        try:
++            from aden_tools.credentials.store_adapter import CredentialStoreAdapter
++
++            adapter = CredentialStoreAdapter.default()
++            tool_provider_map = adapter.get_tool_provider_map()
++            live_providers = {a.get("provider", "") for a in adapter.get_all_account_info() if a.get("provider")}
++        except Exception:
++            logger.debug("Credential snapshot unavailable for MCP gate", exc_info=True)
++
++        def admit(tool_name: str) -> bool:
++            if tool_name == self._MCP_VERIFIED_MANIFEST_TOOL:
++                return False
++            provider = tool_provider_map.get(tool_name)
++            if provider:
++                # Credentialed tool — needs an account.
++                return provider in live_providers
++            if not manifest_present:
++                # Third-party MCP server: preserve legacy "admit everything".
++                return True
++            return tool_name in verified_names
++
++        return admit
++
+     def _convert_mcp_tool_to_framework_tool(self, mcp_tool: Any) -> Tool:
+         """
+         Convert an MCP tool to a framework Tool.
+@@ -978,6 +1019,8 @@ def _convert_mcp_tool_to_framework_tool(self, mcp_tool: Any) -> Tool:
+                 "properties": properties,
+                 "required": required,
+             },
++            produces_image=bool(_IMAGE_TOOL_NAME_RE.search(mcp_tool.name or "")),
++            concurrency_safe=mcp_tool.name in self.CONCURRENCY_SAFE_TOOLS,
+         )
+ 
+         return tool
+@@ -1044,7 +1087,7 @@ def reload_registry_mcp_servers_after_resync(self) -> None:
+         """Re-run ``mcp_registry.json`` resolution and register servers (post-resync)."""
+         if self._mcp_registry_agent_path is None:
+             return
+-        from framework.runner.mcp_registry import MCPRegistry
++        from framework.loader.mcp_registry import MCPRegistry
+ 
+         try:
+             reg = MCPRegistry()
+@@ -1083,6 +1126,11 @@ def resync_mcp_servers_if_needed(self) -> bool:
+         clients and re-loads them so the new subprocess picks up the fresh
+         credentials.
+ 
++        Note: Individual credential TTL/refresh is handled by the MCP server
++        process internally -- it resolves tokens from the credential store
++        on every tool call, not at startup. This method only handles the case
++        where entirely new credential files appear.
++
+         Returns True if a resync was performed, False otherwise.
+         """
+         if not self._mcp_clients or self._mcp_config_path is None:
+@@ -1120,6 +1168,7 @@ def resync_mcp_servers_if_needed(self) -> bool:
+             self.reload_registry_mcp_servers_after_resync()
+ 
+         logger.info("MCP server resync complete")
++        self._log_registry_snapshot("after resync_mcp_servers_if_needed")
+         return True
+ 
+     def cleanup(self) -> None:
+@@ -1136,7 +1185,7 @@ def _cleanup_mcp_clients(self, context: str = "") -> None:
+             server_name = self._mcp_client_servers.get(client_id, client.config.name)
+             try:
+                 if client_id in self._mcp_managed_clients:
+-                    from framework.runner.mcp_connection_manager import MCPConnectionManager
++                    from framework.loader.mcp_connection_manager import MCPConnectionManager
+ 
+                     MCPConnectionManager.get_instance().release(server_name)
+                 else:
+@@ -1146,6 +1195,33 @@ def _cleanup_mcp_clients(self, context: str = "") -> None:
+         self._mcp_clients.clear()
+         self._mcp_client_servers.clear()
+         self._mcp_managed_clients.clear()
++        self._mcp_tool_clients.clear()
++
++    def kill_mcp_for_tool(self, tool_name: str) -> bool:
++        """Force-disconnect the MCP client that owns *tool_name*.
++
++        Called from the timeout handler in ``execute_tool`` when a tool
++        call hangs. Plain ``asyncio.wait_for`` cancellation cannot stop
++        a sync executor running inside a thread pool (and therefore
++        cannot stop the MCP subprocess), so we reach through to the
++        client here and tear it down. The next ``call_tool`` triggers
++        an automatic reconnect.
++
++        Returns True if a client was found and disconnect was attempted.
++        """
++        client = self._mcp_tool_clients.get(tool_name)
++        if client is None:
++            return False
++        try:
++            logger.warning(
++                "Force-disconnecting MCP client for hung tool '%s' on server '%s'",
++                tool_name,
++                getattr(client.config, "name", "?"),
++            )
++            client.disconnect()
++        except Exception as exc:
++            logger.warning("Error force-disconnecting MCP client for '%s': %s", tool_name, exc)
++        return True
+ 
+     def __del__(self):
+         """Destructor to ensure cleanup."""

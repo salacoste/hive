@@ -1,0 +1,19 @@
+{
+  "generated_at_utc": "2026-04-26T13:52:46Z",
+  "wave": "Wave16-R10N",
+  "title": "Autonomous pipeline stage-profile contract lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py",
+    "core/framework/server/project_execution.py"
+  ],
+  "delta_summary": [
+    "R10M confirmed execution_template/model_profile propagation for project API and worker handoff",
+    "next bounded step verifies autonomous backlog/pipeline flows continue honoring stage-specific model_profile contracts",
+    "lane remains non-destructive and test-bundle driven"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'backlog_create_ci_first_contract_with_service_matrix or backlog_and_pipeline_happy_path or pipeline_dispatch_next_picks_highest_priority_todo or pipeline_escalates_on_review_after_retries' -q"
+  ],
+  "decision_gate": "close lane only after autonomous pipeline stage-profile tests remain green under current execution-template defaults"
+}

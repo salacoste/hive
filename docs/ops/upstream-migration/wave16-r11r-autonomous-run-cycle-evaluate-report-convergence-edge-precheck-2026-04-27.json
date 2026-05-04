@@ -1,0 +1,23 @@
+{
+  "generated_at_utc": "2026-04-27T01:05:03Z",
+  "wave": "Wave16-R11R",
+  "title": "Autonomous run-cycle/evaluate/report convergence edge lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify run-cycle outputs remain consistent when converged with evaluate/report pathways in edge transitions",
+    "verify report/read-model continuity across run-cycle terminal/pr-ready and evaluate-driven updates"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_run_cycle_reports_terminal_and_pr_ready",
+    "pipeline_loop_run_cycle_summary_outcomes",
+    "pipeline_loop_run_cycle_report_endpoint",
+    "pipeline_evaluate_endpoint_uses_checks_and_updates_report",
+    "pipeline_evaluate_endpoint_accepts_status_field",
+    "pipeline_evaluate_github_endpoint",
+    "pipeline_auto_next_endpoint",
+    "pipeline_report_endpoint"
+  ]
+}

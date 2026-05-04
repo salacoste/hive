@@ -1,0 +1,48 @@
+{
+  "generated_at_utc": "2026-04-26T02:17:38Z",
+  "wave": "Wave16-R10B",
+  "title": "Host/runtime residual shortlist lane execution",
+  "scope": [
+    "docs/autonomous-factory/12-backlog-task-list.md",
+    "core/tests/test_session_unified_colony_runtime.py"
+  ],
+  "reconcile_decision": {
+    "mode": "reconcile",
+    "reason": [
+      "precheck exposed legacy test drift referencing removed private API _start_unified_colony_runtime",
+      "updated test contract to current SessionManager lifecycle (_load_worker_core, unload_graph, stop_session)",
+      "host/runtime safety bundles remain green after test migration"
+    ]
+  },
+  "changes": [
+    "rewrote core/tests/test_session_unified_colony_runtime.py against graph_runtime-based worker lifecycle",
+    "removed assertions tied to removed session.colony private wiring path",
+    "added coverage for runtime bootstrap, unload cleanup, and stop_session teardown"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_session_unified_colony_runtime.py -q",
+        "result": "pass",
+        "summary": "3 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q",
+        "result": "pass",
+        "summary": "11 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10B lane closed with legacy-test drift resolved",
+      "next lane: R10C host cancel_all_tasks timeout/noise micro-delta"
+    ]
+  }
+}

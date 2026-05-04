@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-26T02:24:07Z",
+  "wave": "Wave16-R10E",
+  "title": "Queen memory compatibility namespace lane execution",
+  "scope": [
+    "core/framework/agents/queen/queen_memory_v2.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "normalized colony-memory namespace hardens path safety for session ids with separators/spaces",
+      "migrate_legacy compatibility kwarg is accepted for older callers without behavior regression",
+      "queen-memory and session-manager regression bundles are green"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local queen_memory_v2 compatibility contract"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_queen_memory.py -q",
+        "result": "pass",
+        "summary": "32 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q",
+        "result": "pass",
+        "summary": "9 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10E lane closed with explicit keep-local decision",
+      "next candidate lane: cursor_persistence compatibility"
+    ]
+  }
+}

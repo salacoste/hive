@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from framework.llm.fallback import FallbackLLMProvider
+from framework.llm.fallback import FallbackLLMProvider, get_fallback_status
 from framework.llm.provider import LLMProvider, LLMResponse, Tool
 from framework.llm.stream_events import FinishEvent, StreamErrorEvent, TextDeltaEvent, TextEndEvent
 
@@ -150,3 +150,25 @@ def test_complete_uses_default_failover_retry_limit() -> None:
 
     assert primary.last_max_retries == 3
     assert glm.last_max_retries == 3
+
+
+def test_complete_records_fallback_attempt_chain() -> None:
+    primary = _CompleteProvider("claude-opus-4-6", error="429 No accounts are currently available")
+    glm = _CompleteProvider("openai/glm-5.1")
+    provider = FallbackLLMProvider([primary, glm])
+
+    response = provider.complete(messages=[{"role": "user", "content": "ping"}])
+    status = get_fallback_status()
+    chain = status["recent_attempt_chains"][-1]
+
+    assert response.model == "openai/glm-5.1"
+    assert chain["mode"] == "complete"
+    assert chain["final_model"] == "openai/glm-5.1"
+    assert chain["exhausted"] is False
+    assert len(chain["attempts"]) == 2
+    assert chain["attempts"][0]["model"] == "claude-opus-4-6"
+    assert chain["attempts"][0]["result"] == "error"
+    assert chain["attempts"][0]["rate_limit_like"] is True
+    assert chain["attempts"][0]["fallback_to"] == "openai/glm-5.1"
+    assert chain["attempts"][1]["model"] == "openai/glm-5.1"
+    assert chain["attempts"][1]["result"] == "success"

@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-26T13:10:31Z",
+  "wave": "Wave16-R10G",
+  "title": "Queen lifecycle prompt alias compatibility lane execution",
+  "scope": [
+    "core/framework/tools/queen_lifecycle_tools.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "prompt_building alias keeps legacy constructors/tests compatible while newer prompt_independent flow remains primary",
+      "__post_init__ synchronization is behavior-safe and deterministic",
+      "queen-memory and colony tool bundles are green"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local prompt alias compatibility in QueenPhaseState"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_queen_memory.py -q",
+        "result": "pass",
+        "summary": "32 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_create_colony_tool.py -q",
+        "result": "pass",
+        "summary": "16 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_run_parallel_workers_tool.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10G lane closed with explicit keep-local decision",
+      "next candidate lane: routes_config AppKey contract refresh"
+    ]
+  }
+}

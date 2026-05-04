@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-25T13:27:00Z",
+  "wave": "Wave16-R9R",
+  "title": "MCP client teardown warning-noise lane precheck",
+  "scope": [
+    "core/framework/loader/mcp_client.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/loader/mcp_client.py",
+      "add": 5,
+      "del": 1,
+      "total": 6
+    }
+  },
+  "delta_summary": [
+    "local teardown branch downgrades known anyio cancel-scope/different-task shutdown quirk from warning to debug",
+    "non-quirk teardown errors remain warnings"
+  ],
+  "risk_signals": [
+    {
+      "type": "warning-noise-vs-signal",
+      "evidence": "known anyio teardown quirk should not inflate warning/error channels",
+      "impact": "upstream replay can reintroduce warning noise and hide actionable MCP failures"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_mcp_client.py -q",
+    "uv run --package framework pytest core/tests/test_mcp_registry_loader.py core/tests/test_tool_registry.py -k 'mcp' -q",
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'mcp or credentials' -q"
+  ],
+  "decision_gate": "prefer keep_local if known-quirk downgrade is covered and targeted MCP bundles stay green"
+}

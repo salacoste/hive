@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-25T13:24:00Z",
+  "wave": "Wave16-R9P",
+  "title": "Event-loop package boundary lane execution",
+  "scope": [
+    "core/framework/graph/event_loop/__init__.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local additive initializer is documentation-only and clarifies event-loop package boundary",
+      "it has no runtime side effects and remains compatibility-safe",
+      "targeted event-loop tests and import checks are green"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9P lane (doc-only package initializer retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_loop_node.py -q",
+        "result": "pass",
+        "summary": "65 passed, 4 skipped"
+      },
+      {
+        "command": "uv run --package framework python - <<'PY' ... import framework.graph.event_loop.* submodule check ... PY",
+        "result": "pass",
+        "summary": "event_loop_submodules_import_ok=4"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9P lane closed with explicit keep-local decision",
+      "next residual lane: runtime tests package marker (`core/framework/runtime/tests/__init__.py`)"
+    ]
+  }
+}

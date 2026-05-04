@@ -648,12 +648,6 @@ class MCPClient:
     _CLEANUP_TIMEOUT = 10
     _THREAD_JOIN_TIMEOUT = 12
 
-    @staticmethod
-    def _is_known_anyio_teardown_quirk(exc: Exception) -> bool:
-        """Best-effort classifier for benign anyio cross-task teardown errors."""
-        msg = str(exc).lower()
-        return "cancel scope" in msg or "different task" in msg
-
     async def _cleanup_stdio_async(self) -> None:
         """Async cleanup for persistent MCP session and context managers.
 
@@ -672,7 +666,8 @@ class MCPClient:
         except asyncio.CancelledError:
             logger.warning("MCP session cleanup was cancelled; proceeding with best-effort shutdown")
         except Exception as e:
-            if self._is_known_anyio_teardown_quirk(e):
+            msg = str(e).lower()
+            if "cancel scope" in msg or "different task" in msg:
                 logger.debug("MCP session teardown (known anyio quirk): %s", e)
             else:
                 logger.warning(f"Error closing MCP session: {e}")
@@ -686,7 +681,8 @@ class MCPClient:
         except asyncio.CancelledError:
             logger.debug("STDIO context cleanup was cancelled; proceeding with best-effort shutdown")
         except Exception as e:
-            if self._is_known_anyio_teardown_quirk(e):
+            msg = str(e).lower()
+            if "cancel scope" in msg or "different task" in msg:
                 logger.debug("STDIO context teardown (known anyio quirk): %s", e)
             else:
                 logger.warning(f"Error closing STDIO context: {e}")
@@ -699,10 +695,7 @@ class MCPClient:
         except asyncio.CancelledError:
             logger.debug("SSE context cleanup was cancelled; proceeding with best-effort shutdown")
         except Exception as e:
-            if self._is_known_anyio_teardown_quirk(e):
-                logger.debug("SSE context teardown (known anyio quirk): %s", e)
-            else:
-                logger.warning(f"Error closing SSE context: {e}")
+            logger.warning(f"Error closing SSE context: {e}")
         finally:
             self._sse_context = None
 

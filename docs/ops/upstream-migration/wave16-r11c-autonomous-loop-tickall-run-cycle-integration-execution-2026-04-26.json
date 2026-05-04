@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-26T18:43:40Z",
+  "wave": "Wave16-R11C",
+  "title": "Autonomous loop tick-all + run-cycle integration continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "loop tick_all integration continuity with run-cycle endpoints remains stable",
+      "run-cycle/report continuity after tick_all-driven dispatch paths remains stable",
+      "no regressions observed in targeted integration bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_all_rejects_non_array_project_ids or pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_rejects_invalid_max_steps or pipeline_loop_tick_dispatches_next_when_idle or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11C lane closed as keep-local with green tick_all/run_cycle integration bundle",
+      "next lane continues loop tick-resolution + run-cycle terminal coupling continuity"
+    ]
+  }
+}

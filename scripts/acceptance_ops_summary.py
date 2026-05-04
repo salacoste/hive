@@ -13,6 +13,7 @@ from typing import Any
 REPORTS_DIR = Path("docs/ops/acceptance-reports")
 LATEST_ARTIFACT = REPORTS_DIR / "latest.json"
 DIGEST_JSON = REPORTS_DIR / "digest-latest.json"
+GATE_RESULTS_JSON = REPORTS_DIR / "gate-latest.json"
 BACKLOG_STATUS_DIR = Path("docs/ops/backlog-status")
 BACKLOG_STATUS_LATEST = BACKLOG_STATUS_DIR / "latest.json"
 BACKLOG_STATUS_PATTERN = "backlog-status-*.json"
@@ -120,6 +121,7 @@ def main() -> int:
 
     latest = _read_json(LATEST_ARTIFACT) or {}
     digest = _read_json(DIGEST_JSON) or {}
+    gate = _read_json(GATE_RESULTS_JSON) or {}
     backlog_status_doc = _read_json(BACKLOG_STATUS_LATEST) or {}
     backlog_status = backlog_status_doc.get("status") or {}
     backlog_status_counts = backlog_status.get("status_counts") or {}
@@ -136,14 +138,28 @@ def main() -> int:
     health = latest.get("health") or {}
     ops = latest.get("ops") or {}
     tg = latest.get("telegram_bridge") or {}
+    release_matrix = gate.get("release_matrix") or {}
+    telegram_conflict_warning_active = bool(tg.get("poll_conflict_warning_active"))
+    telegram_conflict_warning_reason = None
+    if telegram_conflict_warning_active:
+        telegram_conflict_warning_reason = "telegram_409_conflicts_rising"
+    warnings: list[str] = []
+    if telegram_conflict_warning_reason:
+        warnings.append(telegram_conflict_warning_reason)
 
     summary = {
         "latest_artifact_exists": LATEST_ARTIFACT.exists(),
         "digest_exists": DIGEST_JSON.exists(),
+        "gate_results_exists": GATE_RESULTS_JSON.exists(),
         "latest_generated_at": latest.get("generated_at"),
         "health_status": health.get("status"),
         "ops_status": ops.get("status"),
         "telegram_status": tg.get("status"),
+        "telegram_poll_conflict_409_count": tg.get("poll_conflict_409_count"),
+        "telegram_last_poll_conflict_409_at": tg.get("last_poll_conflict_409_at"),
+        "telegram_last_poll_conflict_recover_result": tg.get("last_poll_conflict_recover_result"),
+        "telegram_poll_conflict_warning_active": telegram_conflict_warning_active,
+        "telegram_poll_conflict_warning_reason": telegram_conflict_warning_reason,
         "stuck_runs_total": ops.get("stuck_runs_total"),
         "no_progress_projects_total": ops.get("no_progress_projects_total"),
         "digest_window_days": digest.get("window_days"),
@@ -166,6 +182,15 @@ def main() -> int:
         "scheduler_autonomous_loop_launchd": autonomous_loop_launchd,
         "scheduler_autonomous_loop_cron": autonomous_loop_cron,
         "scheduler_hive_scheduler_container": docker_scheduler,
+        "release_matrix_status": release_matrix.get("status"),
+        "release_matrix_must_passed": release_matrix.get("must_passed"),
+        "release_matrix_must_total": release_matrix.get("must_total"),
+        "release_matrix_must_failed": release_matrix.get("must_failed"),
+        "release_matrix_must_missing": release_matrix.get("must_missing"),
+        "release_matrix_must": release_matrix.get("must"),
+        "release_matrix_should": release_matrix.get("should"),
+        "release_matrix_nice": release_matrix.get("nice"),
+        "warnings": warnings,
     }
 
     if args.json:

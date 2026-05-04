@@ -1,0 +1,965 @@
+{
+  "generated_at_utc": "2026-04-24T18:02:42Z",
+  "base_ref": "HEAD",
+  "target_ref": "upstream/main",
+  "totals": {
+    "all": 528,
+    "non_destructive": 174,
+    "status_counts": {
+      "D": 354,
+      "M": 131,
+      "A": 40,
+      "R100": 3
+    }
+  },
+  "top_prefixes_non_destructive": [
+    {
+      "prefix": "core/framework",
+      "count": 70
+    },
+    {
+      "prefix": "core/frontend",
+      "count": 31
+    },
+    {
+      "prefix": "core/tests",
+      "count": 20
+    },
+    {
+      "prefix": "tools/src",
+      "count": 18
+    },
+    {
+      "prefix": "examples/templates",
+      "count": 15
+    },
+    {
+      "prefix": "tools/tests",
+      "count": 6
+    },
+    {
+      "prefix": "docs/releases",
+      "count": 2
+    },
+    {
+      "prefix": ".gitignore",
+      "count": 1
+    },
+    {
+      "prefix": ".hive/browser-logs",
+      "count": 1
+    },
+    {
+      "prefix": ".pre-commit-config.yaml",
+      "count": 1
+    },
+    {
+      "prefix": "Makefile",
+      "count": 1
+    },
+    {
+      "prefix": "data/autonomous_agent_research_log.md",
+      "count": 1
+    },
+    {
+      "prefix": "docs/skill-registry-prd.md",
+      "count": 1
+    },
+    {
+      "prefix": "quickstart.sh",
+      "count": 1
+    },
+    {
+      "prefix": "scripts/browser_remote_ui.html",
+      "count": 1
+    },
+    {
+      "prefix": "scripts/check_llm_key.py",
+      "count": 1
+    },
+    {
+      "prefix": "tools/Dockerfile",
+      "count": 1
+    },
+    {
+      "prefix": "tools/coder_tools_server.py",
+      "count": 1
+    },
+    {
+      "prefix": "tools/mcp_servers.json",
+      "count": 1
+    }
+  ],
+  "entries_non_destructive": [
+    {
+      "status": "M",
+      "old_path": null,
+      "path": ".gitignore"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": ".hive/browser-logs/browser-2026-04-04.jsonl"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": ".pre-commit-config.yaml"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "Makefile"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agent_loop/agent_loop.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agent_loop/conversation.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agent_loop/internals/compaction.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agent_loop/internals/cursor_persistence.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agent_loop/internals/event_publishing.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agent_loop/internals/synthetic_tools.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/agent_loop/internals/tool_input_coercer.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agent_loop/internals/types.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/agent_loop/internals/vision_fallback.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agent_loop/prompting.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agent_loop/types.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agents/discovery.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/agents/queen/incubating_evaluator.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agents/queen/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agents/queen/nodes/__init__.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agents/queen/queen_memory_v2.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agents/queen/queen_profiles.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/agents/queen/queen_tools_config.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/agents/queen/queen_tools_defaults.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agents/queen/recall_selector.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/agents/queen/reflection_agent.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/config.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/host/agent_host.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/host/colony_metadata.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/host/colony_runtime.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/host/colony_tools_config.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/host/event_bus.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/llm/antigravity.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/llm/litellm.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/llm/mock.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/llm/model_catalog.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/llm/provider.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/llm/stream_events.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/loader/agent_loader.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/loader/mcp_client.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/loader/tool_registry.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/orchestrator/client_io.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/orchestrator/gcu.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/orchestrator/node.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/orchestrator/safe_eval.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/README.md"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/app.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/server/compaction_status.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/queen_orchestrator.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/server/routes_colony_tools.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/routes_credentials.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/routes_events.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/routes_execution.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/server/routes_mcp.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/server/routes_queen_tools.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/routes_queens.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/routes_sessions.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/server/routes_skills.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/session_manager.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/tests/test_api.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/server/tests/test_colony_tools.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/server/tests/test_mcp_routes.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/server/tests/test_queen_orchestrator.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/server/tests/test_queen_tools.py"
+    },
+    {
+      "status": "R100",
+      "old_path": "core/framework/skills/_default_skills/browser-automation/SKILL.md",
+      "path": "core/framework/skills/_preset_skills/browser-automation/SKILL.md"
+    },
+    {
+      "status": "R100",
+      "old_path": "core/framework/skills/_default_skills/linkedin-automation/SKILL.md",
+      "path": "core/framework/skills/_preset_skills/linkedin-automation/SKILL.md"
+    },
+    {
+      "status": "R100",
+      "old_path": "core/framework/skills/_default_skills/x-automation/SKILL.md",
+      "path": "core/framework/skills/_preset_skills/x-automation/SKILL.md"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/skills/authoring.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/skills/catalog.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/skills/discovery.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/skills/manager.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/framework/skills/overrides.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/skills/tool_gating.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/skills/trust.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/framework/tools/queen_lifecycle_tools.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/App.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/api/agents.ts"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/api/colonies.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/api/execution.ts"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/api/mcp.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/api/queens.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/api/sessions.ts"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/api/skills.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/api/types.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/components/AppHeader.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/components/ChatPanel.tsx"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/components/ColonyToolsSection.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/components/ColonyWorkersPanel.tsx"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/components/McpServersPanel.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/components/QueenProfilePanel.tsx"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/components/QueenToolsSection.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/components/SettingsModal.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/components/Sidebar.tsx"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/components/ToolsEditor.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/context/ColonyContext.tsx"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/hooks/use-pending-queue.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/lib/chat-helpers.test.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/lib/chat-helpers.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/lib/colony-registry.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/lib/colony-session-restore.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/pages/colony-chat.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/pages/org-chart.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/pages/queen-dm.tsx"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/pages/skills-library.tsx"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/frontend/src/pages/tool-library.tsx"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/frontend/src/types/colony.ts"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/conftest.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_colony_fork_flow.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_colony_runtime_overseer.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_create_colony_tool.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_event_bus.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_event_loop_node.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_litellm_provider.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_mcp_client.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_model_catalog.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_node_conversation.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/tests/test_queen_identity_prompt.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_queen_memory.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/tests/test_routes_skills.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_run_parallel_workers_tool.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_safe_eval.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_session_manager_worker_handoff.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/tests/test_skill_overrides.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_stream_events.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "core/tests/test_tool_input_coercer.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "core/tests/test_tool_registry.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "data/autonomous_agent_research_log.md"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "docs/releases/v0.10.3.md"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "docs/releases/v0.10.4.md"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "docs/skill-registry-prd.md"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/competitive_intel_agent/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/deep_research_agent/agent.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/deep_research_agent/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/deep_research_agent/nodes/__init__.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/email_inbox_management/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/email_reply_agent/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/job_hunter/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/local_business_extractor/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/meeting_scheduler/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/meeting_scheduler/nodes/__init__.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/sdr_agent/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/tech_news_reporter/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/twitter_news_agent/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/vulnerability_assessment/mcp_registry.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "examples/templates/vulnerability_assessment/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "quickstart.sh"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "scripts/browser_remote_ui.html"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "scripts/check_llm_key.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/Dockerfile"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/coder_tools_server.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/aden_tools/credentials/__init__.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/aden_tools/credentials/health_check.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "tools/src/aden_tools/credentials/prometheus.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/aden_tools/tools/__init__.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/aden_tools/tools/calendar_tool/calendar_tool.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/aden_tools/tools/github_tool/github_tool.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/aden_tools/tools/gmail_tool/gmail_tool.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "tools/src/aden_tools/tools/prometheus_tool/README.md"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "tools/src/aden_tools/tools/prometheus_tool/__init__.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "tools/src/aden_tools/tools/prometheus_tool/prometheus_tool.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/gcu/__init__.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/gcu/browser/__init__.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/gcu/browser/bridge.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/gcu/browser/tools/inspection.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/gcu/browser/tools/interactions.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/src/gcu/browser/tools/tabs.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/tests/test_browser_tools_comprehensive.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/tests/test_coder_tools_server.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/tests/test_health_checks.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/tests/tools/test_github_tool.py"
+    },
+    {
+      "status": "A",
+      "old_path": null,
+      "path": "tools/tests/tools/test_prometheus_tool.py"
+    },
+    {
+      "status": "M",
+      "old_path": null,
+      "path": "tools/tests/tools/test_wandb_tool.py"
+    }
+  ]
+}

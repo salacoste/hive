@@ -1,0 +1,3548 @@
+diff --git a/core/frontend/src/App.tsx b/core/frontend/src/App.tsx
+index f85a2ea8..66319e4e 100644
+--- a/core/frontend/src/App.tsx
++++ b/core/frontend/src/App.tsx
+@@ -5,6 +5,8 @@ import ColonyChat from "./pages/colony-chat";
+ import QueenDM from "./pages/queen-dm";
+ import OrgChart from "./pages/org-chart";
+ import PromptLibrary from "./pages/prompt-library";
++import SkillsLibrary from "./pages/skills-library";
++import ToolLibrary from "./pages/tool-library";
+ import CredentialsPage from "./pages/credentials";
+ import NotFound from "./pages/not-found";
+ 
+@@ -16,7 +18,9 @@ function App() {
+         <Route path="/colony/:colonyId" element={<ColonyChat />} />
+         <Route path="/queen/:queenId" element={<QueenDM />} />
+         <Route path="/org-chart" element={<OrgChart />} />
++        <Route path="/skills-library" element={<SkillsLibrary />} />
+         <Route path="/prompt-library" element={<PromptLibrary />} />
++        <Route path="/tool-library" element={<ToolLibrary />} />
+         <Route path="/credentials" element={<CredentialsPage />} />
+         <Route path="*" element={<NotFound />} />
+       </Route>
+diff --git a/core/frontend/src/api/colonies.ts b/core/frontend/src/api/colonies.ts
+new file mode 100644
+index 00000000..ddff1d4e
+--- /dev/null
++++ b/core/frontend/src/api/colonies.ts
+@@ -0,0 +1,50 @@
++import { api } from "./client";
++import type { ToolMeta, McpServerTools } from "./queens";
++
++export interface ColonySummary {
++  name: string;
++  queen_name: string | null;
++  created_at: string | null;
++  has_allowlist: boolean;
++  enabled_count: number | null;
++}
++
++export interface ColonyToolsResponse {
++  colony_name: string;
++  enabled_mcp_tools: string[] | null;
++  stale: boolean;
++  lifecycle: ToolMeta[];
++  synthetic: ToolMeta[];
++  mcp_servers: McpServerTools[];
++}
++
++export interface ColonyToolsUpdateResult {
++  colony_name: string;
++  enabled_mcp_tools: string[] | null;
++  refreshed_runtimes: number;
++  note?: string;
++}
++
++export const coloniesApi = {
++  /** List every colony on disk with a summary of its tool allowlist. */
++  list: () =>
++    api.get<{ colonies: ColonySummary[] }>(`/colonies/tools-index`),
++
++  /** Enumerate a colony's tool surface (lifecycle + synthetic + MCP). */
++  getTools: (colonyName: string) =>
++    api.get<ColonyToolsResponse>(
++      `/colony/${encodeURIComponent(colonyName)}/tools`,
++    ),
++
++  /** Persist a colony's MCP tool allowlist.
++   *
++   * ``null`` resets to "allow every MCP tool". A list of names enables
++   * only those MCP tools. Changes take effect on the next worker spawn;
++   * in-flight workers keep their booted tool list.
++   */
++  updateTools: (colonyName: string, enabled: string[] | null) =>
++    api.patch<ColonyToolsUpdateResult>(
++      `/colony/${encodeURIComponent(colonyName)}/tools`,
++      { enabled_mcp_tools: enabled },
++    ),
++};
+diff --git a/core/frontend/src/api/mcp.ts b/core/frontend/src/api/mcp.ts
+new file mode 100644
+index 00000000..57d6d6e1
+--- /dev/null
++++ b/core/frontend/src/api/mcp.ts
+@@ -0,0 +1,66 @@
++import { api } from "./client";
++
++export type McpTransport = "stdio" | "http" | "sse" | "unix";
++
++export interface McpServer {
++  name: string;
++  /** "local": added via UI/CLI (user-editable). "registry": installed from
++   * the remote MCP registry. "built-in": baked into the queen package —
++   * visible but not removable from the UI. */
++  source: "local" | "registry" | "built-in";
++  transport: McpTransport | string;
++  description: string;
++  enabled: boolean;
++  last_health_status: "healthy" | "unhealthy" | null;
++  last_error: string | null;
++  last_health_check_at: string | null;
++  tool_count: number | null;
++  /** Servers flagged removable:false cannot be deleted from the UI. */
++  removable?: boolean;
++}
++
++export interface AddMcpServerBody {
++  name: string;
++  transport: McpTransport;
++  /** stdio */
++  command?: string;
++  args?: string[];
++  env?: Record<string, string>;
++  cwd?: string;
++  /** http / sse */
++  url?: string;
++  headers?: Record<string, string>;
++  /** unix */
++  socket_path?: string;
++  description?: string;
++}
++
++export interface McpHealthResult {
++  name: string;
++  status: "healthy" | "unhealthy" | "unknown";
++  tools: number;
++  error: string | null;
++}
++
++/** Backend MCPError shape when an operation fails. */
++export interface McpErrorBody {
++  error: string;
++  code?: string;
++  what?: string;
++  why?: string;
++  fix?: string;
++}
++
++export const mcpApi = {
++  listServers: () => api.get<{ servers: McpServer[] }>("/mcp/servers"),
++  addServer: (body: AddMcpServerBody) =>
++    api.post<{ server: McpServer; hint: string }>("/mcp/servers", body),
++  removeServer: (name: string) =>
++    api.delete<{ removed: string }>(`/mcp/servers/${encodeURIComponent(name)}`),
++  setEnabled: (name: string, enabled: boolean) =>
++    api.post<{ name: string; enabled: boolean }>(
++      `/mcp/servers/${encodeURIComponent(name)}/${enabled ? "enable" : "disable"}`,
++    ),
++  checkHealth: (name: string) =>
++    api.post<McpHealthResult>(`/mcp/servers/${encodeURIComponent(name)}/health`),
++};
+diff --git a/core/frontend/src/api/skills.ts b/core/frontend/src/api/skills.ts
+new file mode 100644
+index 00000000..81e6568a
+--- /dev/null
++++ b/core/frontend/src/api/skills.ts
+@@ -0,0 +1,154 @@
++import { api } from "./client";
++
++export type SkillScopeKind = "queen" | "colony" | "user";
++
++export type SkillProvenance =
++  | "framework"
++  | "preset"
++  | "user_dropped"
++  | "user_ui_created"
++  | "queen_created"
++  | "learned_runtime"
++  | "project_dropped"
++  | "other";
++
++export interface SkillOwner {
++  type: "queen" | "colony";
++  id: string;
++  name: string;
++}
++
++export interface SkillRow {
++  name: string;
++  description: string;
++  source_scope: string;
++  provenance: SkillProvenance;
++  enabled: boolean;
++  editable: boolean;
++  deletable: boolean;
++  location: string;
++  base_dir?: string;
++  visibility: string[] | null;
++  trust: string | null;
++  created_at: string | null;
++  created_by: string | null;
++  notes: string | null;
++  param_overrides?: Record<string, unknown>;
++  owner?: SkillOwner | null;
++  visible_to?: { queens: string[]; colonies: string[] };
++  enabled_by_default?: boolean;
++}
++
++export interface ScopeSkillsResponse {
++  queen_id?: string;
++  colony_name?: string;
++  all_defaults_disabled: boolean;
++  skills: SkillRow[];
++  inherited_from_queen?: string[];
++}
++
++export interface AggregatedSkillsResponse {
++  skills: SkillRow[];
++  queens: Array<{ id: string; name: string }>;
++  colonies: Array<{ name: string; queen_id: string | null }>;
++}
++
++export interface SkillScopesResponse {
++  queens: Array<{ id: string; name: string }>;
++  colonies: Array<{ name: string; queen_id: string | null }>;
++}
++
++export interface SkillDetailResponse {
++  name: string;
++  description: string;
++  source_scope: string;
++  location: string;
++  base_dir: string;
++  body: string;
++  visibility: string[] | null;
++}
++
++export interface SkillCreatePayload {
++  name: string;
++  description: string;
++  body: string;
++  files?: Array<{ path: string; content: string }>;
++  enabled?: boolean;
++  notes?: string | null;
++  replace_existing?: boolean;
++}
++
++export interface SkillPatchPayload {
++  enabled?: boolean;
++  param_overrides?: Record<string, unknown>;
++  notes?: string | null;
++  all_defaults_disabled?: boolean;
++}
++
++const scopePath = (scope: "queen" | "colony", targetId: string) =>
++  scope === "queen"
++    ? `/queen/${encodeURIComponent(targetId)}/skills`
++    : `/colonies/${encodeURIComponent(targetId)}/skills`;
++
++export const skillsApi = {
++  // Aggregated library
++  listAll: () => api.get<AggregatedSkillsResponse>("/skills"),
++  listScopes: () => api.get<SkillScopesResponse>("/skills/scopes"),
++  getDetail: (name: string) =>
++    api.get<SkillDetailResponse>(`/skills/${encodeURIComponent(name)}`),
++
++  // Per-scope
++  listForQueen: (queenId: string) =>
++    api.get<ScopeSkillsResponse>(`/queen/${encodeURIComponent(queenId)}/skills`),
++  listForColony: (colonyName: string) =>
++    api.get<ScopeSkillsResponse>(
++      `/colonies/${encodeURIComponent(colonyName)}/skills`,
++    ),
++
++  create: (
++    scope: "queen" | "colony",
++    targetId: string,
++    payload: SkillCreatePayload,
++  ) => api.post<SkillRow>(scopePath(scope, targetId), payload),
++
++  patch: (
++    scope: "queen" | "colony",
++    targetId: string,
++    skillName: string,
++    payload: SkillPatchPayload,
++  ) =>
++    api.patch<{ name: string; enabled: boolean | null; ok: boolean }>(
++      `${scopePath(scope, targetId)}/${encodeURIComponent(skillName)}`,
++      payload,
++    ),
++
++  putBody: (
++    scope: "queen" | "colony",
++    targetId: string,
++    skillName: string,
++    payload: { body: string; description?: string },
++  ) =>
++    api.put<{ name: string; installed_path: string }>(
++      `${scopePath(scope, targetId)}/${encodeURIComponent(skillName)}/body`,
++      payload,
++    ),
++
++  remove: (scope: "queen" | "colony", targetId: string, skillName: string) =>
++    api.delete<{ name: string; removed: boolean }>(
++      `${scopePath(scope, targetId)}/${encodeURIComponent(skillName)}`,
++    ),
++
++  reload: (scope: "queen" | "colony", targetId: string) =>
++    api.post<{ ok: boolean }>(`${scopePath(scope, targetId)}/reload`),
++
++  // Multipart upload. File may be a SKILL.md or a .zip bundle.
++  upload: (formData: FormData) =>
++    api.upload<{
++      name: string;
++      installed_path: string;
++      replaced: boolean;
++      scope: SkillScopeKind;
++      target_id: string | null;
++      enabled: boolean;
++    }>("/skills/upload", formData),
++};
+diff --git a/core/frontend/src/components/ColonyToolsSection.tsx b/core/frontend/src/components/ColonyToolsSection.tsx
+new file mode 100644
+index 00000000..a897c92e
+--- /dev/null
++++ b/core/frontend/src/components/ColonyToolsSection.tsx
+@@ -0,0 +1,27 @@
++import { useCallback } from "react";
++import { coloniesApi } from "@/api/colonies";
++import ToolsEditor from "./ToolsEditor";
++
++export default function ColonyToolsSection({
++  colonyName,
++}: {
++  colonyName: string;
++}) {
++  const fetchSnapshot = useCallback(
++    () => coloniesApi.getTools(colonyName),
++    [colonyName],
++  );
++  const saveAllowlist = useCallback(
++    (enabled: string[] | null) => coloniesApi.updateTools(colonyName, enabled),
++    [colonyName],
++  );
++  return (
++    <ToolsEditor
++      subjectKey={`colony:${colonyName}`}
++      title="Tools"
++      caveat="Changes apply to the next worker spawn. Running workers keep the tool list they booted with."
++      fetchSnapshot={fetchSnapshot}
++      saveAllowlist={saveAllowlist}
++    />
++  );
++}
+diff --git a/core/frontend/src/components/McpServersPanel.tsx b/core/frontend/src/components/McpServersPanel.tsx
+new file mode 100644
+index 00000000..3a4eaf0f
+--- /dev/null
++++ b/core/frontend/src/components/McpServersPanel.tsx
+@@ -0,0 +1,651 @@
++import { useEffect, useState } from "react";
++import {
++  Plus,
++  Trash2,
++  RefreshCw,
++  Loader2,
++  AlertCircle,
++  Check,
++  X,
++  Server,
++  CircleCheck,
++  CircleAlert,
++  CircleDashed,
++} from "lucide-react";
++import {
++  mcpApi,
++  type McpServer,
++  type McpTransport,
++  type AddMcpServerBody,
++} from "@/api/mcp";
++
++type TransportKey = McpTransport;
++
++const TRANSPORT_OPTIONS: TransportKey[] = ["stdio", "http", "sse", "unix"];
++
++function healthBadge(server: McpServer) {
++  if (!server.enabled) {
++    return (
++      <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
++        <CircleDashed className="w-3 h-3" /> Disabled
++      </span>
++    );
++  }
++  if (server.last_health_status === "healthy") {
++    return (
++      <span className="flex items-center gap-1 text-[11px] text-green-500">
++        <CircleCheck className="w-3 h-3" /> Healthy
++      </span>
++    );
++  }
++  if (server.last_health_status === "unhealthy") {
++    return (
++      <span
++        className="flex items-center gap-1 text-[11px] text-red-400"
++        title={server.last_error || "Unhealthy"}
++      >
++        <CircleAlert className="w-3 h-3" /> Unhealthy
++      </span>
++    );
++  }
++  return (
++    <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
++      <CircleDashed className="w-3 h-3" /> Unknown
++    </span>
++  );
++}
++
++interface AddFormState {
++  name: string;
++  transport: TransportKey;
++  command: string;
++  args: string;
++  env: string;
++  cwd: string;
++  url: string;
++  headers: string;
++  socketPath: string;
++  description: string;
++}
++
++const EMPTY_FORM: AddFormState = {
++  name: "",
++  transport: "stdio",
++  command: "",
++  args: "",
++  env: "",
++  cwd: "",
++  url: "",
++  headers: "",
++  socketPath: "",
++  description: "",
++};
++
++function parseKeyValueLines(text: string): Record<string, string> {
++  const out: Record<string, string> = {};
++  text
++    .split("\n")
++    .map((l) => l.trim())
++    .filter(Boolean)
++    .forEach((line) => {
++      const eq = line.indexOf("=");
++      if (eq < 0) return;
++      const k = line.slice(0, eq).trim();
++      const v = line.slice(eq + 1).trim();
++      if (k) out[k] = v;
++    });
++  return out;
++}
++
++function buildAddBody(form: AddFormState): AddMcpServerBody {
++  const body: AddMcpServerBody = {
++    name: form.name.trim(),
++    transport: form.transport,
++    description: form.description.trim() || undefined,
++  };
++  if (form.transport === "stdio") {
++    body.command = form.command.trim();
++    const args = form.args
++      .split("\n")
++      .map((s) => s.trim())
++      .filter(Boolean);
++    if (args.length) body.args = args;
++    const env = parseKeyValueLines(form.env);
++    if (Object.keys(env).length) body.env = env;
++    if (form.cwd.trim()) body.cwd = form.cwd.trim();
++  } else if (form.transport === "http" || form.transport === "sse") {
++    body.url = form.url.trim();
++    const headers = parseKeyValueLines(form.headers);
++    if (Object.keys(headers).length) body.headers = headers;
++  } else if (form.transport === "unix") {
++    body.socket_path = form.socketPath.trim();
++  }
++  return body;
++}
++
++export default function McpServersPanel() {
++  const [servers, setServers] = useState<McpServer[] | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState<string | null>(null);
++
++  const [adding, setAdding] = useState(false);
++  const [form, setForm] = useState<AddFormState>(EMPTY_FORM);
++  const [submitting, setSubmitting] = useState(false);
++  const [submitError, setSubmitError] = useState<string | null>(null);
++
++  const [busyByName, setBusyByName] = useState<Record<string, boolean>>({});
++
++  const refresh = async () => {
++    setLoading(true);
++    setError(null);
++    try {
++      const { servers } = await mcpApi.listServers();
++      setServers(servers);
++    } catch (e: unknown) {
++      setError((e as Error)?.message || "Failed to load MCP servers");
++    } finally {
++      setLoading(false);
++    }
++  };
++
++  useEffect(() => {
++    refresh();
++  }, []);
++
++  const setBusy = (name: string, v: boolean) =>
++    setBusyByName((p) => ({ ...p, [name]: v }));
++
++  const handleToggle = async (server: McpServer) => {
++    setBusy(server.name, true);
++    try {
++      await mcpApi.setEnabled(server.name, !server.enabled);
++      await refresh();
++    } catch (e: unknown) {
++      setError((e as Error)?.message || "Toggle failed");
++    } finally {
++      setBusy(server.name, false);
++    }
++  };
++
++  const handleRemove = async (server: McpServer) => {
++    if (!confirm(`Remove MCP server "${server.name}"?`)) return;
++    setBusy(server.name, true);
++    try {
++      await mcpApi.removeServer(server.name);
++      await refresh();
++    } catch (e: unknown) {
++      const body = (e as { body?: { error?: string } }).body;
++      setError(body?.error || (e as Error)?.message || "Remove failed");
++    } finally {
++      setBusy(server.name, false);
++    }
++  };
++
++  const handleHealth = async (server: McpServer) => {
++    setBusy(server.name, true);
++    try {
++      await mcpApi.checkHealth(server.name);
++      await refresh();
++    } catch (e: unknown) {
++      setError((e as Error)?.message || "Health check failed");
++    } finally {
++      setBusy(server.name, false);
++    }
++  };
++
++  const canSubmit = (() => {
++    if (!form.name.trim()) return false;
++    if (form.transport === "stdio") return !!form.command.trim();
++    if (form.transport === "http" || form.transport === "sse")
++      return !!form.url.trim();
++    if (form.transport === "unix") return !!form.socketPath.trim();
++    return false;
++  })();
++
++  const handleSubmit = async () => {
++    if (!canSubmit) return;
++    setSubmitting(true);
++    setSubmitError(null);
++    try {
++      const body = buildAddBody(form);
++      const { server } = await mcpApi.addServer(body);
++      // Best-effort: auto-run health check so the UI shows tool count.
++      try {
++        await mcpApi.checkHealth(server.name);
++      } catch {
++        /* health check is informational; don't block the add flow */
++      }
++      setAdding(false);
++      setForm(EMPTY_FORM);
++      await refresh();
++    } catch (e: unknown) {
++      const body = (e as { body?: { error?: string; fix?: string } }).body;
++      setSubmitError(
++        [body?.error, body?.fix].filter(Boolean).join(" — ") ||
++          (e as Error)?.message ||
++          "Add failed",
++      );
++    } finally {
++      setSubmitting(false);
++    }
++  };
++
++  // Group by origin. "local" = user-registered via the UI or CLI. Everything
++  // else (built-in package entries, registry-installed entries) sits under
++  // "Built-in" since the user can't remove them from the UI.
++  const builtIns = (servers || []).filter((s) => s.source !== "local");
++  const custom = (servers || []).filter((s) => s.source === "local");
++
++  return (
++    <div className="flex flex-col gap-5">
++      <div className="flex items-start justify-between gap-3">
++        <div>
++          <h3 className="text-lg font-semibold text-foreground">MCP Servers</h3>
++          <p className="text-sm text-muted-foreground mt-1">
++            Register your own MCP servers so queens can use their tools. New
++            servers take effect in the next queen session you start.
++          </p>
++        </div>
++        <div className="flex items-center gap-2">
++          <button
++            onClick={refresh}
++            disabled={loading}
++            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border/60 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 disabled:opacity-50"
++            title="Refresh"
++          >
++            <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
++          </button>
++          <button
++            onClick={() => {
++              setAdding(true);
++              setForm(EMPTY_FORM);
++              setSubmitError(null);
++            }}
++            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90"
++          >
++            <Plus className="w-3 h-3" />
++            Add MCP Server
++          </button>
++        </div>
++      </div>
++
++      {error && (
++        <div className="flex items-start gap-2 text-xs text-destructive p-2.5 rounded-md bg-destructive/10 border border-destructive/30">
++          <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
++          <span className="flex-1">{error}</span>
++          <button
++            onClick={() => setError(null)}
++            className="text-destructive/70 hover:text-destructive"
++          >
++            <X className="w-3 h-3" />
++          </button>
++        </div>
++      )}
++
++      {loading && !servers && (
++        <div className="flex items-center gap-2 text-xs text-muted-foreground">
++          <Loader2 className="w-3 h-3 animate-spin" /> Loading MCP servers…
++        </div>
++      )}
++
++      {servers && (
++        <>
++          {custom.length > 0 && (
++            <Section title="My Custom">
++              {custom.map((s) => (
++                <ServerRow
++                  key={s.name}
++                  server={s}
++                  busy={!!busyByName[s.name]}
++                  onToggle={() => handleToggle(s)}
++                  onRemove={() => handleRemove(s)}
++                  onHealth={() => handleHealth(s)}
++                  isLocal
++                />
++              ))}
++            </Section>
++          )}
++          <Section title="Built-in">
++            {builtIns.length === 0 ? (
++              <p className="text-xs text-muted-foreground px-2 py-2">
++                No built-in servers registered.
++              </p>
++            ) : (
++              builtIns.map((s) => (
++                <ServerRow
++                  key={s.name}
++                  server={s}
++                  busy={!!busyByName[s.name]}
++                  onToggle={() => handleToggle(s)}
++                  onRemove={() => handleRemove(s)}
++                  onHealth={() => handleHealth(s)}
++                />
++              ))
++            )}
++          </Section>
++        </>
++      )}
++
++      {/* Add MCP modal */}
++      {adding && (
++        <div className="fixed inset-0 z-[60] flex items-center justify-center">
++          <div
++            className="absolute inset-0 bg-black/50"
++            onClick={() => !submitting && setAdding(false)}
++          />
++          <div className="relative bg-card border border-border/60 rounded-xl shadow-2xl w-full max-w-lg p-5 space-y-4 max-h-[85vh] overflow-y-auto">
++            <div className="flex items-center justify-between">
++              <h3 className="text-sm font-semibold text-foreground">
++                Add MCP Server
++              </h3>
++              <button
++                onClick={() => !submitting && setAdding(false)}
++                className="p-1 rounded text-muted-foreground hover:text-foreground"
++              >
++                <X className="w-4 h-4" />
++              </button>
++            </div>
++
++            <FieldRow label="Name *" hint="Unique identifier, e.g. my-search-tool">
++              <input
++                autoFocus
++                value={form.name}
++                onChange={(e) =>
++                  setForm((f) => ({
++                    ...f,
++                    name: e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""),
++                  }))
++                }
++                placeholder="my-search-tool"
++                className={inputCls}
++              />
++            </FieldRow>
++
++            <FieldRow label="Transport *">
++              <div className="flex gap-1">
++                {TRANSPORT_OPTIONS.map((t) => (
++                  <button
++                    key={t}
++                    onClick={() => setForm((f) => ({ ...f, transport: t }))}
++                    className={`flex-1 px-3 py-1.5 rounded-md text-xs font-medium border ${
++                      form.transport === t
++                        ? "bg-primary/15 text-primary border-primary/40"
++                        : "text-muted-foreground hover:text-foreground border-border/60 hover:bg-muted/30"
++                    }`}
++                  >
++                    {t}
++                  </button>
++                ))}
++              </div>
++            </FieldRow>
++
++            {form.transport === "stdio" && (
++              <>
++                <FieldRow
++                  label="Command *"
++                  hint="Executable that speaks MCP over stdin/stdout"
++                >
++                  <input
++                    value={form.command}
++                    onChange={(e) =>
++                      setForm((f) => ({ ...f, command: e.target.value }))
++                    }
++                    placeholder="uv"
++                    className={inputCls}
++                  />
++                </FieldRow>
++                <FieldRow label="Args (one per line)">
++                  <textarea
++                    value={form.args}
++                    onChange={(e) =>
++                      setForm((f) => ({ ...f, args: e.target.value }))
++                    }
++                    rows={3}
++                    placeholder={"run\npython\nmy_server.py\n--stdio"}
++                    className={textareaCls}
++                  />
++                </FieldRow>
++                <FieldRow label="Env (KEY=VALUE, one per line)">
++                  <textarea
++                    value={form.env}
++                    onChange={(e) =>
++                      setForm((f) => ({ ...f, env: e.target.value }))
++                    }
++                    rows={2}
++                    placeholder="API_KEY=abc123"
++                    className={textareaCls}
++                  />
++                </FieldRow>
++                <FieldRow label="Working directory">
++                  <input
++                    value={form.cwd}
++                    onChange={(e) =>
++                      setForm((f) => ({ ...f, cwd: e.target.value }))
++                    }
++                    placeholder="/path/to/repo"
++                    className={inputCls}
++                  />
++                </FieldRow>
++              </>
++            )}
++
++            {(form.transport === "http" || form.transport === "sse") && (
++              <>
++                <FieldRow label="URL *">
++                  <input
++                    value={form.url}
++                    onChange={(e) =>
++                      setForm((f) => ({ ...f, url: e.target.value }))
++                    }
++                    placeholder="https://example.com/mcp"
++                    className={inputCls}
++                  />
++                </FieldRow>
++                <FieldRow label="Headers (KEY=VALUE, one per line)">
++                  <textarea
++                    value={form.headers}
++                    onChange={(e) =>
++                      setForm((f) => ({ ...f, headers: e.target.value }))
++                    }
++                    rows={2}
++                    placeholder="Authorization=Bearer ..."
++                    className={textareaCls}
++                  />
++                </FieldRow>
++              </>
++            )}
++
++            {form.transport === "unix" && (
++              <FieldRow label="Socket path *">
++                <input
++                  value={form.socketPath}
++                  onChange={(e) =>
++                    setForm((f) => ({ ...f, socketPath: e.target.value }))
++                  }
++                  placeholder="/tmp/mcp.sock"
++                  className={inputCls}
++                />
++              </FieldRow>
++            )}
++
++            <FieldRow label="Description">
++              <input
++                value={form.description}
++                onChange={(e) =>
++                  setForm((f) => ({ ...f, description: e.target.value }))
++                }
++                placeholder="What this server does"
++                className={inputCls}
++              />
++            </FieldRow>
++
++            {submitError && (
++              <div className="flex items-start gap-2 text-xs text-destructive p-2 rounded-md bg-destructive/10 border border-destructive/30">
++                <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
++                <span>{submitError}</span>
++              </div>
++            )}
++
++            <div className="flex justify-end gap-2 pt-1">
++              <button
++                onClick={() => setAdding(false)}
++                disabled={submitting}
++                className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30"
++              >
++                Cancel
++              </button>
++              <button
++                onClick={handleSubmit}
++                disabled={!canSubmit || submitting}
++                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-semibold hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
++              >
++                {submitting ? (
++                  <Loader2 className="w-3 h-3 animate-spin" />
++                ) : (
++                  <Check className="w-3 h-3" />
++                )}
++                {submitting ? "Adding…" : "Add"}
++              </button>
++            </div>
++          </div>
++        </div>
++      )}
++    </div>
++  );
++}
++
++const inputCls =
++  "w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40";
++const textareaCls = `${inputCls} resize-none font-mono text-xs`;
++
++function FieldRow({
++  label,
++  hint,
++  children,
++}: {
++  label: string;
++  hint?: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <div>
++      <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">
++        {label}
++      </label>
++      {children}
++      {hint && (
++        <p className="text-[11px] text-muted-foreground/70 mt-1">{hint}</p>
++      )}
++    </div>
++  );
++}
++
++function Section({
++  title,
++  children,
++}: {
++  title: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <div>
++      <p className="text-[11px] font-semibold text-muted-foreground/60 uppercase tracking-wider mb-2">
++        {title}
++      </p>
++      <div className="flex flex-col gap-1">{children}</div>
++    </div>
++  );
++}
++
++function ServerRow({
++  server,
++  busy,
++  onToggle,
++  onRemove,
++  onHealth,
++  isLocal,
++}: {
++  server: McpServer;
++  busy: boolean;
++  onToggle: () => void;
++  onRemove: () => void;
++  onHealth: () => void;
++  isLocal?: boolean;
++}) {
++  // Package-baked servers live in the repo and aren't managed by
++  // MCPRegistry, so toggling / removing / health-checking them would
++  // fail against the backend. Show them as read-only.
++  const isBuiltIn = server.source === "built-in";
++  return (
++    <div className="flex items-center gap-3 py-2.5 px-2 rounded-lg hover:bg-muted/20">
++      <div className="w-9 h-9 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
++        <Server className="w-4 h-4 text-primary" />
++      </div>
++      <div className="flex-1 min-w-0">
++        <div className="flex items-center gap-2">
++          <p className="text-sm font-medium text-foreground truncate">
++            {server.name}
++          </p>
++          <span className="text-[10px] uppercase tracking-wider text-muted-foreground/60">
++            {server.transport}
++          </span>
++          {isBuiltIn && (
++            <span className="text-[10px] uppercase tracking-wider text-muted-foreground/80 bg-muted/40 px-1.5 py-0.5 rounded">
++              Built-in
++            </span>
++          )}
++          {server.tool_count !== null && server.tool_count !== undefined && (
++            <span className="text-[11px] text-muted-foreground">
++              {server.tool_count} tools
++            </span>
++          )}
++        </div>
++        <div className="flex items-center gap-2">
++          {!isBuiltIn && healthBadge(server)}
++          {server.description && (
++            <span className="text-xs text-muted-foreground truncate">
++              {isBuiltIn ? server.description : `· ${server.description}`}
++            </span>
++          )}
++        </div>
++      </div>
++      {!isBuiltIn && (
++        <>
++          <button
++            onClick={onHealth}
++            disabled={busy}
++            className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/40 disabled:opacity-50"
++            title="Health check"
++          >
++            {busy ? (
++              <Loader2 className="w-3.5 h-3.5 animate-spin" />
++            ) : (
++              <RefreshCw className="w-3.5 h-3.5" />
++            )}
++          </button>
++          <button
++            onClick={onToggle}
++            disabled={busy}
++            className={`px-3 py-1 rounded-md text-[11px] font-semibold border disabled:opacity-50 ${
++              server.enabled
++                ? "text-muted-foreground border-border/60 hover:bg-muted/30"
++                : "bg-primary/15 text-primary border-primary/40 hover:bg-primary/25"
++            }`}
++          >
++            {server.enabled ? "Disable" : "Enable"}
++          </button>
++        </>
++      )}
++      {isLocal && !isBuiltIn && (
++        <button
++          onClick={onRemove}
++          disabled={busy}
++          className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 disabled:opacity-50"
++          title="Remove"
++        >
++          <Trash2 className="w-3.5 h-3.5" />
++        </button>
++      )}
++    </div>
++  );
++}
+diff --git a/core/frontend/src/components/QueenToolsSection.tsx b/core/frontend/src/components/QueenToolsSection.tsx
+new file mode 100644
+index 00000000..493c052f
+--- /dev/null
++++ b/core/frontend/src/components/QueenToolsSection.tsx
+@@ -0,0 +1,27 @@
++import { useCallback } from "react";
++import { queensApi } from "@/api/queens";
++import ToolsEditor from "./ToolsEditor";
++
++export default function QueenToolsSection({ queenId }: { queenId: string }) {
++  const fetchSnapshot = useCallback(
++    () => queensApi.getTools(queenId),
++    [queenId],
++  );
++  const saveAllowlist = useCallback(
++    (enabled: string[] | null) => queensApi.updateTools(queenId, enabled),
++    [queenId],
++  );
++  const resetToRoleDefault = useCallback(
++    () => queensApi.resetTools(queenId),
++    [queenId],
++  );
++  return (
++    <ToolsEditor
++      subjectKey={`queen:${queenId}`}
++      title="Tools"
++      fetchSnapshot={fetchSnapshot}
++      saveAllowlist={saveAllowlist}
++      resetToRoleDefault={resetToRoleDefault}
++    />
++  );
++}
+diff --git a/core/frontend/src/components/Sidebar.tsx b/core/frontend/src/components/Sidebar.tsx
+index 92fb4b8b..d6f7d040 100644
+--- a/core/frontend/src/components/Sidebar.tsx
++++ b/core/frontend/src/components/Sidebar.tsx
+@@ -5,22 +5,57 @@ import {
+   ChevronRight,
+   MessageSquarePlus,
+   Network,
+-  Sparkles,
+   KeyRound,
+   ChevronDown,
++  Plus,
++  X,
++  Crown,
++  Loader2,
++  Library,
+ } from "lucide-react";
+ import SidebarColonyItem from "./SidebarColonyItem";
+ import SidebarQueenItem from "./SidebarQueenItem";
+ import { useColony } from "@/context/ColonyContext";
++import { queensApi } from "@/api/queens";
++import { executionApi } from "@/api/execution";
++import { slugToColonyId, sortQueenProfiles } from "@/lib/colony-registry";
+ 
+ export default function Sidebar() {
+   const navigate = useNavigate();
+-  const { colonies, queens, queenProfiles, sidebarCollapsed, setSidebarCollapsed } = useColony();
++  const { colonies, queens, queenProfiles, sidebarCollapsed, setSidebarCollapsed, refresh } = useColony();
+   const activeQueenIds = new Set(
+     queens.filter((q) => q.status === "online").map((q) => q.id),
+   );
+   const [coloniesExpanded, setColoniesExpanded] = useState(true);
+   const [queensExpanded, setQueensExpanded] = useState(true);
++  const [libraryExpanded, setLibraryExpanded] = useState(false);
++
++  // Colony creation
++  const [createColonyOpen, setCreateColonyOpen] = useState(false);
++  const [newColonyQueen, setNewColonyQueen] = useState("");
++  const [newColonyName, setNewColonyName] = useState("");
++  const [newColonyGoal, setNewColonyGoal] = useState("");
++  const [creatingColony, setCreatingColony] = useState(false);
++
++  const handleCreateColony = async () => {
++    const cname = newColonyName.trim();
++    if (!cname || !newColonyQueen || creatingColony) return;
++    setCreatingColony(true);
++    try {
++      const { session_id } = await queensApi.createNewSession(newColonyQueen, newColonyGoal.trim() || undefined);
++      await executionApi.colonySpawn(session_id, cname, newColonyGoal.trim() || undefined);
++      setCreateColonyOpen(false);
++      setNewColonyQueen("");
++      setNewColonyName("");
++      setNewColonyGoal("");
++      refresh();
++      navigate(`/colony/${slugToColonyId(cname)}`);
++    } catch (err) {
++      console.error("Failed to create colony:", err);
++    } finally {
++      setCreatingColony(false);
++    }
++  };
+ 
+   // ── Resizable width ──────────────────────────────────────────────────
+   const MIN_WIDTH = 180;
+@@ -82,6 +117,7 @@ export default function Sidebar() {
+   }
+ 
+   return (
++    <>
+     <aside
+       className="flex-shrink-0 flex flex-col bg-sidebar-bg border-r border-sidebar-border h-full relative"
+       style={{ width }}
+@@ -131,12 +167,39 @@ export default function Sidebar() {
+           <span>Org Chart</span>
+         </button>
+         <button
+-          onClick={() => navigate("/prompt-library")}
++          onClick={() => setLibraryExpanded((v) => !v)}
+           className="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-sm text-foreground/70 hover:bg-sidebar-item-hover hover:text-foreground transition-colors"
+         >
+-          <Sparkles className="w-4 h-4" />
+-          <span>Prompt Library</span>
++          <Library className="w-4 h-4" />
++          <span className="flex-1 text-left">Library</span>
++          <ChevronDown
++            className={`w-3.5 h-3.5 transition-transform ${
++              libraryExpanded ? "" : "-rotate-90"
++            }`}
++          />
+         </button>
++        {libraryExpanded && (
++          <>
++            <button
++              onClick={() => navigate("/skills-library")}
++              className="flex items-center gap-2.5 pl-9 pr-3 py-1.5 rounded-md text-sm text-foreground/70 hover:bg-sidebar-item-hover hover:text-foreground transition-colors"
++            >
++              <span>Skills</span>
++            </button>
++            <button
++              onClick={() => navigate("/prompt-library")}
++              className="flex items-center gap-2.5 pl-9 pr-3 py-1.5 rounded-md text-sm text-foreground/70 hover:bg-sidebar-item-hover hover:text-foreground transition-colors"
++            >
++              <span>Prompts</span>
++            </button>
++            <button
++              onClick={() => navigate("/tool-library")}
++              className="flex items-center gap-2.5 pl-9 pr-3 py-1.5 rounded-md text-sm text-foreground/70 hover:bg-sidebar-item-hover hover:text-foreground transition-colors"
++            >
++              <span>Tools</span>
++            </button>
++          </>
++        )}
+         <button
+           onClick={() => navigate("/credentials")}
+           className="flex items-center gap-2.5 px-3 py-1.5 rounded-md text-sm text-foreground/70 hover:bg-sidebar-item-hover hover:text-foreground transition-colors"
+@@ -149,20 +212,29 @@ export default function Sidebar() {
+       {/* COLONIES section */}
+       <div className="flex-1 overflow-y-auto min-h-0">
+         <div className="py-2">
+-          <button
+-            onClick={() => setColoniesExpanded((v) => !v)}
+-            className="flex items-center gap-1.5 px-4 py-1.5 w-full text-[11px] font-semibold text-sidebar-section-text uppercase tracking-wider hover:text-foreground transition-colors"
+-          >
+-            <ChevronDown
+-              className={`w-3 h-3 transition-transform ${coloniesExpanded ? "" : "-rotate-90"}`}
+-            />
+-            <span>Colonies</span>
+-            {colonies.length > 0 && (
+-              <span className="ml-auto text-[10px] bg-sidebar-item-hover rounded-full px-1.5 py-0.5 font-medium">
+-                {colonies.length}
+-              </span>
+-            )}
+-          </button>
++          <div className="flex items-center px-4 py-1.5">
++            <button
++              onClick={() => setColoniesExpanded((v) => !v)}
++              className="flex items-center gap-1.5 flex-1 text-[11px] font-semibold text-sidebar-section-text uppercase tracking-wider hover:text-foreground transition-colors"
++            >
++              <ChevronDown
++                className={`w-3 h-3 transition-transform ${coloniesExpanded ? "" : "-rotate-90"}`}
++              />
++              <span>Colonies</span>
++              {colonies.length > 0 && (
++                <span className="text-[10px] bg-sidebar-item-hover rounded-full px-1.5 py-0.5 font-medium">
++                  {colonies.length}
++                </span>
++              )}
++            </button>
++            <button
++              onClick={() => setCreateColonyOpen(true)}
++              className="p-0.5 rounded text-sidebar-section-text hover:text-foreground hover:bg-sidebar-item-hover transition-colors"
++              title="Create colony"
++            >
++              <Plus className="w-3.5 h-3.5" />
++            </button>
++          </div>
+           {coloniesExpanded && (
+             <div className="flex flex-col gap-0.5 mt-0.5">
+               {colonies.map((colony) => (
+@@ -207,5 +279,70 @@ export default function Sidebar() {
+         </div>
+       </div>
+     </aside>
++
++    {/* Create Colony modal */}
++    {createColonyOpen && (
++      <div className="fixed inset-0 z-50 flex items-center justify-center">
++        <div className="absolute inset-0 bg-black/40" onClick={() => !creatingColony && setCreateColonyOpen(false)} />
++        <div className="relative bg-card border border-border/60 rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4">
++          <div className="flex items-center justify-between">
++            <h2 className="text-sm font-semibold text-foreground">Create Colony</h2>
++            <button onClick={() => setCreateColonyOpen(false)} className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50">
++              <X className="w-4 h-4" />
++            </button>
++          </div>
++
++          <div className="space-y-3">
++            <div>
++              <label className="block text-[11px] font-medium text-muted-foreground mb-1">Queen Bee <span className="text-primary">*</span></label>
++              <div className="grid grid-cols-2 gap-1.5 max-h-[160px] overflow-y-auto">
++                {sortQueenProfiles(queenProfiles).map((q) => (
++                  <button key={q.id} onClick={() => setNewColonyQueen(q.id)}
++                    className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs transition-colors ${
++                      newColonyQueen === q.id
++                        ? "border-primary/40 bg-primary/[0.06] text-primary"
++                        : "border-border/50 text-foreground hover:border-primary/30"
++                    }`}>
++                    <Crown className="w-3 h-3 flex-shrink-0" />
++                    <div className="min-w-0">
++                      <p className="font-medium truncate">{q.name}</p>
++                      <p className="text-[10px] text-muted-foreground truncate">{q.title}</p>
++                    </div>
++                  </button>
++                ))}
++              </div>
++            </div>
++
++            <div>
++              <label className="block text-[11px] font-medium text-muted-foreground mb-1">Colony Name <span className="text-primary">*</span></label>
++              <input type="text" value={newColonyName}
++                onChange={(e) => setNewColonyName(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))}
++                placeholder="e.g. research_team" autoFocus
++                className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary" />
++            </div>
++
++            <div>
++              <label className="block text-[11px] font-medium text-muted-foreground mb-1">Goal <span className="text-muted-foreground/40">(optional)</span></label>
++              <textarea value={newColonyGoal} onChange={(e) => setNewColonyGoal(e.target.value)}
++                placeholder="Describe what this colony should work on" rows={3}
++                className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary resize-none" />
++            </div>
++          </div>
++
++          <div className="flex justify-end gap-2 pt-2">
++            <button onClick={() => { setCreateColonyOpen(false); setNewColonyQueen(""); setNewColonyName(""); setNewColonyGoal(""); }}
++              disabled={creatingColony}
++              className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50">
++              Cancel
++            </button>
++            <button onClick={handleCreateColony} disabled={creatingColony || !newColonyName.trim() || !newColonyQueen}
++              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
++              {creatingColony ? <><Loader2 className="w-3 h-3 animate-spin" /> Creating...</> : "Create"}
++            </button>
++          </div>
++        </div>
++      </div>
++    )}
++    </>
+   );
+ }
+diff --git a/core/frontend/src/components/ToolsEditor.tsx b/core/frontend/src/components/ToolsEditor.tsx
+new file mode 100644
+index 00000000..0d248403
+--- /dev/null
++++ b/core/frontend/src/components/ToolsEditor.tsx
+@@ -0,0 +1,532 @@
++import { useEffect, useMemo, useRef, useState } from "react";
++import {
++  ChevronDown,
++  ChevronRight,
++  Check,
++  Loader2,
++  Lock,
++  Wrench,
++  AlertCircle,
++} from "lucide-react";
++import type { ToolMeta, McpServerTools } from "@/api/queens";
++
++/** Shape every Tools section (Queen / Colony) shares. */
++export interface ToolsSnapshot {
++  enabled_mcp_tools: string[] | null;
++  stale: boolean;
++  lifecycle: ToolMeta[];
++  synthetic: ToolMeta[];
++  mcp_servers: McpServerTools[];
++  /** Optional: when true, the allowlist came from the role-based
++   * default (no explicit save). Only queens surface this today. */
++  is_role_default?: boolean;
++}
++
++export interface ToolsEditorProps {
++  /** Stable identifier — refetches when it changes. */
++  subjectKey: string;
++  /** Title shown above the controls. */
++  title?: string;
++  /** One-line caveat rendered under the header (e.g. "Changes apply …"). */
++  caveat?: string;
++  /** Load the current snapshot. */
++  fetchSnapshot: () => Promise<ToolsSnapshot>;
++  /** Persist an allowlist. ``null`` is an explicit "allow all" save. */
++  saveAllowlist: (
++    enabled: string[] | null,
++  ) => Promise<{ enabled_mcp_tools: string[] | null }>;
++  /** Optional: drop any saved allowlist so the subject falls back to
++   * its role-based default. Shows a "Reset to role default" button
++   * when provided. */
++  resetToRoleDefault?: () => Promise<{ enabled_mcp_tools: string[] | null }>;
++}
++
++type TriState = "checked" | "unchecked" | "indeterminate";
++
++function triStateForServer(
++  toolNames: string[],
++  allowed: Set<string> | null,
++): TriState {
++  if (allowed === null) return "checked";
++  if (toolNames.length === 0) return "unchecked";
++  const enabledCount = toolNames.reduce(
++    (n, name) => n + (allowed.has(name) ? 1 : 0),
++    0,
++  );
++  if (enabledCount === 0) return "unchecked";
++  if (enabledCount === toolNames.length) return "checked";
++  return "indeterminate";
++}
++
++function TriStateCheckbox({
++  state,
++  onChange,
++  disabled,
++}: {
++  state: TriState;
++  onChange: (next: boolean) => void;
++  disabled?: boolean;
++}) {
++  const ref = useRef<HTMLInputElement>(null);
++  useEffect(() => {
++    if (ref.current) ref.current.indeterminate = state === "indeterminate";
++  }, [state]);
++  return (
++    <input
++      ref={ref}
++      type="checkbox"
++      checked={state === "checked"}
++      disabled={disabled}
++      onChange={(e) => onChange(e.target.checked)}
++      onClick={(e) => e.stopPropagation()}
++      className="h-3.5 w-3.5 rounded border-border/70 text-primary focus:ring-primary/40"
++    />
++  );
++}
++
++function ToolRow({
++  name,
++  description,
++  enabled,
++  editable,
++  onToggle,
++}: {
++  name: string;
++  description: string;
++  enabled: boolean;
++  editable: boolean;
++  onToggle?: (next: boolean) => void;
++}) {
++  return (
++    <div className="flex items-start gap-2 py-1.5 px-2 rounded hover:bg-muted/30">
++      {editable ? (
++        <input
++          type="checkbox"
++          checked={enabled}
++          onChange={(e) => onToggle?.(e.target.checked)}
++          className="mt-0.5 h-3.5 w-3.5 rounded border-border/70 text-primary focus:ring-primary/40"
++        />
++      ) : (
++        <Lock className="mt-0.5 h-3 w-3 text-muted-foreground/60 flex-shrink-0" />
++      )}
++      <div className="min-w-0 flex-1">
++        <div className="text-xs font-medium text-foreground font-mono">
++          {name}
++        </div>
++        {description && (
++          <div className="text-[11px] text-muted-foreground leading-relaxed line-clamp-2">
++            {description}
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
++
++function CollapsibleGroup({
++  title,
++  count,
++  badge,
++  expanded,
++  onToggle,
++  leading,
++  children,
++}: {
++  title: string;
++  count: number;
++  badge?: string;
++  expanded: boolean;
++  onToggle: () => void;
++  leading?: React.ReactNode;
++  children: React.ReactNode;
++}) {
++  return (
++    <div className="mb-2 rounded-lg border border-border/40 bg-muted/10 overflow-hidden">
++      <button
++        onClick={onToggle}
++        className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left hover:bg-muted/30"
++      >
++        {expanded ? (
++          <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />
++        ) : (
++          <ChevronRight className="w-3.5 h-3.5 text-muted-foreground" />
++        )}
++        {leading}
++        <span className="text-xs font-medium text-foreground flex-1 truncate">
++          {title}
++        </span>
++        <span className="text-[11px] text-muted-foreground">
++          {badge ?? count}
++        </span>
++      </button>
++      {expanded && (
++        <div className="border-t border-border/30 px-1 py-1">{children}</div>
++      )}
++    </div>
++  );
++}
++
++export default function ToolsEditor({
++  subjectKey,
++  title = "Tools",
++  caveat,
++  fetchSnapshot,
++  saveAllowlist,
++  resetToRoleDefault,
++}: ToolsEditorProps) {
++  const [data, setData] = useState<ToolsSnapshot | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState<string | null>(null);
++
++  const [draftAllowed, setDraftAllowed] = useState<Set<string> | null>(null);
++  const baselineRef = useRef<Set<string> | null>(null);
++  const [saving, setSaving] = useState(false);
++  const [saveError, setSaveError] = useState<string | null>(null);
++  const [savedRecently, setSavedRecently] = useState(false);
++
++  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
++
++  useEffect(() => {
++    let cancelled = false;
++    setLoading(true);
++    setError(null);
++    fetchSnapshot()
++      .then((d) => {
++        if (cancelled) return;
++        setData(d);
++        const baseline =
++          d.enabled_mcp_tools === null
++            ? null
++            : new Set<string>(d.enabled_mcp_tools);
++        baselineRef.current = baseline === null ? null : new Set(baseline);
++        setDraftAllowed(baseline);
++      })
++      .catch((e) => {
++        if (cancelled) return;
++        setError((e as Error)?.message || "Failed to load tools");
++      })
++      .finally(() => {
++        if (!cancelled) setLoading(false);
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [subjectKey, fetchSnapshot]);
++
++  const dirty = useMemo(() => {
++    const a = draftAllowed;
++    const b = baselineRef.current;
++    if (a === null && b === null) return false;
++    if (a === null || b === null) return true;
++    if (a.size !== b.size) return true;
++    for (const n of a) if (!b.has(n)) return true;
++    return false;
++  }, [draftAllowed]);
++
++  const allMcpNames = useMemo(() => {
++    const s = new Set<string>();
++    data?.mcp_servers.forEach((srv) => srv.tools.forEach((t) => s.add(t.name)));
++    return s;
++  }, [data]);
++
++  const toggleOne = (name: string, next: boolean) => {
++    setDraftAllowed((prev) => {
++      const base =
++        prev === null ? new Set<string>(allMcpNames) : new Set<string>(prev);
++      if (next) base.add(name);
++      else base.delete(name);
++      return base;
++    });
++  };
++
++  const toggleServer = (serverNames: string[], next: boolean) => {
++    setDraftAllowed((prev) => {
++      const base =
++        prev === null ? new Set<string>(allMcpNames) : new Set<string>(prev);
++      if (next) serverNames.forEach((n) => base.add(n));
++      else serverNames.forEach((n) => base.delete(n));
++      return base;
++    });
++  };
++
++  const handleDraftAllowAll = () => setDraftAllowed(null);
++
++  const handleResetToRoleDefault = async () => {
++    if (!resetToRoleDefault) return;
++    setSaving(true);
++    setSaveError(null);
++    try {
++      const result = await resetToRoleDefault();
++      const updated = result.enabled_mcp_tools;
++      baselineRef.current = updated === null ? null : new Set(updated);
++      setDraftAllowed(updated === null ? null : new Set(updated));
++      if (data) {
++        const u = updated === null ? null : new Set(updated);
++        setData({
++          ...data,
++          enabled_mcp_tools: updated,
++          is_role_default: true,
++          mcp_servers: data.mcp_servers.map((srv) => ({
++            ...srv,
++            tools: srv.tools.map((t) => ({
++              ...t,
++              enabled: u === null ? true : u.has(t.name),
++            })),
++          })),
++        });
++      }
++      setSavedRecently(true);
++      setTimeout(() => setSavedRecently(false), 2500);
++    } catch (e: unknown) {
++      const err = e as { body?: { error?: string } };
++      setSaveError(err.body?.error || "Reset failed");
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  const handleCancel = () => {
++    const baseline = baselineRef.current;
++    setDraftAllowed(baseline === null ? null : new Set(baseline));
++    setSaveError(null);
++  };
++
++  const handleSave = async () => {
++    setSaving(true);
++    setSaveError(null);
++    try {
++      const payload =
++        draftAllowed === null ? null : Array.from(draftAllowed).sort();
++      const result = await saveAllowlist(payload);
++      const updated = result.enabled_mcp_tools;
++      baselineRef.current = updated === null ? null : new Set(updated);
++      setDraftAllowed(updated === null ? null : new Set(updated));
++      if (data) {
++        const u = updated === null ? null : new Set(updated);
++        setData({
++          ...data,
++          enabled_mcp_tools: updated,
++          is_role_default: false,
++          mcp_servers: data.mcp_servers.map((srv) => ({
++            ...srv,
++            tools: srv.tools.map((t) => ({
++              ...t,
++              enabled: u === null ? true : u.has(t.name),
++            })),
++          })),
++        });
++      }
++      setSavedRecently(true);
++      setTimeout(() => setSavedRecently(false), 2500);
++    } catch (e: unknown) {
++      const err = e as { body?: { error?: string; unknown?: string[] } };
++      const extra = err.body?.unknown
++        ? ` (${err.body.unknown.join(", ")})`
++        : "";
++      setSaveError((err.body?.error || "Save failed") + extra);
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  if (loading) {
++    return (
++      <div className="flex items-center gap-2 text-xs text-muted-foreground py-3">
++        <Loader2 className="w-3 h-3 animate-spin" />
++        Loading tools…
++      </div>
++    );
++  }
++
++  if (error || !data) {
++    return (
++      <div className="flex items-start gap-2 text-xs text-destructive py-3">
++        <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
++        <span>{error || "Could not load tools"}</span>
++      </div>
++    );
++  }
++
++  const draftEnabledCount =
++    draftAllowed === null ? allMcpNames.size : draftAllowed.size;
++  const totalMcpCount = allMcpNames.size;
++
++  return (
++    <div>
++      <div className="flex items-center justify-between mb-1.5">
++        <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
++          <Wrench className="w-3 h-3" /> {title}
++        </h4>
++        <span className="text-[11px] text-muted-foreground">
++          {draftEnabledCount}/{totalMcpCount} MCP enabled
++        </span>
++      </div>
++
++      {caveat && (
++        <div className="flex items-start gap-1.5 text-[11px] text-muted-foreground mb-2 px-2 py-1.5 rounded bg-muted/20 border border-border/40">
++          <AlertCircle className="w-3 h-3 mt-0.5 flex-shrink-0" />
++          <span>{caveat}</span>
++        </div>
++      )}
++
++      {data.stale && (
++        <div className="flex items-start gap-1.5 text-[11px] text-muted-foreground mb-3 px-2 py-1.5 rounded bg-muted/30">
++          <AlertCircle className="w-3 h-3 mt-0.5 flex-shrink-0" />
++          <span>
++            Catalog is unavailable. Start a session once to populate the tool list.
++          </span>
++        </div>
++      )}
++
++      {(data.lifecycle.length > 0 || data.synthetic.length > 0) && (
++        <CollapsibleGroup
++          title="System tools (always enabled)"
++          count={data.lifecycle.length + data.synthetic.length}
++          expanded={!!expanded["__system"]}
++          onToggle={() =>
++            setExpanded((p) => ({ ...p, __system: !p["__system"] }))
++          }
++        >
++          <div className="flex flex-col">
++            {data.synthetic.map((t) => (
++              <ToolRow
++                key={`syn-${t.name}`}
++                name={t.name}
++                description={t.description}
++                enabled={true}
++                editable={false}
++              />
++            ))}
++            {data.lifecycle.map((t) => (
++              <ToolRow
++                key={`lc-${t.name}`}
++                name={t.name}
++                description={t.description}
++                enabled={true}
++                editable={false}
++              />
++            ))}
++          </div>
++        </CollapsibleGroup>
++      )}
++
++      {data.mcp_servers.map((srv) => {
++        const toolNames = srv.tools.map((t) => t.name);
++        const state = triStateForServer(toolNames, draftAllowed);
++        const enabledInServer =
++          draftAllowed === null
++            ? toolNames.length
++            : toolNames.reduce(
++                (n, name) => n + (draftAllowed.has(name) ? 1 : 0),
++                0,
++              );
++        return (
++          <CollapsibleGroup
++            key={srv.name}
++            title={srv.name}
++            count={srv.tools.length}
++            badge={`${enabledInServer}/${srv.tools.length}`}
++            expanded={!!expanded[srv.name]}
++            onToggle={() =>
++              setExpanded((p) => ({ ...p, [srv.name]: !p[srv.name] }))
++            }
++            leading={
++              <TriStateCheckbox
++                state={state}
++                onChange={(next) => toggleServer(toolNames, next)}
++              />
++            }
++          >
++            <div className="flex flex-col">
++              {srv.tools.map((t) => {
++                const enabled =
++                  draftAllowed === null ? true : draftAllowed.has(t.name);
++                return (
++                  <ToolRow
++                    key={`${srv.name}-${t.name}`}
++                    name={t.name}
++                    description={t.description}
++                    enabled={enabled}
++                    editable={true}
++                    onToggle={(next) => toggleOne(t.name, next)}
++                  />
++                );
++              })}
++            </div>
++          </CollapsibleGroup>
++        );
++      })}
++
++      <div className="flex items-center gap-2 pt-3">
++        <button
++          onClick={handleSave}
++          disabled={!dirty || saving}
++          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
++        >
++          {saving ? (
++            <Loader2 className="w-3 h-3 animate-spin" />
++          ) : (
++            <Check className="w-3 h-3" />
++          )}
++          {saving ? "Saving…" : "Save"}
++        </button>
++        <button
++          onClick={handleCancel}
++          disabled={!dirty || saving}
++          className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30 disabled:opacity-50"
++        >
++          Cancel
++        </button>
++        {savedRecently && !dirty && (
++          <span className="text-[11px] text-green-500 flex items-center gap-1">
++            <Check className="w-3 h-3" /> Saved
++          </span>
++        )}
++        <div className="ml-auto flex items-center gap-3">
++          {data.is_role_default !== undefined && (
++            <span
++              className={`text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded ${
++                data.is_role_default
++                  ? "bg-muted/40 text-muted-foreground"
++                  : "bg-primary/15 text-primary"
++              }`}
++              title={
++                data.is_role_default
++                  ? "Using the default allowlist for this role."
++                  : "Custom allowlist saved by you."
++              }
++            >
++              {data.is_role_default ? "Role default" : "Custom"}
++            </span>
++          )}
++          {resetToRoleDefault && !data.is_role_default && (
++            <button
++              onClick={handleResetToRoleDefault}
++              disabled={saving}
++              className="text-[11px] text-muted-foreground hover:text-foreground underline underline-offset-2 disabled:opacity-50"
++            >
++              Reset to role default
++            </button>
++          )}
++          {draftAllowed !== null && (
++            <button
++              onClick={handleDraftAllowAll}
++              disabled={saving}
++              className="text-[11px] text-muted-foreground hover:text-foreground underline underline-offset-2 disabled:opacity-50"
++              title="Draft 'allow all' — click Save to persist."
++            >
++              Allow all
++            </button>
++          )}
++        </div>
++      </div>
++
++      {saveError && (
++        <div className="flex items-start gap-1.5 mt-2 text-[11px] text-destructive">
++          <AlertCircle className="w-3 h-3 mt-0.5 flex-shrink-0" />
++          <span>{saveError}</span>
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/core/frontend/src/hooks/use-pending-queue.ts b/core/frontend/src/hooks/use-pending-queue.ts
+new file mode 100644
+index 00000000..64d9102d
+--- /dev/null
++++ b/core/frontend/src/hooks/use-pending-queue.ts
+@@ -0,0 +1,99 @@
++import { useCallback, useRef } from "react";
++import type { Dispatch, SetStateAction } from "react";
++import type { ChatMessage, ImageContent } from "@/components/ChatPanel";
++
++interface QueuedPayload {
++  text: string;
++  images?: ImageContent[];
++}
++
++interface UsePendingQueueArgs {
++  /** Sends a message to the backend. Must handle its own errors. */
++  sendToBackend: (text: string, images?: ImageContent[]) => void;
++  /** Setter for the chat message list — used to flip/strip the `queued` flag. */
++  setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
++  /** Fires once per flush, before any message is sent. Typically sets
++   *  isTyping/queenIsTyping so the UI reflects that the queen is busy again. */
++  onFlushStart?: () => void;
++}
++
++/**
++ * Client-side queue for user messages typed while the queen is mid-turn.
++ *
++ * - `enqueue` stores a message locally keyed by its optimistic UI id.
++ * - `steer` pulls one message out and sends it now — backend injects at the
++ *   next iteration boundary.
++ * - `cancelQueued` drops a queued message entirely (no backend call).
++ * - `flushNext` pops and sends one; wire this to `llm_turn_complete` (the
++ *   real per-turn boundary — execution_completed only fires at session
++ *   shutdown because the queen's loop parks in _await_user_input between
++ *   turns). Do NOT call on pause / cancel / fail.
++ *
++ * `flushRef` exposes the latest `flush` for capture-once SSE handlers.
++ */
++export function usePendingQueue({
++  sendToBackend,
++  setMessages,
++  onFlushStart,
++}: UsePendingQueueArgs) {
++  const queueRef = useRef<Map<string, QueuedPayload>>(new Map());
++
++  const enqueue = useCallback(
++    (messageId: string, payload: QueuedPayload) => {
++      queueRef.current.set(messageId, payload);
++    },
++    [],
++  );
++
++  const steer = useCallback(
++    (messageId: string) => {
++      const pending = queueRef.current.get(messageId);
++      if (!pending) return;
++      queueRef.current.delete(messageId);
++      setMessages((prev) =>
++        prev.map((m) => (m.id === messageId ? { ...m, queued: false } : m)),
++      );
++      sendToBackend(pending.text, pending.images);
++    },
++    [sendToBackend, setMessages],
++  );
++
++  const cancelQueued = useCallback(
++    (messageId: string) => {
++      if (!queueRef.current.has(messageId)) return;
++      queueRef.current.delete(messageId);
++      setMessages((prev) => prev.filter((m) => m.id !== messageId));
++    },
++    [setMessages],
++  );
++
++  // Drop every queued payload without sending. Call on route-level resets
++  // (queen switch, colony switch) — the hook outlives those transitions,
++  // so without this, stale queue entries flush into the new session.
++  const clear = useCallback(() => {
++    queueRef.current.clear();
++  }, []);
++
++  // Pop and send the oldest queued message (Map iteration is insertion
++  // order in JS). One-at-a-time semantics: used for both the Stop-button
++  // path (cancel current turn, send next) and the natural-turn-end path
++  // (on `execution_completed`, pick up the next queued message).
++  const flushNext = useCallback(() => {
++    const first = queueRef.current.entries().next();
++    if (first.done) return;
++    const [firstId, payload] = first.value;
++    queueRef.current.delete(firstId);
++    setMessages((prev) =>
++      prev.map((m) => (m.id === firstId ? { ...m, queued: false } : m)),
++    );
++    onFlushStart?.();
++    sendToBackend(payload.text, payload.images);
++  }, [sendToBackend, setMessages, onFlushStart]);
++
++  // Ref to the latest flushNext so SSE handlers captured with narrow deps
++  // can still invoke the up-to-date closure.
++  const flushNextRef = useRef(flushNext);
++  flushNextRef.current = flushNext;
++
++  return { enqueue, steer, cancelQueued, flushNext, flushNextRef, clear };
++}
+diff --git a/core/frontend/src/pages/org-chart.tsx b/core/frontend/src/pages/org-chart.tsx
+index e78d93ad..366125bf 100644
+--- a/core/frontend/src/pages/org-chart.tsx
++++ b/core/frontend/src/pages/org-chart.tsx
+@@ -1,10 +1,24 @@
+ import { useState, useCallback, useRef, useEffect } from "react";
+-import { NavLink } from "react-router-dom";
+-import { User } from "lucide-react";
++import { useNavigate } from "react-router-dom";
++import {
++  User, Component, X, Calendar, Target, Activity, ArrowRight, Clock,
++  Rocket, Globe, Mail, Search, Shield, TrendingUp, Briefcase, Code,
++  Database, FileText, MessageSquare, Zap, BarChart3, Users, Bot,
++  type LucideIcon,
++} from "lucide-react";
+ import { useColony } from "@/context/ColonyContext";
++import { agentsApi } from "@/api/agents";
+ import type { QueenProfileSummary, Colony } from "@/types/colony";
+-import { getColonyIcon } from "@/lib/colony-registry";
+ import QueenProfilePanel from "@/components/QueenProfilePanel";
++import { sortQueenProfiles } from "@/lib/colony-registry";
++
++const COLONY_ICONS: Record<string, LucideIcon> = {
++  component: Component, rocket: Rocket, globe: Globe, mail: Mail,
++  search: Search, shield: Shield, trending: TrendingUp, briefcase: Briefcase,
++  code: Code, database: Database, file: FileText, message: MessageSquare,
++  zap: Zap, chart: BarChart3, users: Users, bot: Bot,
++};
++const COLONY_ICON_KEYS = Object.keys(COLONY_ICONS);
+ 
+ /* ── User avatar (CEO card) ──────────────────────────────────────────── */
+ 
+@@ -25,22 +39,175 @@ function UserAvatar({ initials, avatarVersion }: { initials: string; avatarVersi
+   );
+ }
+ 
+-/* ── Colony tag (clickable link to colony chat) ───────────────────────── */
++/* ── Colony tag ──────────────────────────────────────────────────────── */
+ 
+-function ColonyTag({ colony }: { colony: Colony }) {
+-  const Icon = getColonyIcon(colony.queenId);
++function ColonyTag({ colony, onSelect }: { colony: Colony; onSelect: () => void }) {
++  const Icon = (colony.icon && COLONY_ICONS[colony.icon]) || Component;
+   return (
+-    <NavLink
+-      to={`/colony/${colony.id}`}
+-      className="flex items-center gap-1.5 rounded-lg border border-border/50 bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground hover:border-primary/30 hover:text-foreground transition-colors"
++    <button
++      onClick={onSelect}
++      className="flex items-center gap-1.5 rounded-lg border border-border/50 bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground hover:border-primary/30 hover:text-foreground transition-colors w-full text-left"
+     >
+-      <Icon className="w-3 h-3 flex-shrink-0" />
++      <Icon className="w-3 h-3 flex-shrink-0 text-primary/60" />
+       <span className="truncate">{colony.name}</span>
+-    </NavLink>
++    </button>
+   );
+ }
+ 
+-/* ── Queen card in the org grid ───────────────────────────────────────── */
++/* ── Colony detail drawer ────────────────────────────────────────────── */
++
++function ColonyDetailPanel({ colony, queenName, onClose, onIconChange }: {
++  colony: Colony; queenName: string; onClose: () => void;
++  onIconChange: (colonyId: string, icon: string) => void;
++}) {
++  const navigate = useNavigate();
++  const [iconPickerOpen, setIconPickerOpen] = useState(false);
++
++  const formatDate = (iso: string | null) => {
++    if (!iso) return "—";
++    try {
++      const d = new Date(iso);
++      return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
++        + " at " + d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
++    } catch { return "—"; }
++  };
++
++  const formatRelative = (iso: string | null) => {
++    if (!iso) return null;
++    try {
++      const diff = Date.now() - new Date(iso).getTime();
++      const mins = Math.floor(diff / 60000);
++      if (mins < 1) return "just now";
++      if (mins < 60) return `${mins}m ago`;
++      const hrs = Math.floor(mins / 60);
++      if (hrs < 24) return `${hrs}h ago`;
++      const days = Math.floor(hrs / 24);
++      return `${days}d ago`;
++    } catch { return null; }
++  };
++
++  const currentIconKey = colony.icon || "component";
++  const CurrentIcon = COLONY_ICONS[currentIconKey] || Component;
++
++  const handlePickIcon = async (key: string) => {
++    setIconPickerOpen(false);
++    onIconChange(colony.id, key);
++    await agentsApi.updateMetadata(colony.agentPath, { icon: key }).catch(() => {});
++  };
++
++  return (
++    <aside className="w-[320px] min-w-[320px] max-w-[320px] flex-shrink-0 border-l border-border/60 bg-card overflow-y-auto overflow-x-hidden overscroll-contain">
++      {/* Header */}
++      <div className="flex items-center justify-between px-5 py-3.5 border-b border-border/60">
++        <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
++          <Component className="w-4 h-4 text-primary" />
++          Colony Details
++        </div>
++        <button onClick={onClose} className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/60">
++          <X className="w-4 h-4" />
++        </button>
++      </div>
++
++      <div className="px-5 py-6">
++        {/* Icon + Name */}
++        <div className="mb-6 text-center">
++          <div className="relative inline-block">
++            <button
++              onClick={() => setIconPickerOpen(!iconPickerOpen)}
++              className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center mx-auto mb-3 hover:bg-primary/20 transition-colors"
++              title="Change icon"
++            >
++              <CurrentIcon className="w-6 h-6 text-primary" />
++            </button>
++            {iconPickerOpen && (
++              <div className="absolute top-14 left-1/2 -translate-x-1/2 bg-card border border-border/60 rounded-lg shadow-xl z-20 p-2 w-[200px]">
++                <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-1">Choose icon</p>
++                <div className="grid grid-cols-4 gap-1">
++                  {COLONY_ICON_KEYS.map((key) => {
++                    const Icon = COLONY_ICONS[key];
++                    return (
++                      <button key={key} onClick={() => handlePickIcon(key)}
++                        className={`w-10 h-10 rounded-lg flex items-center justify-center ${key === currentIconKey ? "bg-primary/15 text-primary" : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"}`}>
++                        <Icon className="w-4.5 h-4.5" />
++                      </button>
++                    );
++                  })}
++                </div>
++              </div>
++            )}
++          </div>
++          <h3 className="text-base font-semibold text-foreground">{colony.name}</h3>
++          {queenName && <p className="text-xs text-muted-foreground mt-0.5">Managed by {queenName}</p>}
++        </div>
++
++        {/* Go to colony */}
++        <button
++          onClick={() => navigate(`/colony/${colony.id}`)}
++          className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary text-primary-foreground py-2.5 text-sm font-medium hover:bg-primary/90 mb-6"
++        >
++          Open Colony
++          <ArrowRight className="w-4 h-4" />
++        </button>
++
++        {/* Metadata */}
++        <div className="space-y-4">
++          <div>
++            <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Start Date</h4>
++            <div className="flex items-center gap-2 text-sm text-foreground">
++              <Calendar className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
++              {formatDate(colony.createdAt)}
++            </div>
++          </div>
++
++          <div>
++            <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Project Goal</h4>
++            <div className="flex items-start gap-2 text-sm text-foreground/80 min-w-0">
++              <Target className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0 mt-0.5" />
++              <p className="leading-relaxed break-words min-w-0">{colony.task || colony.description || "No goal specified"}</p>
++            </div>
++          </div>
++
++          <div>
++            <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Current Status</h4>
++            <div className="flex items-center gap-2 text-sm">
++              <Activity className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
++              <span className={`inline-flex items-center gap-1.5 ${colony.status === "running" ? "text-emerald-500" : "text-muted-foreground"}`}>
++                <span className={`w-1.5 h-1.5 rounded-full ${colony.status === "running" ? "bg-emerald-500" : "bg-muted-foreground/40"}`} />
++                {colony.status === "running" ? "Running" : "Idle"}
++              </span>
++            </div>
++          </div>
++
++          {colony.lastActive && (
++            <div>
++              <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Last Active</h4>
++              <div className="flex items-center gap-2 text-sm text-foreground">
++                <Clock className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
++                {formatRelative(colony.lastActive) || formatDate(colony.lastActive)}
++              </div>
++            </div>
++          )}
++
++          <div>
++            <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5">Stats</h4>
++            <div className="grid grid-cols-2 gap-2">
++              <div className="rounded-lg bg-muted/30 px-3 py-2 text-center">
++                <p className="text-lg font-semibold text-foreground">{colony.sessionCount}</p>
++                <p className="text-[10px] text-muted-foreground">Sessions</p>
++              </div>
++              <div className="rounded-lg bg-muted/30 px-3 py-2 text-center">
++                <p className="text-lg font-semibold text-foreground">{colony.runCount}</p>
++                <p className="text-[10px] text-muted-foreground">Runs</p>
++              </div>
++            </div>
++          </div>
++        </div>
++      </div>
++    </aside>
++  );
++}
++
++/* ── Queen avatar ────────────────────────────────────────────────────── */
+ 
+ function QueenAvatar({ queenId, name, size = "w-11 h-11" }: { queenId: string; name: string; size?: string }) {
+   const [hasAvatar, setHasAvatar] = useState(true);
+@@ -56,26 +223,30 @@ function QueenAvatar({ queenId, name, size = "w-11 h-11" }: { queenId: string; n
+   );
+ }
+ 
++/* ── Queen card in the org grid ───────────────────────────────────────── */
++
+ function QueenCard({
+   queen,
+   colonies,
+   selected,
+   onSelect,
++  onSelectColony,
+ }: {
+   queen: QueenProfileSummary;
+   colonies: Colony[];
+   selected: boolean;
+   onSelect: () => void;
++  onSelectColony: (colony: Colony) => void;
+ }) {
+   return (
+     <div className="flex flex-col items-center w-[140px] flex-shrink-0">
+       {/* Vertical stub from horizontal bar */}
+       <div className="w-px h-6 bg-border" />
+ 
+-      {/* Queen card */}
++      {/* Queen card — fixed height so all cards align */}
+       <button
+         onClick={onSelect}
+-        className={`group flex flex-col items-center rounded-xl border bg-card p-4 w-full transition-all duration-200 text-center ${
++        className={`group flex flex-col items-center justify-center rounded-xl border bg-card p-4 w-full h-[130px] transition-all duration-200 text-center ${
+           selected
+             ? "border-primary/40 bg-primary/[0.04] ring-1 ring-primary/20"
+             : "border-border/60 hover:border-primary/30 hover:bg-primary/[0.03]"
+@@ -84,10 +255,10 @@ function QueenCard({
+         <div className="mb-2.5">
+           <QueenAvatar queenId={queen.id} name={queen.name} />
+         </div>
+-        <span className="text-sm font-semibold text-foreground group-hover:text-primary transition-colors">
++        <span className="text-sm font-semibold text-foreground group-hover:text-primary transition-colors line-clamp-1">
+           {queen.name}
+         </span>
+-        <span className="text-xs text-muted-foreground mt-0.5">
++        <span className="text-xs text-muted-foreground mt-0.5 line-clamp-1">
+           {queen.title}
+         </span>
+       </button>
+@@ -98,7 +269,7 @@ function QueenCard({
+           <div className="w-px h-4 bg-border" />
+           <div className="flex flex-col gap-1.5 w-full">
+             {colonies.map((colony) => (
+-              <ColonyTag key={colony.id} colony={colony} />
++              <ColonyTag key={colony.id} colony={colony} onSelect={() => onSelectColony(colony)} />
+             ))}
+           </div>
+         </>
+@@ -109,9 +280,12 @@ function QueenCard({
+ 
+ /* ── Main org chart page ──────────────────────────────────────────────── */
+ 
++// Fixed left-to-right order for queen cards
+ export default function OrgChart() {
+-  const { queenProfiles, colonies, userProfile, userAvatarVersion } = useColony();
++  const { queenProfiles: unsortedQueenProfiles, colonies, userProfile, userAvatarVersion } = useColony();
++  const queenProfiles = sortQueenProfiles(unsortedQueenProfiles);
+   const [selectedQueenId, setSelectedQueenId] = useState<string | null>(null);
++  const [selectedColony, setSelectedColony] = useState<Colony | null>(null);
+ 
+   // Pan & zoom state
+   const [zoom, setZoom] = useState(1);
+@@ -167,6 +341,21 @@ export default function OrgChart() {
+     .toUpperCase()
+     .slice(0, 2);
+ 
++  const handleSelectColony = (colony: Colony) => {
++    setSelectedQueenId(null);
++    setSelectedColony(selectedColony?.id === colony.id ? null : colony);
++  };
++
++  const handleSelectQueen = (queenId: string) => {
++    setSelectedColony(null);
++    setSelectedQueenId(selectedQueenId === queenId ? null : queenId);
++  };
++
++  // Resolve queen name for colony panel
++  const colonyQueenName = selectedColony?.queenProfileId
++    ? (queenProfiles.find((q) => q.id === selectedColony.queenProfileId)?.name ?? "")
++    : "";
++
+   return (
+     <div className="flex-1 flex overflow-hidden">
+       {/* Main chart area — pannable canvas */}
+@@ -234,11 +423,8 @@ export default function OrgChart() {
+                     queen={queen}
+                     colonies={coloniesByQueen.get(queen.id) ?? []}
+                     selected={selectedQueenId === queen.id}
+-                    onSelect={() =>
+-                      setSelectedQueenId(
+-                        selectedQueenId === queen.id ? null : queen.id,
+-                      )
+-                    }
++                    onSelect={() => handleSelectQueen(queen.id)}
++                    onSelectColony={handleSelectColony}
+                   />
+                 ))}
+               </div>
+@@ -247,7 +433,7 @@ export default function OrgChart() {
+         </div>
+       </div>
+ 
+-      {/* Profile side panel */}
++      {/* Queen profile side panel */}
+       {selectedQueenId && (
+         <QueenProfilePanel
+           queenId={selectedQueenId}
+@@ -255,6 +441,18 @@ export default function OrgChart() {
+           onClose={() => setSelectedQueenId(null)}
+         />
+       )}
++
++      {/* Colony detail side panel */}
++      {selectedColony && (
++        <ColonyDetailPanel
++          colony={selectedColony}
++          queenName={colonyQueenName}
++          onClose={() => setSelectedColony(null)}
++          onIconChange={(colonyId, icon) => {
++            setSelectedColony((prev) => prev && prev.id === colonyId ? { ...prev, icon } : prev);
++          }}
++        />
++      )}
+     </div>
+   );
+ }
+diff --git a/core/frontend/src/pages/skills-library.tsx b/core/frontend/src/pages/skills-library.tsx
+new file mode 100644
+index 00000000..f83ce515
+--- /dev/null
++++ b/core/frontend/src/pages/skills-library.tsx
+@@ -0,0 +1,982 @@
++import { useCallback, useEffect, useMemo, useState } from "react";
++import {
++  Library,
++  Crown,
++  Network,
++  BookOpen,
++  Search,
++  Plus,
++  Upload,
++  X,
++  Trash2,
++  Lock,
++  AlertCircle,
++  Loader2,
++  CheckCircle2,
++  Circle,
++} from "lucide-react";
++import { queensApi } from "@/api/queens";
++import { coloniesApi, type ColonySummary } from "@/api/colonies";
++import { slugToDisplayName } from "@/lib/colony-registry";
++import { ApiError } from "@/api/client";
++import {
++  skillsApi,
++  type AggregatedSkillsResponse,
++  type ScopeSkillsResponse,
++  type SkillDetailResponse,
++  type SkillProvenance,
++  type SkillRow,
++} from "@/api/skills";
++
++type Tab = "queens" | "colonies" | "catalog";
++
++const PROVENANCE_LABEL: Record<SkillProvenance, string> = {
++  framework: "Framework",
++  preset: "Preset",
++  user_dropped: "User",
++  user_ui_created: "User (UI)",
++  queen_created: "Queen",
++  learned_runtime: "Learned",
++  project_dropped: "Colony",
++  other: "Other",
++};
++
++function ProvenanceBadge({ provenance }: { provenance: SkillProvenance }) {
++  const tone =
++    provenance === "framework"
++      ? "bg-slate-400/10 text-slate-400"
++      : provenance === "preset"
++        ? "bg-teal-500/10 text-teal-500"
++        : provenance === "queen_created"
++          ? "bg-amber-500/10 text-amber-500"
++          : provenance === "learned_runtime"
++            ? "bg-purple-500/10 text-purple-500"
++            : "bg-primary/10 text-primary";
++  return (
++    <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${tone}`}>
++      {PROVENANCE_LABEL[provenance]}
++    </span>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Page shell
++// ---------------------------------------------------------------------------
++
++export default function SkillsLibrary() {
++  const [tab, setTab] = useState<Tab>("queens");
++
++  return (
++    <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
++      <div className="px-6 py-4 border-b border-border/60">
++        <div className="flex items-baseline gap-3 mb-3">
++          <h2 className="text-lg font-semibold text-foreground flex items-center gap-2">
++            <Library className="w-5 h-5 text-primary" />
++            Skills Library
++          </h2>
++          <span className="text-xs text-muted-foreground">
++            Curate which skills each queen and colony exposes, upload your own, or browse the full catalog.
++          </span>
++        </div>
++        <div className="flex items-center gap-1">
++          <TabButton active={tab === "queens"} onClick={() => setTab("queens")} icon={<Crown className="w-3.5 h-3.5" />}>
++            Queens
++          </TabButton>
++          <TabButton active={tab === "colonies"} onClick={() => setTab("colonies")} icon={<Network className="w-3.5 h-3.5" />}>
++            Colonies
++          </TabButton>
++          <TabButton active={tab === "catalog"} onClick={() => setTab("catalog")} icon={<BookOpen className="w-3.5 h-3.5" />}>
++            Catalog
++          </TabButton>
++        </div>
++      </div>
++
++      <div className="flex-1 overflow-y-auto">
++        {tab === "queens" && <QueensTab />}
++        {tab === "colonies" && <ColoniesTab />}
++        {tab === "catalog" && <CatalogTab />}
++      </div>
++    </div>
++  );
++}
++
++function TabButton({
++  active,
++  onClick,
++  icon,
++  children,
++}: {
++  active: boolean;
++  onClick: () => void;
++  icon: React.ReactNode;
++  children: React.ReactNode;
++}) {
++  return (
++    <button
++      onClick={onClick}
++      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium ${
++        active
++          ? "bg-primary/15 text-primary"
++          : "text-muted-foreground hover:text-foreground hover:bg-muted/30"
++      }`}
++    >
++      {icon}
++      {children}
++    </button>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Queens tab
++// ---------------------------------------------------------------------------
++
++function QueensTab() {
++  const [queens, setQueens] = useState<Array<{ id: string; name: string; title: string }> | null>(
++    null,
++  );
++  const [selected, setSelected] = useState<string | null>(null);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    queensApi
++      .list()
++      .then((r) => {
++        setQueens(r.queens);
++        if (r.queens.length > 0) setSelected((prev) => prev ?? r.queens[0].id);
++      })
++      .catch((e: Error) => setError(e.message || "Failed to load queens"));
++  }, []);
++
++  if (error) return <ErrorBlock message={error} />;
++  if (queens === null) return <LoadingBlock label="Loading queens…" />;
++  if (queens.length === 0) return <EmptyBlock label="No queens yet." />;
++
++  return (
++    <div className="flex h-full">
++      <SidePicker>
++        {queens.map((q) => (
++          <PickerItem
++            key={q.id}
++            active={selected === q.id}
++            onClick={() => setSelected(q.id)}
++            primary={q.name}
++            secondary={q.title}
++          />
++        ))}
++      </SidePicker>
++      <div className="flex-1 overflow-y-auto px-6 py-5 min-w-0">
++        {selected ? (
++          <>
++            {(() => {
++              const q = queens.find((x) => x.id === selected);
++              return q ? (
++                <div className="mb-4 pb-3 border-b border-border/40">
++                  <h3 className="text-base font-semibold text-foreground">{q.name}</h3>
++                  <p className="text-xs text-muted-foreground mt-0.5">{q.title}</p>
++                </div>
++              ) : null;
++            })()}
++            <SkillsPerScopeSection scopeKind="queen" targetId={selected} />
++          </>
++        ) : (
++          <EmptyBlock label="Pick a queen to edit her skill catalog." />
++        )}
++      </div>
++    </div>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Colonies tab
++// ---------------------------------------------------------------------------
++
++function ColoniesTab() {
++  const [colonies, setColonies] = useState<ColonySummary[] | null>(null);
++  const [selected, setSelected] = useState<string | null>(null);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    coloniesApi
++      .list()
++      .then((r) => {
++        setColonies(r.colonies);
++        if (r.colonies.length > 0) setSelected((prev) => prev ?? r.colonies[0].name);
++      })
++      .catch((e: Error) => setError(e.message || "Failed to load colonies"));
++  }, []);
++
++  const sorted = useMemo(() => {
++    if (!colonies) return null;
++    return [...colonies].sort((a, b) => a.name.localeCompare(b.name));
++  }, [colonies]);
++
++  if (error) return <ErrorBlock message={error} />;
++  if (sorted === null) return <LoadingBlock label="Loading colonies…" />;
++  if (sorted.length === 0)
++    return (
++      <EmptyBlock label="No colonies yet. Ask a queen to incubate one and its skills will show up here." />
++    );
++
++  return (
++    <div className="flex h-full">
++      <SidePicker>
++        {sorted.map((c) => (
++          <PickerItem
++            key={c.name}
++            active={selected === c.name}
++            onClick={() => setSelected(c.name)}
++            primary={slugToDisplayName(c.name)}
++            secondary={c.queen_name ? `@${c.queen_name}` : undefined}
++            tertiary={c.name}
++          />
++        ))}
++      </SidePicker>
++      <div className="flex-1 overflow-y-auto px-6 py-5 min-w-0">
++        {selected ? (
++          <>
++            <div className="mb-4 pb-3 border-b border-border/40">
++              <h3 className="text-base font-semibold text-foreground">
++                {slugToDisplayName(selected)}
++              </h3>
++              <p className="text-[11px] text-muted-foreground font-mono mt-0.5">{selected}</p>
++            </div>
++            <SkillsPerScopeSection scopeKind="colony" targetId={selected} />
++          </>
++        ) : (
++          <EmptyBlock label="Pick a colony to edit its skill catalog." />
++        )}
++      </div>
++    </div>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Per-scope section (shared body for Queens + Colonies tabs)
++// ---------------------------------------------------------------------------
++
++function SkillsPerScopeSection({
++  scopeKind,
++  targetId,
++}: {
++  scopeKind: "queen" | "colony";
++  targetId: string;
++}) {
++  const [resp, setResp] = useState<ScopeSkillsResponse | null>(null);
++  const [loading, setLoading] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [search, setSearch] = useState("");
++  const [createOpen, setCreateOpen] = useState(false);
++  const [detailName, setDetailName] = useState<string | null>(null);
++
++  const reload = useCallback(async () => {
++    setLoading(true);
++    setError(null);
++    try {
++      const r =
++        scopeKind === "queen"
++          ? await skillsApi.listForQueen(targetId)
++          : await skillsApi.listForColony(targetId);
++      setResp(r);
++    } catch (e) {
++      setError(e instanceof ApiError ? e.body.error : String(e));
++    } finally {
++      setLoading(false);
++    }
++  }, [scopeKind, targetId]);
++
++  useEffect(() => {
++    reload();
++  }, [reload]);
++
++  const rows = resp?.skills ?? [];
++  const filtered = useMemo(() => {
++    const q = search.trim().toLowerCase();
++    if (!q) return rows;
++    return rows.filter(
++      (r) => r.name.toLowerCase().includes(q) || r.description.toLowerCase().includes(q),
++    );
++  }, [rows, search]);
++
++  const toggle = async (row: SkillRow) => {
++    try {
++      await skillsApi.patch(scopeKind, targetId, row.name, { enabled: !row.enabled });
++      await reload();
++    } catch (e) {
++      setError(e instanceof ApiError ? e.body.error : String(e));
++    }
++  };
++
++  const remove = async (row: SkillRow) => {
++    if (!window.confirm(`Delete skill '${row.name}'? This removes its files.`)) return;
++    try {
++      await skillsApi.remove(scopeKind, targetId, row.name);
++      await reload();
++    } catch (e) {
++      setError(e instanceof ApiError ? e.body.error : String(e));
++    }
++  };
++
++  return (
++    <div>
++      <div className="flex items-center gap-3 mb-4">
++        <div className="relative flex-1 min-w-[200px] max-w-[320px]">
++          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
++          <input
++            value={search}
++            onChange={(e) => setSearch(e.target.value)}
++            placeholder="Search by name or description"
++            className="w-full pl-9 pr-3 py-1.5 rounded-md border border-border/60 bg-muted/30 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40"
++          />
++        </div>
++        <div className="flex-1" />
++        <button
++          onClick={() => setCreateOpen(true)}
++          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary/10 text-primary text-sm font-medium hover:bg-primary/20"
++        >
++          <Plus className="w-3.5 h-3.5" /> New Skill
++        </button>
++      </div>
++
++      {resp?.inherited_from_queen?.length ? (
++        <div className="mb-3 text-xs text-muted-foreground">
++          Inherited from queen{resp.queen_id ? ` (${resp.queen_id})` : ""}:{" "}
++          {resp.inherited_from_queen.join(", ")}
++        </div>
++      ) : null}
++
++      {loading && <LoadingBlock label="Loading skills…" />}
++      {error && (
++        <div className="mb-4 px-3 py-2 rounded-lg bg-destructive/10 text-destructive text-sm">
++          {error}
++        </div>
++      )}
++      {!loading && filtered.length === 0 && (
++        <p className="text-sm text-muted-foreground">No skills match your filter.</p>
++      )}
++
++      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
++        {filtered.map((row) => (
++          <SkillCard
++            key={row.name}
++            row={row}
++            onToggle={() => toggle(row)}
++            onOpen={() => setDetailName(row.name)}
++            onRemove={row.deletable ? () => remove(row) : undefined}
++          />
++        ))}
++      </div>
++
++      <CreateSkillModal
++        open={createOpen}
++        scopeKind={scopeKind}
++        targetId={targetId}
++        onClose={() => setCreateOpen(false)}
++        onSaved={reload}
++      />
++      <SkillDetailDrawer skillName={detailName} onClose={() => setDetailName(null)} />
++    </div>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Catalog tab
++// ---------------------------------------------------------------------------
++
++function CatalogTab() {
++  const [resp, setResp] = useState<AggregatedSkillsResponse | null>(null);
++  const [loading, setLoading] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [search, setSearch] = useState("");
++  const [uploadOpen, setUploadOpen] = useState(false);
++  const [detailName, setDetailName] = useState<string | null>(null);
++
++  const reload = useCallback(async () => {
++    setLoading(true);
++    setError(null);
++    try {
++      setResp(await skillsApi.listAll());
++    } catch (e) {
++      setError(e instanceof ApiError ? e.body.error : String(e));
++    } finally {
++      setLoading(false);
++    }
++  }, []);
++
++  useEffect(() => {
++    reload();
++  }, [reload]);
++
++  const rows = resp?.skills ?? [];
++  const filtered = useMemo(() => {
++    const q = search.trim().toLowerCase();
++    if (!q) return rows;
++    return rows.filter(
++      (r) => r.name.toLowerCase().includes(q) || r.description.toLowerCase().includes(q),
++    );
++  }, [rows, search]);
++
++  return (
++    <div className="px-6 py-5">
++      <div className="flex items-center gap-3 mb-4">
++        <div className="relative flex-1 min-w-[200px] max-w-[360px]">
++          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
++          <input
++            value={search}
++            onChange={(e) => setSearch(e.target.value)}
++            placeholder="Search every skill on this machine"
++            className="w-full pl-9 pr-3 py-1.5 rounded-md border border-border/60 bg-muted/30 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40"
++          />
++        </div>
++        <div className="flex-1" />
++        <button
++          onClick={() => setUploadOpen(true)}
++          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border/60 bg-card text-sm font-medium text-foreground hover:bg-muted/50"
++        >
++          <Upload className="w-3.5 h-3.5" /> Upload
++        </button>
++      </div>
++
++      {loading && <LoadingBlock label="Loading catalog…" />}
++      {error && (
++        <div className="mb-4 px-3 py-2 rounded-lg bg-destructive/10 text-destructive text-sm">
++          {error}
++        </div>
++      )}
++      {!loading && filtered.length === 0 && (
++        <p className="text-sm text-muted-foreground">No skills match your filter.</p>
++      )}
++
++      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
++        {filtered.map((row) => (
++          <SkillCard
++            key={row.name}
++            row={row}
++            onOpen={() => setDetailName(row.name)}
++            // Catalog view is read-only for toggle/delete — all mutations
++            // happen in the scoped tabs.
++          />
++        ))}
++      </div>
++
++      <UploadSkillModal
++        open={uploadOpen}
++        scopes={{
++          queens: resp?.queens ?? [],
++          colonies: resp?.colonies ?? [],
++        }}
++        onClose={() => setUploadOpen(false)}
++        onUploaded={reload}
++      />
++      <SkillDetailDrawer skillName={detailName} onClose={() => setDetailName(null)} />
++    </div>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Skill card (shared across all three tabs)
++// ---------------------------------------------------------------------------
++
++function SkillCard({
++  row,
++  onOpen,
++  onToggle,
++  onRemove,
++}: {
++  row: SkillRow;
++  onOpen: () => void;
++  onToggle?: () => void;
++  onRemove?: () => void;
++}) {
++  return (
++    <div className="rounded-lg border border-border/60 bg-card p-4 hover:border-primary/30 transition-colors flex flex-col">
++      <div className="flex items-start gap-2 mb-1">
++        {onToggle ? (
++          <button
++            onClick={onToggle}
++            title={row.enabled ? "Disable" : "Enable"}
++            className="flex-shrink-0 mt-0.5"
++          >
++            {row.enabled ? (
++              <CheckCircle2 className="w-4 h-4 text-emerald-500" />
++            ) : (
++              <Circle className="w-4 h-4 text-muted-foreground" />
++            )}
++          </button>
++        ) : (
++          <div className="flex-shrink-0 mt-0.5" aria-hidden>
++            {row.enabled ? (
++              <CheckCircle2 className="w-4 h-4 text-muted-foreground/40" />
++            ) : (
++              <Circle className="w-4 h-4 text-muted-foreground/40" />
++            )}
++          </div>
++        )}
++        <div className="min-w-0 flex-1">
++          <button
++            onClick={onOpen}
++            className="text-sm font-medium text-foreground text-left hover:text-primary line-clamp-1"
++          >
++            {row.name}
++          </button>
++          <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
++            <ProvenanceBadge provenance={row.provenance} />
++            {row.owner && (
++              <span className="text-[10px] text-muted-foreground">@{row.owner.id}</span>
++            )}
++            {!row.editable && (
++              <Lock
++                className="w-3 h-3 text-muted-foreground"
++                aria-label="Read-only"
++              >
++                <title>Read-only</title>
++              </Lock>
++            )}
++          </div>
++        </div>
++        {onRemove && (
++          <button
++            onClick={onRemove}
++            className="p-1 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10"
++            title="Delete skill"
++          >
++            <Trash2 className="w-3.5 h-3.5" />
++          </button>
++        )}
++      </div>
++      <p className="text-xs text-muted-foreground line-clamp-2 mb-2">{row.description}</p>
++      {row.visible_to && (
++        <p className="text-[10px] text-muted-foreground mt-auto">
++          Visible on {row.visible_to.queens.length} queens, {row.visible_to.colonies.length}{" "}
++          colonies
++        </p>
++      )}
++    </div>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Modals + drawer (shared)
++// ---------------------------------------------------------------------------
++
++function CreateSkillModal({
++  open,
++  scopeKind,
++  targetId,
++  onClose,
++  onSaved,
++}: {
++  open: boolean;
++  scopeKind: "queen" | "colony";
++  targetId: string;
++  onClose: () => void;
++  onSaved: () => void;
++}) {
++  const [name, setName] = useState("");
++  const [description, setDescription] = useState("");
++  const [body, setBody] = useState("");
++  const [saving, setSaving] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  if (!open) return null;
++
++  const submit = async () => {
++    setError(null);
++    if (!name.trim() || !description.trim() || !body.trim()) {
++      setError("Name, description, and body are required.");
++      return;
++    }
++    setSaving(true);
++    try {
++      await skillsApi.create(scopeKind, targetId, {
++        name: name.trim(),
++        description: description.trim(),
++        body,
++        enabled: true,
++      });
++      setName("");
++      setDescription("");
++      setBody("");
++      onSaved();
++      onClose();
++    } catch (e) {
++      setError(e instanceof ApiError ? e.body.error : String(e));
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  const label = scopeKind === "queen" ? `Queen: ${targetId}` : `Colony: ${targetId}`;
++
++  return (
++    <div className="fixed inset-0 z-50 flex items-center justify-center">
++      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
++      <div className="relative bg-card border border-border/60 rounded-2xl shadow-2xl w-full max-w-[640px] p-6 max-h-[90vh] overflow-y-auto">
++        <div className="flex items-center justify-between mb-5">
++          <div>
++            <h3 className="text-lg font-semibold text-foreground">New Skill</h3>
++            <p className="text-xs text-muted-foreground mt-0.5">Scope: {label}</p>
++          </div>
++          <button
++            onClick={onClose}
++            className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50"
++          >
++            <X className="w-4 h-4" />
++          </button>
++        </div>
++        <div className="flex flex-col gap-4">
++          <div>
++            <label className="text-sm font-medium text-foreground mb-1.5 block">
++              Name <span className="text-primary">*</span>
++            </label>
++            <input
++              value={name}
++              onChange={(e) => setName(e.target.value.toLowerCase())}
++              placeholder="e.g. vendor-api-protocol"
++              className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40"
++            />
++            <p className="text-[11px] text-muted-foreground mt-1">
++              Lowercase letters, digits, hyphens, dots. Max 64 chars.
++            </p>
++          </div>
++          <div>
++            <label className="text-sm font-medium text-foreground mb-1.5 block">
++              Description <span className="text-primary">*</span>
++            </label>
++            <input
++              value={description}
++              onChange={(e) => setDescription(e.target.value)}
++              placeholder="One-line summary shown in the catalog picker"
++              className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40"
++            />
++          </div>
++          <div>
++            <label className="text-sm font-medium text-foreground mb-1.5 block">
++              Body (SKILL.md content) <span className="text-primary">*</span>
++            </label>
++            <textarea
++              value={body}
++              onChange={(e) => setBody(e.target.value)}
++              rows={14}
++              placeholder={"## When to use\n\n...\n\n## Steps\n\n1. ..."}
++              className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm font-mono text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40 resize-none"
++            />
++          </div>
++          {error && (
++            <div className="px-3 py-2 rounded-lg bg-destructive/10 text-destructive text-xs">
++              {error}
++            </div>
++          )}
++          <div className="flex justify-end gap-2 pt-1">
++            <button
++              onClick={onClose}
++              className="px-4 py-2 rounded-lg text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30"
++            >
++              Cancel
++            </button>
++            <button
++              onClick={submit}
++              disabled={saving}
++              className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
++            >
++              {saving ? "Saving…" : "Create"}
++            </button>
++          </div>
++        </div>
++      </div>
++    </div>
++  );
++}
++
++function UploadSkillModal({
++  open,
++  scopes,
++  onClose,
++  onUploaded,
++}: {
++  open: boolean;
++  scopes: {
++    queens: Array<{ id: string; name: string }>;
++    colonies: Array<{ name: string; queen_id: string | null }>;
++  };
++  onClose: () => void;
++  onUploaded: () => void;
++}) {
++  const [file, setFile] = useState<File | null>(null);
++  const [scopeKind, setScopeKind] = useState<"user" | "queen" | "colony">("user");
++  const [targetId, setTargetId] = useState<string>("");
++  const [enabled, setEnabled] = useState(true);
++  const [replaceExisting, setReplaceExisting] = useState(false);
++  const [uploading, setUploading] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    if (scopeKind === "queen" && scopes.queens.length > 0 && !targetId) {
++      setTargetId(scopes.queens[0].id);
++    } else if (scopeKind === "colony" && scopes.colonies.length > 0 && !targetId) {
++      setTargetId(scopes.colonies[0].name);
++    } else if (scopeKind === "user") {
++      setTargetId("");
++    }
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [scopeKind]);
++
++  if (!open) return null;
++
++  const submit = async () => {
++    if (!file) {
++      setError("Pick a .md or .zip file first.");
++      return;
++    }
++    setError(null);
++    setUploading(true);
++    try {
++      const fd = new FormData();
++      fd.append("file", file);
++      fd.append("scope", scopeKind);
++      if (scopeKind !== "user") fd.append("target_id", targetId);
++      fd.append("enabled", String(enabled));
++      fd.append("replace_existing", String(replaceExisting));
++      await skillsApi.upload(fd);
++      onUploaded();
++      onClose();
++      setFile(null);
++    } catch (e) {
++      setError(e instanceof ApiError ? e.body.error : String(e));
++    } finally {
++      setUploading(false);
++    }
++  };
++
++  return (
++    <div className="fixed inset-0 z-50 flex items-center justify-center">
++      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
++      <div className="relative bg-card border border-border/60 rounded-2xl shadow-2xl w-full max-w-[520px] p-6">
++        <div className="flex items-center justify-between mb-5">
++          <h3 className="text-lg font-semibold text-foreground">Upload Skill</h3>
++          <button
++            onClick={onClose}
++            className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50"
++          >
++            <X className="w-4 h-4" />
++          </button>
++        </div>
++        <div className="flex flex-col gap-4">
++          <div>
++            <label className="text-sm font-medium text-foreground mb-1.5 block">
++              File (.md or .zip)
++            </label>
++            <input
++              type="file"
++              accept=".md,.zip"
++              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
++              className="w-full text-sm text-foreground file:mr-3 file:rounded-md file:border-0 file:bg-primary/10 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-primary hover:file:bg-primary/20"
++            />
++          </div>
++          <div>
++            <label className="text-sm font-medium text-foreground mb-1.5 block">Scope</label>
++            <select
++              value={scopeKind}
++              onChange={(e) => setScopeKind(e.target.value as typeof scopeKind)}
++              className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
++            >
++              <option value="user">User library (available to all queens)</option>
++              <option value="queen">Queen</option>
++              <option value="colony">Colony</option>
++            </select>
++          </div>
++          {scopeKind === "queen" && (
++            <div>
++              <label className="text-sm font-medium text-foreground mb-1.5 block">Queen</label>
++              <select
++                value={targetId}
++                onChange={(e) => setTargetId(e.target.value)}
++                className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
++              >
++                {scopes.queens.map((q) => (
++                  <option key={q.id} value={q.id}>
++                    {q.name}
++                  </option>
++                ))}
++              </select>
++            </div>
++          )}
++          {scopeKind === "colony" && (
++            <div>
++              <label className="text-sm font-medium text-foreground mb-1.5 block">Colony</label>
++              <select
++                value={targetId}
++                onChange={(e) => setTargetId(e.target.value)}
++                className="w-full bg-muted/30 border border-border/50 rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary/40"
++              >
++                {scopes.colonies.map((c) => (
++                  <option key={c.name} value={c.name}>
++                    {c.name} {c.queen_id ? `(${c.queen_id})` : ""}
++                  </option>
++                ))}
++              </select>
++            </div>
++          )}
++          <div className="flex items-center gap-4">
++            <label className="flex items-center gap-2 text-sm text-foreground">
++              <input
++                type="checkbox"
++                checked={enabled}
++                onChange={(e) => setEnabled(e.target.checked)}
++              />
++              Enable immediately
++            </label>
++            <label className="flex items-center gap-2 text-sm text-foreground">
++              <input
++                type="checkbox"
++                checked={replaceExisting}
++                onChange={(e) => setReplaceExisting(e.target.checked)}
++              />
++              Replace if exists
++            </label>
++          </div>
++          {error && (
++            <div className="px-3 py-2 rounded-lg bg-destructive/10 text-destructive text-xs">
++              {error}
++            </div>
++          )}
++          <div className="flex justify-end gap-2 pt-1">
++            <button
++              onClick={onClose}
++              className="px-4 py-2 rounded-lg text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted/30"
++            >
++              Cancel
++            </button>
++            <button
++              onClick={submit}
++              disabled={uploading || !file}
++              className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
++            >
++              {uploading ? "Uploading…" : "Upload"}
++            </button>
++          </div>
++        </div>
++      </div>
++    </div>
++  );
++}
++
++function SkillDetailDrawer({
++  skillName,
++  onClose,
++}: {
++  skillName: string | null;
++  onClose: () => void;
++}) {
++  const [detail, setDetail] = useState<SkillDetailResponse | null>(null);
++  const [loading, setLoading] = useState(false);
++
++  useEffect(() => {
++    if (!skillName) return;
++    setLoading(true);
++    skillsApi
++      .getDetail(skillName)
++      .then(setDetail)
++      .catch(() => setDetail(null))
++      .finally(() => setLoading(false));
++  }, [skillName]);
++
++  if (!skillName) return null;
++
++  return (
++    <div className="fixed inset-0 z-40 flex justify-end">
++      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
++      <div className="relative w-full max-w-[640px] h-full bg-card border-l border-border/60 overflow-y-auto p-6">
++        <div className="flex items-start justify-between mb-4">
++          <div>
++            <h3 className="text-lg font-semibold text-foreground">{skillName}</h3>
++            {detail && (
++              <p className="text-xs text-muted-foreground mt-0.5">{detail.description}</p>
++            )}
++          </div>
++          <button
++            onClick={onClose}
++            className="p-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50"
++          >
++            <X className="w-4 h-4" />
++          </button>
++        </div>
++        {loading && <p className="text-sm text-muted-foreground">Loading…</p>}
++        {detail && (
++          <pre className="whitespace-pre-wrap text-xs font-mono bg-muted/30 border border-border/40 rounded-lg p-4 text-foreground/80">
++            {detail.body}
++          </pre>
++        )}
++      </div>
++    </div>
++  );
++}
++
++// ---------------------------------------------------------------------------
++// Primitives (match tool-library style)
++// ---------------------------------------------------------------------------
++
++function SidePicker({ children }: { children: React.ReactNode }) {
++  return (
++    <div className="w-[260px] flex-shrink-0 border-r border-border/60 overflow-y-auto py-3 px-2 flex flex-col gap-1">
++      {children}
++    </div>
++  );
++}
++
++function PickerItem({
++  active,
++  onClick,
++  primary,
++  secondary,
++  tertiary,
++}: {
++  active: boolean;
++  onClick: () => void;
++  primary: string;
++  secondary?: string;
++  tertiary?: string;
++}) {
++  return (
++    <button
++      onClick={onClick}
++      className={`text-left px-3 py-2 rounded-md text-sm ${
++        active ? "bg-primary/15 text-primary" : "text-foreground hover:bg-muted/30"
++      }`}
++    >
++      <div className="font-medium truncate">{primary}</div>
++      {secondary && (
++        <div className="text-[11px] text-muted-foreground truncate">{secondary}</div>
++      )}
++      {tertiary && (
++        <div className="text-[10px] text-muted-foreground/60 font-mono truncate">{tertiary}</div>
++      )}
++    </button>
++  );
++}
++
++function LoadingBlock({ label }: { label: string }) {
++  return (
++    <div className="flex items-center gap-2 text-xs text-muted-foreground px-6 py-6">
++      <Loader2 className="w-3 h-3 animate-spin" />
++      {label}
++    </div>
++  );
++}
++
++function EmptyBlock({ label }: { label: string }) {
++  return (
++    <div className="flex items-start gap-2 text-xs text-muted-foreground px-6 py-6">
++      <AlertCircle className="w-3.5 h-3.5 mt-0.5" />
++      <span>{label}</span>
++    </div>
++  );
++}
++
++function ErrorBlock({ message }: { message: string }) {
++  return (
++    <div className="flex items-start gap-2 text-xs text-destructive px-6 py-6">
++      <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
++      <span>{message}</span>
++    </div>
++  );
++}
+diff --git a/core/frontend/src/pages/tool-library.tsx b/core/frontend/src/pages/tool-library.tsx
+new file mode 100644
+index 00000000..2036a3eb
+--- /dev/null
++++ b/core/frontend/src/pages/tool-library.tsx
+@@ -0,0 +1,282 @@
++import { useEffect, useMemo, useState } from "react";
++import { Wrench, Crown, Network, Server, Loader2, AlertCircle } from "lucide-react";
++import { queensApi } from "@/api/queens";
++import { coloniesApi, type ColonySummary } from "@/api/colonies";
++import { slugToDisplayName } from "@/lib/colony-registry";
++import QueenToolsSection from "@/components/QueenToolsSection";
++import ColonyToolsSection from "@/components/ColonyToolsSection";
++import McpServersPanel from "@/components/McpServersPanel";
++
++type Tab = "queens" | "colonies" | "mcp";
++
++export default function ToolLibrary() {
++  const [tab, setTab] = useState<Tab>("queens");
++
++  return (
++    <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
++      {/* Header */}
++      <div className="px-6 py-4 border-b border-border/60">
++        <div className="flex items-baseline gap-3 mb-3">
++          <h2 className="text-lg font-semibold text-foreground flex items-center gap-2">
++            <Wrench className="w-5 h-5 text-primary" />
++            Tool Library
++          </h2>
++          <span className="text-xs text-muted-foreground">
++            Curate which tools each queen and colony can call, and register your own MCP servers.
++          </span>
++        </div>
++        <div className="flex items-center gap-1">
++          <TabButton active={tab === "queens"} onClick={() => setTab("queens")} icon={<Crown className="w-3.5 h-3.5" />}>
++            Queens
++          </TabButton>
++          <TabButton active={tab === "colonies"} onClick={() => setTab("colonies")} icon={<Network className="w-3.5 h-3.5" />}>
++            Colonies
++          </TabButton>
++          <TabButton active={tab === "mcp"} onClick={() => setTab("mcp")} icon={<Server className="w-3.5 h-3.5" />}>
++            MCP Servers
++          </TabButton>
++        </div>
++      </div>
++
++      <div className="flex-1 overflow-y-auto">
++        {tab === "queens" && <QueensTab />}
++        {tab === "colonies" && <ColoniesTab />}
++        {tab === "mcp" && (
++          <div className="px-6 py-6 max-w-4xl">
++            <McpServersPanel />
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
++
++function TabButton({
++  active,
++  onClick,
++  icon,
++  children,
++}: {
++  active: boolean;
++  onClick: () => void;
++  icon: React.ReactNode;
++  children: React.ReactNode;
++}) {
++  return (
++    <button
++      onClick={onClick}
++      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium ${
++        active
++          ? "bg-primary/15 text-primary"
++          : "text-muted-foreground hover:text-foreground hover:bg-muted/30"
++      }`}
++    >
++      {icon}
++      {children}
++    </button>
++  );
++}
++
++// ----- Queens tab ---------------------------------------------------------
++
++function QueensTab() {
++  const [queens, setQueens] = useState<Array<{ id: string; name: string; title: string }> | null>(null);
++  const [selected, setSelected] = useState<string | null>(null);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    queensApi
++      .list()
++      .then((r) => {
++        setQueens(r.queens);
++        if (r.queens.length > 0) setSelected((prev) => prev ?? r.queens[0].id);
++      })
++      .catch((e: Error) => setError(e.message || "Failed to load queens"));
++  }, []);
++
++  if (error) return <ErrorBlock message={error} />;
++  if (queens === null) return <LoadingBlock label="Loading queens…" />;
++  if (queens.length === 0)
++    return <EmptyBlock label="No queens yet. Create one to curate its tools." />;
++
++  return (
++    <div className="flex h-full">
++      <SidePicker>
++        {queens.map((q) => (
++          <PickerItem
++            key={q.id}
++            active={selected === q.id}
++            onClick={() => setSelected(q.id)}
++            primary={q.name}
++            secondary={q.title}
++          />
++        ))}
++      </SidePicker>
++      <div className="flex-1 overflow-y-auto px-6 py-5 min-w-0">
++        {selected ? (
++          <>
++            {(() => {
++              const queen = queens.find((q) => q.id === selected);
++              return queen ? (
++                <div className="mb-4 pb-3 border-b border-border/40">
++                  <h3 className="text-base font-semibold text-foreground">
++                    {queen.name}
++                  </h3>
++                  <p className="text-xs text-muted-foreground mt-0.5">
++                    {queen.title}
++                  </p>
++                </div>
++              ) : null;
++            })()}
++            <QueenToolsSection queenId={selected} />
++          </>
++        ) : (
++          <EmptyBlock label="Pick a queen to edit her tool allowlist." />
++        )}
++      </div>
++    </div>
++  );
++}
++
++// ----- Colonies tab -------------------------------------------------------
++
++function ColoniesTab() {
++  const [colonies, setColonies] = useState<ColonySummary[] | null>(null);
++  const [selected, setSelected] = useState<string | null>(null);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    coloniesApi
++      .list()
++      .then((r) => {
++        setColonies(r.colonies);
++        if (r.colonies.length > 0)
++          setSelected((prev) => prev ?? r.colonies[0].name);
++      })
++      .catch((e: Error) => setError(e.message || "Failed to load colonies"));
++  }, []);
++
++  const sorted = useMemo(() => {
++    if (!colonies) return null;
++    return [...colonies].sort((a, b) => a.name.localeCompare(b.name));
++  }, [colonies]);
++
++  if (error) return <ErrorBlock message={error} />;
++  if (sorted === null) return <LoadingBlock label="Loading colonies…" />;
++  if (sorted.length === 0)
++    return (
++      <EmptyBlock label="No colonies yet. Ask a queen to incubate one and its tools will show up here." />
++    );
++
++  return (
++    <div className="flex h-full">
++      <SidePicker>
++        {sorted.map((c) => (
++          <PickerItem
++            key={c.name}
++            active={selected === c.name}
++            onClick={() => setSelected(c.name)}
++            primary={slugToDisplayName(c.name)}
++            secondary={
++              c.has_allowlist
++                ? `${c.enabled_count ?? 0} tools allowed · ${c.queen_name ?? ""}`
++                : `all tools · ${c.queen_name ?? ""}`
++            }
++            tertiary={c.name}
++          />
++        ))}
++      </SidePicker>
++      <div className="flex-1 overflow-y-auto px-6 py-5 min-w-0">
++        {selected ? (
++          <>
++            <div className="mb-4 pb-3 border-b border-border/40">
++              <h3 className="text-base font-semibold text-foreground">
++                {slugToDisplayName(selected)}
++              </h3>
++              <p className="text-[11px] text-muted-foreground font-mono mt-0.5">
++                {selected}
++              </p>
++            </div>
++            <ColonyToolsSection colonyName={selected} />
++          </>
++        ) : (
++          <EmptyBlock label="Pick a colony to edit its tool allowlist." />
++        )}
++      </div>
++    </div>
++  );
++}
++
++// ----- Shared primitives --------------------------------------------------
++
++function SidePicker({ children }: { children: React.ReactNode }) {
++  return (
++    <div className="w-[260px] flex-shrink-0 border-r border-border/60 overflow-y-auto py-3 px-2 flex flex-col gap-1">
++      {children}
++    </div>
++  );
++}
++
++function PickerItem({
++  active,
++  onClick,
++  primary,
++  secondary,
++  tertiary,
++}: {
++  active: boolean;
++  onClick: () => void;
++  primary: string;
++  secondary?: string;
++  tertiary?: string;
++}) {
++  return (
++    <button
++      onClick={onClick}
++      className={`text-left px-3 py-2 rounded-md text-sm ${
++        active
++          ? "bg-primary/15 text-primary"
++          : "text-foreground hover:bg-muted/30"
++      }`}
++    >
++      <div className="font-medium truncate">{primary}</div>
++      {secondary && (
++        <div className="text-[11px] text-muted-foreground truncate">
++          {secondary}
++        </div>
++      )}
++      {tertiary && (
++        <div className="text-[10px] text-muted-foreground/60 font-mono truncate">
++          {tertiary}
++        </div>
++      )}
++    </button>
++  );
++}
++
++function LoadingBlock({ label }: { label: string }) {
++  return (
++    <div className="flex items-center gap-2 text-xs text-muted-foreground px-6 py-6">
++      <Loader2 className="w-3 h-3 animate-spin" />
++      {label}
++    </div>
++  );
++}
++
++function EmptyBlock({ label }: { label: string }) {
++  return (
++    <div className="flex items-start gap-2 text-xs text-muted-foreground px-6 py-6">
++      <AlertCircle className="w-3.5 h-3.5 mt-0.5" />
++      <span>{label}</span>
++    </div>
++  );
++}
++
++function ErrorBlock({ message }: { message: string }) {
++  return (
++    <div className="flex items-start gap-2 text-xs text-destructive px-6 py-6">
++      <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
++      <span>{message}</span>
++    </div>
++  );
++}
+diff --git a/core/frontend/src/types/colony.ts b/core/frontend/src/types/colony.ts
+index 44bb2ee0..e6eabe7e 100644
+--- a/core/frontend/src/types/colony.ts
++++ b/core/frontend/src/types/colony.ts
+@@ -11,6 +11,10 @@ export interface Colony {
+   sessionCount: number;
+   runCount: number;
+   queenName: string;
++  createdAt: string | null;
++  lastActive: string | null;
++  task: string;
++  icon: string | null;
+ }
+ 
+ export interface QueenBee {

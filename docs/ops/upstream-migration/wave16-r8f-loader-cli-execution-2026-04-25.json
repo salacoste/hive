@@ -1,0 +1,48 @@
+{
+  "generated_at_utc": "2026-04-25T10:34:10Z",
+  "wave": "Wave16-R8F",
+  "title": "Loader CLI AppKey contract micro-lane execution",
+  "scope": [
+    "core/framework/loader/cli.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local cli serve path imports APP_KEY_MANAGER and uses typed manager lookup",
+      "this keeps AppKey migration consistent with server routes and avoids raw string key access",
+      "no additional upstream functional behavior in this lane besides key-access style"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; local AppKey-backed loader CLI implementation retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"config or credentials or health\" -q",
+        "result": "pass",
+        "summary": "17 passed, 176 deselected"
+      },
+      {
+        "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+        "result": "pass",
+        "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+      }
+    ],
+    "known_debt": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_colony_fork_flow.py -q",
+        "status": "known_failure",
+        "summary": "ImportError during collection: cannot import _queen_session_dir from framework.server.session_manager",
+        "note": "pre-existing debt, not introduced by this lane"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R8F lane completed with explicit keep-local AppKey guard",
+      "next candidate lane: core/framework/server/README.md docs-sync for APP_KEY_MANAGER pattern"
+    ]
+  }
+}

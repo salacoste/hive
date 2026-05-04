@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-26T18:34:16Z",
+  "wave": "Wave16-R11A",
+  "title": "Autonomous evaluate/dispatch edge continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify evaluate/auto-next outcome to dispatch transition continuity",
+    "verify report/read-model continuity immediately after dispatch edge transitions"
+  ],
+  "targeted_tests": [
+    "pipeline_auto_next_endpoint",
+    "pipeline_execute_next_endpoint",
+    "pipeline_dispatch_next_rejects_when_active_run_exists",
+    "pipeline_report_endpoint",
+    "pipeline_run_create_with_session_triggers_execution",
+    "pipeline_loop_tick_dispatches_next_when_idle"
+  ]
+}

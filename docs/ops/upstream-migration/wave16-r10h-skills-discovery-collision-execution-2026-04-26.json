@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-26T13:13:19Z",
+  "wave": "Wave16-R10H",
+  "title": "Skills discovery bundled-collision precedence lane execution",
+  "scope": [
+    "core/framework/skills/discovery.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "bundled framework↔preset collisions are expected override behavior and should not emit warning noise",
+      "existing user/project collision warnings remain intact",
+      "skill discovery/integration bundles are green"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local bundled-collision precedence logic"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_skill_discovery.py -q",
+        "result": "pass",
+        "summary": "10 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_skill_integration.py -q",
+        "result": "pass",
+        "summary": "9 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10H lane closed with explicit keep-local decision",
+      "next candidate lane: runtime trigger contract compatibility"
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "generated_at_utc": "2026-04-25T01:07:00Z",
+  "wave": "Wave16-R2",
+  "title": "Server README bounded reconcile",
+  "scope": [
+    "core/framework/server/README.md"
+  ],
+  "decision": {
+    "mode": "keep_local",
+    "reason": "Local docs reflect actual AppKey usage (`request.app[APP_KEY_MANAGER]`) while upstream line still references legacy string key access.",
+    "safety": "doc-only, no runtime mutation"
+  },
+  "validation": {
+    "code_reference_check": {
+      "command": "rg -n \"APP_KEY_MANAGER|request.app\\[\\\"manager\\\"\\]\" core/framework/server/*.py core/framework/server/app.py",
+      "result": "pass",
+      "summary": "Server routes consistently use APP_KEY_MANAGER; README local line is aligned with runtime code"
+    },
+    "full_gate_baseline": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "No file content change required in scope",
+      "Candidate closed as explicit reconcile/keep-local"
+    ]
+  }
+}

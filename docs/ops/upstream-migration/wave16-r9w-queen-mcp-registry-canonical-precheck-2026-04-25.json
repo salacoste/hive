@@ -1,0 +1,31 @@
+{
+  "generated_at_utc": "2026-04-25T20:04:29Z",
+  "wave": "Wave16-R9W",
+  "title": "Queen MCP registry canonical include lane precheck",
+  "scope": [
+    "core/framework/agents/queen/mcp_registry.json"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/agents/queen/mcp_registry.json",
+      "add": 1,
+      "del": 1,
+      "total": 2
+    }
+  },
+  "delta_summary": [
+    "queen MCP registry include switched from legacy `hive_tools` to canonical `hive-tools`"
+  ],
+  "risk_signals": [
+    {
+      "type": "registry-name-consistency",
+      "evidence": "loader registry defaults and stale-alias cleanup are canonicalized to `hive-tools`",
+      "impact": "legacy include key can miss tool binding in fresh registries"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'queen' -q"
+  ],
+  "decision_gate": "prefer keep_local when queen include list matches canonical MCP registry naming"
+}

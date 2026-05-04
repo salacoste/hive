@@ -1,0 +1,52 @@
+{
+  "generated_at_utc": "2026-04-25T10:42:08Z",
+  "wave": "Wave16-R8K",
+  "title": "Local-additive residual classification checkpoint",
+  "inventory_command": "git diff --numstat upstream/main -- core/framework",
+  "local_additive_bucket": [
+    {
+      "path": "core/framework/runtime/tests/__init__.py",
+      "numstat": {"add": 1, "del": 0, "total": 1},
+      "reason": "local package marker for runtime tests"
+    },
+    {
+      "path": "core/framework/runtime/__init__.py",
+      "numstat": {"add": 5, "del": 0, "total": 5},
+      "reason": "local runtime export surface"
+    },
+    {
+      "path": "core/framework/graph/event_loop/__init__.py",
+      "numstat": {"add": 6, "del": 0, "total": 6},
+      "reason": "local module boundary/init docs for event-loop package"
+    }
+  ],
+  "intentional_keep_local_contracts": [
+    "core/framework/loader/mcp_client.py",
+    "core/framework/loader/mcp_registry.py",
+    "core/framework/loader/cli.py",
+    "core/framework/server/routes_config.py",
+    "core/framework/server/routes_logs.py",
+    "core/framework/server/routes_messages.py",
+    "core/framework/server/README.md",
+    "core/framework/agents/queen/mcp_registry.json",
+    "core/framework/host/execution_manager.py"
+  ],
+  "selected_next_lane": {
+    "id": "R8L",
+    "paths": [
+      "core/framework/host/agent_host.py",
+      "core/framework/host/colony_runtime.py"
+    ],
+    "rationale": [
+      "paired cancellation-timeout logging contract with same shape in both files",
+      "small bounded diff (+5/-1 per file)",
+      "direct continuity with warning-noise hardening executed in R8J"
+    ],
+    "planned_validation": [
+      "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+      "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"autonomous or execution\" -q",
+      "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh"
+    ]
+  },
+  "status": "checkpoint_complete"
+}

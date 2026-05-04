@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { sseEventToChatMessage, formatAgentDisplayName } from "./chat-helpers";
+import {
+  extractLastPhase,
+  findOptimisticUserMatchIndex,
+  sseEventToChatMessage,
+  formatAgentDisplayName,
+  replayEventsToMessages,
+} from "./chat-helpers";
 import type { AgentEvent } from "@/api/types";
 
 // ---------------------------------------------------------------------------
@@ -327,18 +333,6 @@ describe("sseEventToChatMessage", () => {
     expect(result!.content).toBe("do the thing");
   });
 
-  it("captures client_message_id for optimistic user reconciliation", () => {
-    const event = makeEvent({
-      type: "client_input_received",
-      node_id: "queen",
-      execution_id: "abc",
-      data: { content: "do the thing", client_message_id: "msg-123" },
-    });
-    const result = sseEventToChatMessage(event, "t");
-    expect(result).not.toBeNull();
-    expect(result!.clientMessageId).toBe("msg-123");
-  });
-
   it("returns null for client_input_received with empty content", () => {
     const event = makeEvent({
       type: "client_input_received",
@@ -427,6 +421,336 @@ describe("sseEventToChatMessage", () => {
 });
 
 // ---------------------------------------------------------------------------
+// replayEventsToMessages
+// ---------------------------------------------------------------------------
+
+describe("replayEventsToMessages", () => {
+  it("merges queen inner turns from the same iteration into one restored bubble", () => {
+    const events = [
+      makeEvent({
+        type: "client_output_delta",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-1",
+        timestamp: "2026-04-20T12:45:25.234Z",
+        data: {
+          snapshot: "I will create the ERD.",
+          iteration: 0,
+          inner_turn: 0,
+        },
+      }),
+      makeEvent({
+        type: "tool_call_started",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-1",
+        timestamp: "2026-04-20T12:45:25.238Z",
+        data: {
+          tool_name: "write_file",
+          tool_use_id: "tool-1",
+        },
+      }),
+      makeEvent({
+        type: "tool_call_completed",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-1",
+        timestamp: "2026-04-20T12:45:25.250Z",
+        data: {
+          tool_name: "write_file",
+          tool_use_id: "tool-1",
+          result: "ok",
+        },
+      }),
+      makeEvent({
+        type: "client_output_delta",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-1",
+        timestamp: "2026-04-20T12:46:07.911Z",
+        data: {
+          snapshot: "Saved to `database_erd.md`.",
+          iteration: 0,
+          inner_turn: 2,
+        },
+      }),
+    ];
+
+    const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
+    const queenMessages = restored.filter(
+      (m) => m.role === "queen" && !m.type,
+    );
+
+    expect(queenMessages).toHaveLength(1);
+    expect(queenMessages[0].id).toBe("queen-stream-session-1-0");
+    expect(queenMessages[0].content).toBe(
+      "I will create the ERD.\nSaved to `database_erd.md`.",
+    );
+    expect(queenMessages[0].createdAt).toBe(
+      new Date("2026-04-20T12:45:25.234Z").getTime(),
+    );
+  });
+
+  it("keeps worker inner turns as distinct restored bubbles", () => {
+    const events = [
+      makeEvent({
+        type: "llm_text_delta",
+        stream_id: "worker",
+        node_id: "research",
+        execution_id: "session-1",
+        data: { snapshot: "First pass", iteration: 0, inner_turn: 0 },
+      }),
+      makeEvent({
+        type: "llm_text_delta",
+        stream_id: "worker",
+        node_id: "research",
+        execution_id: "session-1",
+        data: { snapshot: "After tool", iteration: 0, inner_turn: 1 },
+      }),
+    ];
+
+    const restored = replayEventsToMessages(events, "agent", "Research Agent");
+
+    expect(restored.map((m) => m.id)).toEqual([
+      "stream-session-1-0-research",
+      "stream-session-1-0-t1-research",
+    ]);
+  });
+
+  it("does not carry completed queen tools into a scheduler run", () => {
+    const events = [
+      makeEvent({
+        type: "tool_call_started",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-setup",
+        data: { tool_name: "create_colony", tool_use_id: "tool-create" },
+      }),
+      makeEvent({
+        type: "tool_call_completed",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-setup",
+        data: { tool_name: "create_colony", tool_use_id: "tool-create" },
+      }),
+      makeEvent({
+        type: "llm_turn_complete",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-setup",
+      }),
+      makeEvent({
+        type: "node_loop_started",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-scheduler",
+      }),
+      makeEvent({
+        type: "tool_call_started",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-scheduler",
+        data: {
+          tool_name: "list_worker_questions",
+          tool_use_id: "tool-questions",
+        },
+      }),
+      makeEvent({
+        type: "tool_call_started",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-scheduler",
+        data: { tool_name: "get_worker_status", tool_use_id: "tool-status" },
+      }),
+      makeEvent({
+        type: "tool_call_completed",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-scheduler",
+        data: {
+          tool_name: "list_worker_questions",
+          tool_use_id: "tool-questions",
+        },
+      }),
+      makeEvent({
+        type: "tool_call_completed",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "session-scheduler",
+        data: { tool_name: "get_worker_status", tool_use_id: "tool-status" },
+      }),
+    ];
+
+    const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
+    const schedulerToolRow = restored.find(
+      (m) => m.id === "tool-pill-queen-session-scheduler-1",
+    );
+
+    expect(schedulerToolRow).toBeDefined();
+    expect(JSON.parse(schedulerToolRow!.content)).toEqual({
+      tools: [
+        { name: "list_worker_questions", done: true },
+        { name: "get_worker_status", done: true },
+      ],
+      allDone: true,
+    });
+  });
+
+  it("uses execution id when resolving tool completions", () => {
+    const events = [
+      makeEvent({
+        type: "tool_call_started",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "exec-a",
+        data: { tool_name: "first_run_tool", tool_use_id: "shared-id" },
+      }),
+      makeEvent({
+        type: "tool_call_started",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "exec-b",
+        data: { tool_name: "second_run_tool", tool_use_id: "shared-id" },
+      }),
+      makeEvent({
+        type: "tool_call_completed",
+        stream_id: "queen",
+        node_id: "queen",
+        execution_id: "exec-a",
+        data: { tool_name: "first_run_tool", tool_use_id: "shared-id" },
+      }),
+    ];
+
+    const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
+    const firstRunRow = restored.find(
+      (m) => m.id === "tool-pill-queen-exec-a-0",
+    );
+    const secondRunRow = restored.find(
+      (m) => m.id === "tool-pill-queen-exec-b-0",
+    );
+
+    expect(firstRunRow).toBeDefined();
+    expect(secondRunRow).toBeDefined();
+    expect(JSON.parse(firstRunRow!.content)).toEqual({
+      tools: [{ name: "first_run_tool", done: true }],
+      allDone: true,
+    });
+    expect(JSON.parse(secondRunRow!.content)).toEqual({
+      tools: [{ name: "second_run_tool", done: false }],
+      allDone: false,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findOptimisticUserMatchIndex
+// ---------------------------------------------------------------------------
+
+describe("findOptimisticUserMatchIndex", () => {
+  it("returns FIFO match among unreconciled optimistic user messages", () => {
+    const incoming = {
+      id: "server-echo",
+      agent: "You",
+      agentColor: "",
+      type: "user" as const,
+      content: "ping",
+      timestamp: "",
+      thread: "queen-dm",
+      createdAt: Date.now(),
+      executionId: "exec-1",
+    };
+    const messages = [
+      {
+        id: "m1",
+        agent: "You",
+        agentColor: "",
+        type: "user" as const,
+        content: "ping",
+        timestamp: "",
+        thread: "queen-dm",
+        createdAt: Date.now() - 1000,
+      },
+      {
+        id: "m2",
+        agent: "You",
+        agentColor: "",
+        type: "user" as const,
+        content: "ping",
+        timestamp: "",
+        thread: "queen-dm",
+        createdAt: Date.now() - 500,
+      },
+    ];
+    expect(findOptimisticUserMatchIndex(messages, incoming)).toBe(0);
+  });
+
+  it("skips already reconciled user messages (executionId present)", () => {
+    const incoming = {
+      id: "server-echo-2",
+      agent: "You",
+      agentColor: "",
+      type: "user" as const,
+      content: "ping",
+      timestamp: "",
+      thread: "queen-dm",
+      createdAt: Date.now(),
+      executionId: "exec-2",
+    };
+    const messages = [
+      {
+        id: "already-reconciled",
+        agent: "You",
+        agentColor: "",
+        type: "user" as const,
+        content: "ping",
+        timestamp: "",
+        thread: "queen-dm",
+        createdAt: Date.now() - 1000,
+        executionId: "exec-1",
+      },
+      {
+        id: "optimistic-still-pending",
+        agent: "You",
+        agentColor: "",
+        type: "user" as const,
+        content: "ping",
+        timestamp: "",
+        thread: "queen-dm",
+        createdAt: Date.now() - 500,
+      },
+    ];
+    expect(findOptimisticUserMatchIndex(messages, incoming)).toBe(1);
+  });
+
+  it("returns -1 when no optimistic match exists", () => {
+    const incoming = {
+      id: "server-echo-3",
+      agent: "You",
+      agentColor: "",
+      type: "user" as const,
+      content: "different",
+      timestamp: "",
+      thread: "queen-dm",
+      createdAt: Date.now(),
+      executionId: "exec-3",
+    };
+    const messages = [
+      {
+        id: "optimistic",
+        agent: "You",
+        agentColor: "",
+        type: "user" as const,
+        content: "ping",
+        timestamp: "",
+        thread: "queen-dm",
+        createdAt: Date.now() - 1000,
+      },
+    ];
+    expect(findOptimisticUserMatchIndex(messages, incoming)).toBe(-1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // formatAgentDisplayName
 // ---------------------------------------------------------------------------
 
@@ -453,5 +777,37 @@ describe("formatAgentDisplayName", () => {
 
   it("handles a single word", () => {
     expect(formatAgentDisplayName("agent")).toBe("Agent");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractLastPhase
+// ---------------------------------------------------------------------------
+
+describe("extractLastPhase", () => {
+  it("keeps incubating as a valid queen phase", () => {
+    expect(
+      extractLastPhase([
+        makeEvent({
+          type: "queen_phase_changed",
+          data: { phase: "independent" },
+        }),
+        makeEvent({
+          type: "queen_phase_changed",
+          data: { phase: "incubating" },
+        }),
+      ]),
+    ).toBe("incubating");
+  });
+
+  it("reads phase metadata from node loop iterations", () => {
+    expect(
+      extractLastPhase([
+        makeEvent({
+          type: "node_loop_iteration",
+          data: { phase: "working" },
+        }),
+      ]),
+    ).toBe("working");
   });
 });

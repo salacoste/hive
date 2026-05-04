@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T12:57:18Z",
+  "wave": "Wave16-R9J",
+  "title": "Host event bus behavior lane execution",
+  "scope": [
+    "core/framework/host/event_bus.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local branch keeps backward-compatible prompt/options payload for single ask_user flows",
+      "questions-array path for ask_user_multiple remains intact",
+      "event bus and bridge validation bundles pass with current contract"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local emit_client_input_requested compatibility fields"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_type_extension.py -q",
+        "result": "pass",
+        "summary": "78 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_loop_node.py -k \"ask_user or client_input_requested\" -q",
+        "result": "pass",
+        "summary": "2 passed, 1 skipped, 66 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k \"input_requested or ask_user or question\" -q",
+        "result": "pass",
+        "summary": "1 passed, 45 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9J lane closed with explicit keep-local decision",
+      "next candidate lane: core/framework/tools/queen_lifecycle_tools.py"
+    ]
+  }
+}

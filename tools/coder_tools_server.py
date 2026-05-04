@@ -68,6 +68,7 @@ mcp = FastMCP("coder-tools")
 
 PROJECT_ROOT: str = ""
 SNAPSHOT_DIR: str = ""
+WRITE_ROOT: str = ""
 
 
 # ── Path resolution ───────────────────────────────────────────────────────
@@ -172,6 +173,67 @@ def _resolve_path(path: str) -> str:
     if not _is_within_allowed(resolved, allowed_roots):
         allowed = ", ".join(allowed_roots)
         raise ValueError(f"Access denied: '{path}' is outside allowed roots: {allowed}")
+    return resolved
+
+
+def _resolve_write_path(path: str) -> str:
+    """Resolve path for WRITE/EDIT operations.
+
+    Writes are constrained to:
+    - WRITE_ROOT (agent workspace)
+    - ~/.hive/ (session data)
+
+    If WRITE_ROOT == PROJECT_ROOT (legacy mode), behavior falls back to
+    the read resolver.
+    """
+
+    # Normalize slashes + expand ~
+    path = path.replace("/", os.sep)
+    if path.startswith("~"):
+        path = os.path.expanduser(path)
+
+    hive_dir = os.path.abspath(os.path.expanduser("~/.hive"))
+    write_root = os.path.abspath(WRITE_ROOT or PROJECT_ROOT)
+
+    if os.path.isabs(path):
+        resolved = os.path.abspath(path)
+
+        try:
+            if os.path.commonpath([resolved, hive_dir]) == hive_dir:
+                return resolved
+        except ValueError:
+            pass
+
+        try:
+            if os.path.commonpath([resolved, write_root]) == write_root:
+                return resolved
+        except ValueError:
+            pass
+
+        if write_root == os.path.abspath(PROJECT_ROOT):
+            return _resolve_path(path)
+
+        raise ValueError(
+            f"Access denied: writes must be under '{write_root}' or '{hive_dir}'. "
+            f"Path '{path}' is outside both."
+        )
+
+    resolved = os.path.abspath(os.path.join(write_root, path))
+
+    try:
+        wr_common = os.path.commonpath([resolved, write_root])
+    except ValueError:
+        wr_common = ""
+    try:
+        hv_common = os.path.commonpath([resolved, hive_dir])
+    except ValueError:
+        hv_common = ""
+
+    if wr_common != write_root and hv_common != hive_dir:
+        raise ValueError(
+            f"Access denied: resolved write path '{resolved}' escaped allowed roots "
+            f"('{write_root}', '{hive_dir}')."
+        )
     return resolved
 
 
@@ -476,8 +538,12 @@ def list_agent_tools(
     try:
         from pathlib import Path
 
-        from framework.runner.mcp_client import MCPClient, MCPServerConfig
-        from framework.runner.tool_registry import ToolRegistry
+        try:
+            from framework.loader.mcp_client import MCPClient, MCPServerConfig
+            from framework.loader.tool_registry import ToolRegistry
+        except ImportError:
+            from framework.runner.mcp_client import MCPClient, MCPServerConfig
+            from framework.runner.tool_registry import ToolRegistry
     except ImportError:
         return json.dumps({"error": "Cannot import MCPClient"})
 
@@ -847,8 +913,12 @@ def _validate_agent_tools_impl(agent_path: str) -> dict:
     try:
         from pathlib import Path
 
-        from framework.runner.mcp_client import MCPClient, MCPServerConfig
-        from framework.runner.tool_registry import ToolRegistry
+        try:
+            from framework.loader.mcp_client import MCPClient, MCPServerConfig
+            from framework.loader.tool_registry import ToolRegistry
+        except ImportError:
+            from framework.runner.mcp_client import MCPClient, MCPServerConfig
+            from framework.runner.tool_registry import ToolRegistry
     except ImportError:
         return {"error": "Cannot import MCPClient"}
 
@@ -1752,7 +1822,7 @@ def _node_var_name(node_id: str) -> str:
 def initialize_and_build_agent(
     agent_name: str,
     nodes: str | None = None,
-    _draft: dict | None = None,
+    draft: dict | None = None,
 ) -> str:
     """Scaffold a new agent package with placeholder files.
 
@@ -1770,8 +1840,8 @@ def initialize_and_build_agent(
         nodes: Comma-separated node names (snake_case or kebab-case).
                If omitted, a single 'start' node is created.
                Example: 'intake,process,review'
-        _draft: Internal. Draft graph metadata from planning phase, used to
-                pre-populate descriptions, goals, and node metadata.
+        draft: Optional draft graph metadata from planning phase, used to
+               pre-populate descriptions, goals, and node metadata.
 
     Returns:
         JSON with files written and next steps.
@@ -1793,12 +1863,12 @@ def initialize_and_build_agent(
 
     # Build draft node lookup for pre-populating metadata from planning phase
     _draft_nodes: dict[str, dict] = {}
-    if _draft and _draft.get("nodes"):
-        for dn in _draft["nodes"]:
+    if draft and draft.get("nodes"):
+        for dn in draft["nodes"]:
             _draft_nodes[dn.get("id", "")] = dn
 
     # Extract top-level draft metadata early so it's available for all templates
-    _draft_desc = (_draft.get("description") or "") if _draft else ""
+    _draft_desc = (draft.get("description") or "") if draft else ""
 
     class_name = _snake_to_camel(agent_name)
     human_name = agent_name.replace("_", " ").title()
@@ -1924,7 +1994,7 @@ __all__ = {node_var_names!r}
     nodes_list = ", ".join(node_var_names)
 
     # Use draft edges if available, otherwise generate linear edges
-    _draft_edges = _draft.get("edges", []) if _draft else []
+    _draft_edges = draft.get("edges", []) if draft else []
     edge_defs = []
     if _draft_edges:
         for de in _draft_edges:
@@ -1957,12 +2027,12 @@ __all__ = {node_var_names!r}
 
     # Pre-populate goal from draft metadata
     _draft_goal = (
-        (_draft.get("goal") or "TODO: Describe the agent's goal.")
-        if _draft
+        (draft.get("goal") or "TODO: Describe the agent's goal.")
+        if draft
         else "TODO: Describe the agent's goal."
     )
-    _draft_sc = (_draft.get("success_criteria") or []) if _draft else []
-    _draft_constraints = (_draft.get("constraints") or []) if _draft else []
+    _draft_sc = (draft.get("success_criteria") or []) if draft else []
+    _draft_constraints = (draft.get("constraints") or []) if draft else []
 
     # Build success criteria entries
     if _draft_sc:
@@ -2447,7 +2517,7 @@ def runner_loaded():
 
 
 def main() -> None:
-    global PROJECT_ROOT, SNAPSHOT_DIR
+    global PROJECT_ROOT, SNAPSHOT_DIR, WRITE_ROOT
 
     from aden_tools.file_ops import register_file_tools
 
@@ -2456,9 +2526,15 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.getenv("CODER_TOOLS_PORT", "4002")))
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--stdio", action="store_true")
+    parser.add_argument("--write-root", default="")
     args = parser.parse_args()
 
     PROJECT_ROOT = os.path.abspath(args.project_root) if args.project_root else _find_project_root()
+    if args.write_root:
+        WRITE_ROOT = os.path.abspath(os.path.expanduser(args.write_root))
+        os.makedirs(WRITE_ROOT, exist_ok=True)
+    else:
+        WRITE_ROOT = PROJECT_ROOT
     SNAPSHOT_DIR = os.path.join(
         os.path.expanduser("~"),
         ".hive",
@@ -2466,13 +2542,15 @@ def main() -> None:
         os.path.basename(PROJECT_ROOT),
     )
     logger.info(f"Project root: {PROJECT_ROOT}")
+    logger.info(f"Write root: {WRITE_ROOT}")
     logger.info(f"Snapshot dir: {SNAPSHOT_DIR}")
 
     register_file_tools(
         mcp,
         resolve_path=_resolve_path,
+        resolve_path_write=_resolve_write_path,
         before_write=None,  # Git snapshot causes stdio deadlock on Windows; undo_changes limited
-        project_root=PROJECT_ROOT,
+        project_root=WRITE_ROOT,
     )
 
     if args.stdio:

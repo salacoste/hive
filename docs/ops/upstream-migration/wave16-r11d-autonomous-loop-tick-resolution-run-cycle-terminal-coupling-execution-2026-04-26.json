@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-26T18:46:13Z",
+  "wave": "Wave16-R11D",
+  "title": "Autonomous loop tick-resolution + run-cycle terminal coupling lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "tick-resolution transitions remain stable under terminal/pr-ready run-cycle coupling",
+      "run-cycle terminal outcome aggregation remains stable after tick-derived completion/failure edges",
+      "no regressions observed in targeted terminal-coupling bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_loop_tick_resolves_when_terminal_worker_completed_without_execution_event or pipeline_loop_tick_resolves_from_worker_completed_when_session_not_loaded or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11D lane closed as keep-local with green tick-resolution/run-cycle terminal coupling bundle",
+      "next lane continues evaluate/report read-model coupling continuity"
+    ]
+  }
+}

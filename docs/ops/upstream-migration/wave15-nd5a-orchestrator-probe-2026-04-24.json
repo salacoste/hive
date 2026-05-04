@@ -1,0 +1,15 @@
+{
+  "generated_at_utc": "2026-04-24T18:10:00Z",
+  "lane": "ND-5A",
+  "title": "Orchestrator micro-lane probe",
+  "scope_files": [
+    "core/framework/orchestrator/client_io.py",
+    "core/framework/orchestrator/gcu.py",
+    "core/framework/orchestrator/node.py",
+    "core/framework/orchestrator/safe_eval.py"
+  ],
+  "patch": "docs/ops/upstream-migration/wave15-nd5a-orchestrator.patch",
+  "probe_command": "git apply --check docs/ops/upstream-migration/wave15-nd5a-orchestrator.patch",
+  "exit_code": 0,
+  "classification": "replay-ready"
+}

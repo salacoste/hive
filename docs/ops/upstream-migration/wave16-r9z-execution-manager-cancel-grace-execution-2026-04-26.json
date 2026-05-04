@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-26T02:05:35Z",
+  "wave": "Wave16-R9Z",
+  "title": "Execution manager cancellation-grace logging lane execution",
+  "scope": [
+    "core/framework/host/execution_manager.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "delta remains limited to cancellation-grace logging level/message in stop()",
+      "local info-level message keeps observability while reducing expected warning-noise",
+      "no execution lifecycle or cancellation semantics changed"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local execution_manager cancellation-grace logging contract"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'execution' -q",
+        "result": "pass",
+        "summary": "29 passed, 164 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_runtime.py -q",
+        "result": "pass",
+        "summary": "15 passed, 2 skipped"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q",
+        "result": "pass",
+        "summary": "11 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9Z lane closed with explicit keep-local decision",
+      "next lane opened for routes_execution policy/queue contract"
+    ]
+  }
+}

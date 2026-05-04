@@ -1,0 +1,38 @@
+{
+  "generated_at_utc": "2026-04-25T13:14:23Z",
+  "wave": "Wave16-R9M",
+  "title": "Tool registry built-in save_data compatibility lane precheck",
+  "scope": [
+    "core/framework/loader/tool_registry.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/loader/tool_registry.py",
+      "add": 42,
+      "del": 0,
+      "total": 42
+    }
+  },
+  "delta_summary": [
+    "local registry registers built-in `save_data` tool in constructor",
+    "save_data executor honors execution context `data_dir` and treats explicit `.` as context directory"
+  ],
+  "risk_signals": [
+    {
+      "type": "tool-availability-contract",
+      "evidence": "runtime/tests rely on save_data being available without external MCP registration",
+      "impact": "upstream replay can remove save_data and break context-propagation + built-in tool flows"
+    },
+    {
+      "type": "context-routing-contract",
+      "evidence": "execution-context data_dir should override session/inputs for deterministic artifact paths",
+      "impact": "missing override causes writes into incorrect directories and flaky runtime behavior"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_tool_registry.py -k 'builtin_save_data or concurrency_safe_tools' -q",
+    "uv run --package framework pytest core/tests/test_tool_context_propagation.py -q",
+    "uv run --package framework pytest core/tests/test_mcp_registry_loader.py -q"
+  ],
+  "decision_gate": "prefer keep_local if built-in save_data contract remains required and targeted registry/context tests are green"
+}

@@ -1,0 +1,47 @@
+{
+  "generated_at_utc": "2026-04-26T02:09:40Z",
+  "wave": "Wave16-R10B",
+  "title": "Post-R10A residual shortlist refresh precheck",
+  "scope": [
+    "core/framework (upstream residual inventory refresh)"
+  ],
+  "method": [
+    "git diff --numstat upstream/main -- core/framework",
+    "rank by smallest additive/deletion footprint and contract blast radius"
+  ],
+  "top_candidates": [
+    {
+      "path": "core/framework/host/agent_host.py",
+      "numstat": {"add": 5, "del": 1, "total": 6},
+      "note": "small host contract delta candidate"
+    },
+    {
+      "path": "core/framework/host/colony_runtime.py",
+      "numstat": {"add": 5, "del": 1, "total": 6},
+      "note": "runtime host-shape companion delta"
+    },
+    {
+      "path": "core/framework/server/routes_logs.py",
+      "numstat": {"add": 12, "del": 6, "total": 18},
+      "note": "logs route API contract candidate"
+    },
+    {
+      "path": "core/framework/tools/queen_lifecycle_tools.py",
+      "numstat": {"add": 12, "del": 0, "total": 12},
+      "note": "tooling contract candidate"
+    }
+  ],
+  "selected_next_lane": {
+    "lane": "Wave16-R10B",
+    "focus": [
+      "core/framework/host/agent_host.py",
+      "core/framework/host/colony_runtime.py"
+    ],
+    "reason": "smallest coupled host/runtime delta after R10A closure"
+  },
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_session_unified_colony_runtime.py -q",
+    "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q",
+    "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q"
+  ]
+}

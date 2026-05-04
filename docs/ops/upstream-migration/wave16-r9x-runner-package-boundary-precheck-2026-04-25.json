@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-25T20:07:51Z",
+  "wave": "Wave16-R9X",
+  "title": "Runner package export boundary lane precheck",
+  "scope": [
+    "core/framework/runner/__init__.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/runner/__init__.py",
+      "add": 48,
+      "del": 0,
+      "total": 48
+    }
+  },
+  "delta_summary": [
+    "local package initializer exposes stable runner public surface and lazy-loads AgentRunner symbols",
+    "`__getattr__` guard avoids import-cycle during package init"
+  ],
+  "risk_signals": [
+    {
+      "type": "runner-import-cycle-contract",
+      "evidence": "lazy AgentRunner export in __getattr__ is an intentional cycle-avoidance mechanism",
+      "impact": "upstream replay can reintroduce import-cycle regressions during runner package initialization"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework python - <<'PY' ... import framework.runner export check ... PY",
+    "uv run --package framework pytest core/tests/test_runner_api_key_env_var.py core/tests/test_runner_model_fallback_chain.py -q",
+    "uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q"
+  ],
+  "decision_gate": "prefer keep_local if lazy export boundary remains required and runner/session bundles are green"
+}

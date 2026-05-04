@@ -235,8 +235,10 @@ class GraphExecutor:
                 len(protocols_prompt),
             )
         else:
-            self.logger.warning(
-                "GraphExecutor[%s] received EMPTY protocols_prompt",
+            # Empty protocols prompt is valid when skills rely on progressive
+            # disclosure rather than static protocol prelude.
+            self.logger.debug(
+                "GraphExecutor[%s] received empty protocols_prompt",
                 stream_id,
             )
 

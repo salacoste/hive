@@ -1,0 +1,42 @@
+{
+  "generated_at_utc": "2026-04-25T13:01:37Z",
+  "wave": "Wave16-R9K",
+  "title": "Queen lifecycle tools behavior lane execution",
+  "scope": [
+    "core/framework/tools/queen_lifecycle_tools.py",
+    "core/tests/test_create_colony_tool.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local QueenPhaseState prompt aliasing preserves compatibility across legacy and current phase-prompt field names",
+      "lifecycle/colony/queen validation bundles pass with current behavior",
+      "upstream replay would drop compatibility shim used by existing tests/callers"
+    ]
+  },
+  "changes": [
+    "no functional code patch required in queen_lifecycle_tools lane (local behavior retained)",
+    "updated test stub in core/tests/test_create_colony_tool.py to accept concurrency_hint in patched fork signature for current runtime contract"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_create_colony_tool.py core/tests/test_run_parallel_workers_tool.py core/tests/test_queen_memory.py -q",
+        "result": "pass",
+        "summary": "53 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution or colony or queen\" -q",
+        "result": "pass",
+        "summary": "34 passed, 159 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9K lane closed with explicit keep-local decision",
+      "next candidate lane: core/framework/agents/queen/queen_memory_v2.py"
+    ]
+  }
+}

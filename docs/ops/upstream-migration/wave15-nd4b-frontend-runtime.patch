@@ -1,0 +1,4396 @@
+diff --git a/core/frontend/src/api/execution.ts b/core/frontend/src/api/execution.ts
+index 4d540155..2d08b291 100644
+--- a/core/frontend/src/api/execution.ts
++++ b/core/frontend/src/api/execution.ts
+@@ -37,13 +37,11 @@ export const executionApi = {
+     message: string,
+     images?: { type: string; image_url: { url: string } }[],
+     displayMessage?: string,
+-    clientMessageId?: string,
+   ) =>
+     api.post<ChatResult>(`/sessions/${sessionId}/chat`, {
+       message,
+       ...(images?.length ? { images } : {}),
+       ...(displayMessage !== undefined ? { display_message: displayMessage } : {}),
+-      ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
+     }),
+ 
+   /** Queue context for the queen without triggering an LLM response. */
+@@ -76,4 +74,28 @@ export const executionApi = {
+       `/sessions/${sessionId}/colony-spawn`,
+       { colony_name: colonyName, task },
+     ),
++
++  /** Lock a queen DM session because the user opened a spawned colony.
++   *  After this call /chat returns 409 until compactAndFork creates a new session.
++   */
++  markColonySpawned: (sessionId: string, colonyName: string) =>
++    api.post<{
++      session_id: string;
++      colony_spawned: boolean;
++      spawned_colony_name: string;
++    }>(`/sessions/${sessionId}/mark-colony-spawned`, {
++      colony_name: colonyName,
++    }),
++
++  /** Compact the locked session and fork into a fresh session under the same queen.
++   *  Returns the new session ID; the frontend should navigate the user to it.
++   */
++  compactAndFork: (sessionId: string) =>
++    api.post<{
++      new_session_id: string;
++      queen_id: string;
++      compacted_from: string;
++      summary_chars: number;
++      messages_compacted: number;
++    }>(`/sessions/${sessionId}/compact-and-fork`),
+ };
+diff --git a/core/frontend/src/api/sessions.ts b/core/frontend/src/api/sessions.ts
+index 20d07c4f..07ddb168 100644
+--- a/core/frontend/src/api/sessions.ts
++++ b/core/frontend/src/api/sessions.ts
+@@ -84,6 +84,11 @@ export const sessionsApi = {
+       `/sessions/${sessionId}/triggers/${triggerId}/deactivate`,
+     ),
+ 
++  runTrigger: (sessionId: string, triggerId: string) =>
++    api.post<{ status: string; trigger_id: string }>(
++      `/sessions/${sessionId}/triggers/${triggerId}/run`,
++    ),
++
+   colonies: (sessionId: string) =>
+     api.get<{ colonies: string[] }>(`/sessions/${sessionId}/colonies`),
+ 
+diff --git a/core/frontend/src/components/AppHeader.tsx b/core/frontend/src/components/AppHeader.tsx
+index 6bf3c834..e1f87e76 100644
+--- a/core/frontend/src/components/AppHeader.tsx
++++ b/core/frontend/src/components/AppHeader.tsx
+@@ -4,7 +4,7 @@ import { useColony } from "@/context/ColonyContext";
+ import { useHeaderActions } from "@/context/HeaderActionsContext";
+ import { useModel } from "@/context/ModelContext";
+ import { getQueenForAgent } from "@/lib/colony-registry";
+-import { Crown, KeyRound, Network, ChevronDown } from "lucide-react";
++import { Crown, Component, KeyRound, Network, ChevronDown } from "lucide-react";
+ import SettingsModal from "@/components/SettingsModal";
+ 
+ function UserAvatarButton({ initials, onClick, avatarVersion }: { initials: string; onClick: () => void; avatarVersion: number }) {
+@@ -63,15 +63,14 @@ export default function AppHeader({ onOpenQueenProfile }: AppHeaderProps) {
+     const colonyId = colonyMatch[1];
+     const colony = colonies.find((c) => c.id === colonyId);
+     title = colony?.name ?? colonyId;
+-    // Show queen profile button when the colony has a linked queen profile
+     if (colony?.queenProfileId) {
+       const profile = queenProfiles.find((q) => q.id === colony.queenProfileId);
+       if (profile) {
+         queenIdForProfile = profile.id;
+         queenTitle = profile.title ?? null;
+-        icon = <Crown className="w-4 h-4 text-primary" />;
+       }
+     }
++    icon = <Component className="w-4 h-4 text-primary" />;
+   } else if (queenMatch) {
+     const queenId = queenMatch[1];
+     const profile = queenProfiles.find((q) => q.id === queenId);
+diff --git a/core/frontend/src/components/ChatPanel.tsx b/core/frontend/src/components/ChatPanel.tsx
+index f8bf905c..10738e93 100644
+--- a/core/frontend/src/components/ChatPanel.tsx
++++ b/core/frontend/src/components/ChatPanel.tsx
+@@ -9,6 +9,7 @@ import {
+   Loader2,
+   Paperclip,
+   X,
++  Zap,
+ } from "lucide-react";
+ import WorkerRunBubble from "@/components/WorkerRunBubble";
+ import type { WorkerRunGroup } from "@/components/WorkerRunBubble";
+@@ -38,6 +39,8 @@ import {
+   workerIdFromStreamId,
+ } from "@/lib/chat-helpers";
+ 
++type QueenPhase = "independent" | "incubating" | "working" | "reviewing";
++
+ export interface ChatMessage {
+   id: string;
+   agent: string;
+@@ -51,14 +54,16 @@ export interface ChatMessage {
+     | "tool_status"
+     | "worker_input_request"
+     | "run_divider"
+-    | "colony_link";
++    | "colony_link"
++    | "inherited_block"
++    | "trigger";
+   role?: "queen" | "worker";
+   /** Which worker thread this message belongs to (worker agent name) */
+   thread?: string;
+   /** Epoch ms when this message was first created — used for ordering queen/worker interleaving */
+   createdAt?: number;
+   /** Queen phase active when this message was created */
+-  phase?: "independent" | "working" | "reviewing";
++  phase?: QueenPhase;
+   /** Images attached to a user message */
+   images?: ImageContent[];
+   /** Backend node_id that produced this message — used for subagent grouping */
+@@ -73,8 +78,6 @@ export interface ChatMessage {
+   streamId?: string;
+   /** True when the message was sent while the queen was still processing */
+   queued?: boolean;
+-  /** Client-side id used to reconcile optimistic user message echoes from SSE */
+-  clientMessageId?: string;
+ }
+ 
+ interface ChatPanelProps {
+@@ -92,22 +95,27 @@ interface ChatPanelProps {
+   supportsImages?: boolean;
+   /** Called when user clicks the stop button to cancel the queen's current turn */
+   onCancel?: () => void;
+-  /** Pending question from ask_user — replaces textarea when present */
+-  pendingQuestion?: string | null;
+-  /** Options for the pending question */
+-  pendingOptions?: string[] | null;
+-  /** Multiple questions from ask_user_multiple */
++  /** Called when the user steers a queued message into the current turn —
++   *  the message is sent to the backend immediately so it influences the
++   *  agent after the next tool call completes. */
++  onSteer?: (messageId: string) => void;
++  /** Called when the user cancels a still-queued (not-yet-sent) message. */
++  onCancelQueued?: (messageId: string) => void;
++  /** Pending questions from ask_user. A single-entry list renders
++   *  QuestionWidget; 2+ entries render MultiQuestionWidget; a single
++   *  entry with no options falls through to the normal text input so
++   *  the user can type a free-form reply. */
+   pendingQuestions?:
+     | { id: string; prompt: string; options?: string[] }[]
+     | null;
+-  /** Called when user submits an answer to the pending question */
+-  onQuestionSubmit?: (answer: string, isOther: boolean) => void;
+-  /** Called when user submits answers to multiple questions */
+-  onMultiQuestionSubmit?: (answers: Record<string, string>) => void;
++  /** Called when the user answers pending questions. Keys are question
++   *  ids, values are the chosen/typed answer. Called for both single
++   *  and multi-question flows. */
++  onQuestionSubmit?: (answers: Record<string, string>) => void;
+   /** Called when user dismisses the pending question without answering */
+   onQuestionDismiss?: () => void;
+   /** Queen operating phase — shown as a tag on queen messages */
+-  queenPhase?: "independent" | "working" | "reviewing";
++  queenPhase?: QueenPhase;
+   /** When false, queen messages omit the phase badge */
+   showQueenPhaseBadge?: boolean;
+   /** Context window usage for queen and workers */
+@@ -122,11 +130,51 @@ interface ChatPanelProps {
+   queenProfileId?: string | null;
+   /** Queen ID — used to display the queen's avatar photo in messages */
+   queenId?: string;
++  /** Called when the user clicks a `colony_link` system message. Receives
++   *  the colony name. The parent should call markColonySpawned + flip
++   *  ``colonySpawned`` to lock the input. The Link still navigates. */
++  onColonyLinkClick?: (colonyName: string) => void;
++  /** When true, the composer is replaced with a "compact + new session"
++   *  button — set by the parent after the user opens a spawned colony. */
++  colonySpawned?: boolean;
++  /** Name of the colony that locked this DM (shown on the locked button). */
++  spawnedColonyName?: string | null;
++  /** Display label for the queen on the locked button (e.g. "Charlotte"). */
++  queenDisplayName?: string;
++  /** Called when the user clicks the locked-state button. Should compact
++   *  the current session and navigate to the new one. */
++  onCompactAndFork?: () => void;
++  /** When true, disable the compact-and-fork button (request in flight). */
++  compactingAndForking?: boolean;
++  /** Called when the user clicks "Start new session" on the locked view.
++   *  Should create a fresh session for the same queen without compacting. */
++  onStartNewSession?: () => void;
++  /** When true, disable the start-new-session button (request in flight). */
++  startingNewSession?: boolean;
++  /** Cumulative LLM token usage for this session.
++   *  `cached` (cache reads) and `cacheCreated` (cache writes) are subsets of
++   *  `input` — providers count both inside prompt_tokens. Display them
++   *  separately; do not add to a total. */
++  tokenUsage?: { input: number; output: number; cached?: number; cacheCreated?: number; costUsd?: number };
++  /** Optional action element rendered on the right side of the "Conversation" header */
++  headerAction?: React.ReactNode;
+ }
+ 
+ const queenColor = "hsl(45,95%,58%)";
+ const workerColor = "hsl(220,60%,55%)";
+ 
++function queenPhaseLabel(phase?: QueenPhase): string {
++  return phase ?? "independent";
++}
++
++function queenPhaseBadgeClass(phase?: QueenPhase): string {
++  if (phase === "incubating") {
++    // Honey-amber tint distinguishes spec incubation from the normal queen modes.
++    return "bg-amber-500/15 text-amber-500";
++  }
++  return "bg-primary/15 text-primary";
++}
++
+ function getColor(_agent: string, role?: "queen" | "worker"): string {
+   if (role === "queen") return queenColor;
+   return workerColor;
+@@ -238,19 +286,16 @@ export function ToolActivityRow({ content }: { content: string }) {
+ }
+ 
+ // --- Inline ask_user fallback ---------------------------------------------
+-// Sometimes the model prints the ask_user / ask_user_multiple payload as
+-// regular assistant text instead of invoking the tool. We detect that
+-// payload here and render a QuestionWidget / MultiQuestionWidget inline so
+-// the user still gets the nice button UI. Submissions are sent back as a
+-// regular user message via onSend (there is no pending backend state to
+-// fulfill, so we treat it like the user answering in chat).
+-
+-type AskUserInlinePayload =
+-  | { kind: "single"; question: string; options: string[] }
+-  | {
+-      kind: "multi";
+-      questions: { id: string; prompt: string; options?: string[] }[];
+-    };
++// Sometimes the model prints the ask_user payload as regular assistant
++// text instead of invoking the tool. We detect that payload here and
++// render a QuestionWidget / MultiQuestionWidget inline so the user still
++// gets the nice button UI. Submissions are sent back as a regular user
++// message via onSend (there is no pending backend state to fulfill, so
++// we treat it like the user answering in chat).
++
++type AskUserInlinePayload = {
++  questions: { id: string; prompt: string; options?: string[] }[];
++};
+ 
+ function detectAskUserPayload(content: string): AskUserInlinePayload | null {
+   if (!content) return null;
+@@ -274,44 +319,48 @@ function detectAskUserPayload(content: string): AskUserInlinePayload | null {
+   if (!parsed || typeof parsed !== "object") return null;
+   const obj = parsed as Record<string, unknown>;
+ 
+-  // ask_user_multiple: { questions: [{ id, prompt, options? }, ...] }
++  // Normalize to the unified ask_user shape:
++  //   { questions: [{ id, prompt, options? }, ...] }
++  // Accept either the array form directly, or a legacy single-question
++  // shape { question, options } that models occasionally still emit —
++  // it gets wrapped into a one-entry array.
++  let raw: unknown[] | null = null;
+   if (Array.isArray(obj.questions)) {
+-    const raw = obj.questions as unknown[];
+-    if (raw.length < 1 || raw.length > 8) return null;
+-    const questions: { id: string; prompt: string; options?: string[] }[] = [];
+-    for (let i = 0; i < raw.length; i++) {
+-      const q = raw[i];
+-      if (!q || typeof q !== "object") return null;
+-      const qo = q as Record<string, unknown>;
+-      const prompt =
+-        typeof qo.prompt === "string"
+-          ? qo.prompt
+-          : typeof qo.question === "string"
+-            ? qo.question
+-            : null;
+-      if (!prompt) return null;
+-      const id = typeof qo.id === "string" && qo.id ? qo.id : `q${i}`;
+-      let options: string[] | undefined;
+-      if (
+-        Array.isArray(qo.options) &&
+-        qo.options.every((o) => typeof o === "string")
+-      ) {
+-        options = qo.options as string[];
+-      }
+-      questions.push({ id, prompt, options });
++    raw = obj.questions as unknown[];
++  } else if (typeof obj.question === "string" || typeof obj.prompt === "string") {
++    raw = [obj];
++  }
++  if (!raw || raw.length < 1 || raw.length > 8) return null;
++
++  const questions: { id: string; prompt: string; options?: string[] }[] = [];
++  for (let i = 0; i < raw.length; i++) {
++    const q = raw[i];
++    if (!q || typeof q !== "object") return null;
++    const qo = q as Record<string, unknown>;
++    const prompt =
++      typeof qo.prompt === "string"
++        ? qo.prompt
++        : typeof qo.question === "string"
++          ? qo.question
++          : null;
++    if (!prompt) return null;
++    const id = typeof qo.id === "string" && qo.id ? qo.id : `q${i}`;
++    let options: string[] | undefined;
++    if (
++      Array.isArray(qo.options) &&
++      qo.options.every((o) => typeof o === "string")
++    ) {
++      options = qo.options as string[];
+     }
+-    return { kind: "multi", questions };
++    questions.push({ id, prompt, options });
+   }
+ 
+-  // ask_user: { question: string, options: string[] }
+-  const question = typeof obj.question === "string" ? obj.question : null;
+-  const options =
+-    Array.isArray(obj.options) &&
+-    obj.options.every((o) => typeof o === "string")
+-      ? (obj.options as string[])
+-      : null;
+-  if (!question || !options || options.length < 2) return null;
+-  return { kind: "single", question, options };
++  // Require either a multi-question batch or a single-with-options
++  // payload — a single free-form prompt isn't worth a widget.
++  if (questions.length === 1 && !(questions[0].options && questions[0].options.length >= 2)) {
++    return null;
++  }
++  return { questions };
+ }
+ 
+ function InlineAskUserBubble({
+@@ -333,7 +382,7 @@ function InlineAskUserBubble({
+     thread: string,
+     images?: ImageContent[],
+   ) => void;
+-  queenPhase?: "independent" | "working" | "reviewing";
++  queenPhase?: QueenPhase;
+   showQueenPhaseBadge?: boolean;
+   queenProfileId?: string | null;
+ }) {
+@@ -384,14 +433,13 @@ function InlineAskUserBubble({
+       ? "Open worker in colony sidebar"
+       : undefined;
+ 
+-  const handleSingle = (answer: string) => {
+-    setState("submitted");
+-    onSend(answer, thread);
+-  };
+-
+-  const handleMulti = (answers: Record<string, string>) => {
++  const handleSubmit = (answers: Record<string, string>) => {
+     setState("submitted");
+-    if (payload.kind !== "multi") return;
++    if (payload.questions.length === 1) {
++      const only = payload.questions[0];
++      onSend(answers[only.id] ?? "", thread);
++      return;
++    }
+     // Format answers as a readable, numbered list for the outgoing message.
+     const lines = payload.questions.map((q, i) => {
+       const a = answers[q.id] ?? "";
+@@ -407,7 +455,7 @@ function InlineAskUserBubble({
+         style={isQueen && queenAvatarUrl ? undefined : {
+           backgroundColor: `${color}18`,
+           border: `1.5px solid ${color}35`,
+-          boxShadow: isQueen ? `0 0 12px ${color}20` : undefined,
++          boxShadow: isQueen ? `0 0 6px ${color}10` : undefined,
+         }}
+         onClick={handleAvatarClick}
+         title={avatarTitle}
+@@ -429,37 +477,34 @@ function InlineAskUserBubble({
+           >
+             {msg.agent}
+           </span>
+-          {(!isQueen || showQueenPhaseBadge) && (
+-            <span
+-              className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${
+-                isQueen
+-                  ? "bg-primary/15 text-primary"
+-                  : "bg-muted text-muted-foreground"
+-              }`}
+-            >
+-              {isQueen
+-                ? (msg.phase ?? queenPhase) === "working"
+-                  ? "working"
+-                  : (msg.phase ?? queenPhase) === "reviewing"
+-                    ? "reviewing"
+-                    : "independent"
+-                : "Worker"}
+-            </span>
+-          )}
++          {(!isQueen || showQueenPhaseBadge) && (() => {
++            const effectivePhase = msg.phase ?? queenPhase;
++            const badgeClass = isQueen
++              ? queenPhaseBadgeClass(effectivePhase)
++              : "bg-muted text-muted-foreground";
++            const label = isQueen ? queenPhaseLabel(effectivePhase) : "Worker";
++            return (
++              <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${badgeClass}`}>
++                {label}
++              </span>
++            );
++          })()}
+         </div>
+-        {payload.kind === "single" ? (
+-          <QuestionWidget
++        {payload.questions.length >= 2 ? (
++          <MultiQuestionWidget
+             inline
+-            question={payload.question}
+-            options={payload.options}
+-            onSubmit={handleSingle}
++            questions={payload.questions}
++            onSubmit={handleSubmit}
+             onDismiss={() => setState("dismissed")}
+           />
+         ) : (
+-          <MultiQuestionWidget
++          <QuestionWidget
+             inline
+-            questions={payload.questions}
+-            onSubmit={handleMulti}
++            question={payload.questions[0].prompt}
++            options={payload.questions[0].options ?? []}
++            onSubmit={(answer) =>
++              handleSubmit({ [payload.questions[0].id]: answer })
++            }
+             onDismiss={() => setState("dismissed")}
+           />
+         )}
+@@ -468,6 +513,72 @@ function InlineAskUserBubble({
+   );
+ }
+ 
++function InheritedBlock({
++  content,
++  renderMessage,
++}: {
++  content: string;
++  renderMessage: (msg: ChatMessage) => React.ReactNode;
++}) {
++  // Default to collapsed — the colony's own conversation is what the
++  // user navigated for; the inherited DM transcript is one click away.
++  const [open, setOpen] = useState(false);
++  let parsed: {
++    parent_session_id?: string | null;
++    fork_time?: string | null;
++    summary_preview?: string;
++    inherited_message_count?: number;
++    messages?: ChatMessage[];
++  } = {};
++  try {
++    parsed = JSON.parse(content);
++  } catch {
++    // fall through to a degraded "Inherited from previous chat" affordance
++  }
++  const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
++  const count =
++    typeof parsed.inherited_message_count === "number"
++      ? parsed.inherited_message_count
++      : messages.length;
++  const preview = (parsed.summary_preview || "").trim();
++
++  return (
++    <div className="my-3">
++      <button
++        type="button"
++        onClick={() => setOpen((v) => !v)}
++        className="w-full flex items-center gap-2 text-[11px] text-muted-foreground bg-muted/30 hover:bg-muted/50 px-3 py-2 rounded-md border border-border/40 transition-colors"
++      >
++        <span className="font-medium">
++          {open ? "▼" : "▶"} Inherited from previous queen DM
++        </span>
++        <span className="text-muted-foreground/70">
++          ({count} message{count === 1 ? "" : "s"})
++        </span>
++      </button>
++      {open ? (
++        <div className="mt-2 pl-3 border-l-2 border-border/40 space-y-2">
++          {messages.length === 0 ? (
++            <div className="text-[11px] text-muted-foreground italic px-2 py-1">
++              {preview || "No messages preserved."}
++            </div>
++          ) : (
++            messages.map((m) => (
++              <div key={m.id} className="opacity-80">
++                {renderMessage(m)}
++              </div>
++            ))
++          )}
++        </div>
++      ) : preview ? (
++        <div className="mt-1 text-[11px] text-muted-foreground/80 italic px-3 line-clamp-2">
++          {preview}
++        </div>
++      ) : null}
++    </div>
++  );
++}
++
+ function QueenAvatarIcon({ url, size }: { url: string | null; size: number }) {
+   const [ok, setOk] = useState(!!url);
+   const dim = size === 9 ? "w-9 h-9" : "w-7 h-7";
+@@ -484,12 +595,18 @@ const MessageBubble = memo(
+     showQueenPhaseBadge = true,
+     queenProfileId,
+     queenAvatarUrl,
++    onColonyLinkClick,
++    onSteer,
++    onCancelQueued,
+   }: {
+     msg: ChatMessage;
+-    queenPhase?: "independent" | "working" | "reviewing";
++    queenPhase?: QueenPhase;
+     showQueenPhaseBadge?: boolean;
+     queenProfileId?: string | null;
+     queenAvatarUrl?: string | null;
++    onColonyLinkClick?: (colonyName: string) => void;
++    onSteer?: (messageId: string) => void;
++    onCancelQueued?: (messageId: string) => void;
+   }) {
+     const isUser = msg.type === "user";
+     const isQueen = msg.role === "queen";
+@@ -534,10 +651,59 @@ const MessageBubble = memo(
+       );
+     }
+ 
++    if (msg.type === "trigger") {
++      // Rendered when a scheduler/webhook trigger fires. Content is a JSON
++      // payload: { trigger_id, trigger_type, name, task, last_fired_at,
++      // fire_count }. Shown as a distinctive banner marking the start of
++      // the turn the queen is about to run in response.
++      let parsed: {
++        trigger_id?: string;
++        trigger_type?: string;
++        name?: string;
++        task?: string;
++        fire_count?: number;
++        last_fired_at?: number;
++      } = {};
++      try {
++        parsed = JSON.parse(msg.content);
++      } catch {
++        // Fall through to plain text
++      }
++      const label = parsed.name || parsed.trigger_id || "trigger";
++      const kind = parsed.trigger_type || "timer";
++      const task = (parsed.task || "").trim();
++      const fireCount = parsed.fire_count;
++      return (
++        <div className="flex justify-center py-2">
++          <div className="max-w-[85%] w-full rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
++            <div className="flex items-center gap-2 mb-1">
++              <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-amber-500/15 text-amber-400">
++                <Zap className="w-3 h-3" />
++              </span>
++              <span className="text-[11px] font-semibold text-amber-400 uppercase tracking-wider">
++                {kind === "webhook" ? "Webhook" : "Scheduler"} fired
++              </span>
++              <span className="text-[11px] text-foreground font-mono truncate">{label}</span>
++              {fireCount != null && fireCount > 0 && (
++                <span className="ml-auto text-[10px] text-muted-foreground">#{fireCount}</span>
++              )}
++            </div>
++            {task && (
++              <p className="text-[12px] text-muted-foreground leading-snug whitespace-pre-wrap">
++                {task}
++              </p>
++            )}
++          </div>
++        </div>
++      );
++    }
++
+     if (msg.type === "colony_link") {
+       // Rendered when the queen calls create_colony() and the backend
+       // emits a COLONY_CREATED event. Gives the user a clickable card
+-      // that navigates to the new colony page.
++      // that navigates to the new colony page. Clicking also locks the
++      // queen DM (mark-colony-spawned) so the user must compact + fork
++      // before continuing this conversation.
+       let parsed: {
+         colony_name?: string;
+         is_new?: boolean;
+@@ -559,6 +725,11 @@ const MessageBubble = memo(
+         <div className="flex justify-center py-2">
+           <Link
+             to={href}
++            onClick={() => {
++              if (colonyName && onColonyLinkClick) {
++                onColonyLinkClick(colonyName);
++              }
++            }}
+             className="inline-flex items-center gap-2 text-xs font-medium text-primary bg-primary/10 hover:bg-primary/20 px-4 py-2 rounded-full border border-primary/20 transition-colors"
+           >
+             <span>🏛️</span>
+@@ -570,15 +741,33 @@ const MessageBubble = memo(
+       );
+     }
+ 
++    if (msg.type === "inherited_block") {
++      return (
++        <InheritedBlock
++          content={msg.content}
++          renderMessage={(inner) => (
++            <MessageBubble
++              msg={inner}
++              queenPhase={queenPhase}
++              showQueenPhaseBadge={showQueenPhaseBadge}
++              queenProfileId={queenProfileId}
++              queenAvatarUrl={queenAvatarUrl}
++              onColonyLinkClick={onColonyLinkClick}
++            />
++          )}
++        />
++      );
++    }
++
+     if (msg.type === "tool_status") {
+       return <ToolActivityRow content={msg.content} />;
+     }
+ 
+     if (isUser) {
+       return (
+-        <div className="flex justify-end">
++        <div className="flex flex-col items-end gap-1">
+           <div
+-            className={`max-w-[75%] bg-primary text-primary-foreground text-sm leading-relaxed rounded-2xl rounded-br-md px-4 py-3${msg.queued ? " animate-pulse opacity-80" : ""}`}
++            className={`max-w-[75%] bg-primary text-primary-foreground text-sm leading-relaxed rounded-2xl rounded-br-md px-4 py-3${msg.queued ? " ring-1 ring-amber-500/50" : ""}`}
+           >
+             {msg.images && msg.images.length > 0 && (
+               <div className="flex flex-wrap gap-2 mb-2">
+@@ -597,11 +786,42 @@ const MessageBubble = memo(
+             )}
+             {(msg.queued || msg.createdAt) && (
+               <div className="flex justify-end items-center gap-1.5 mt-1 text-[10px] opacity-60">
+-                {msg.queued && <span>queued</span>}
++                {msg.queued && (
++                  <span className="inline-flex items-center gap-1">
++                    <span className="w-1 h-1 rounded-full bg-amber-400 animate-pulse" />
++                    queued
++                  </span>
++                )}
+                 {msg.createdAt && <span>{formatMessageTime(msg.createdAt)}</span>}
+               </div>
+             )}
+           </div>
++          {msg.queued && (onSteer || onCancelQueued) && (
++            <div className="flex items-center gap-1.5">
++              {onSteer && (
++                <button
++                  type="button"
++                  onClick={() => onSteer(msg.id)}
++                  className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 hover:bg-amber-500/25 border border-amber-500/30 transition-colors"
++                  title="Send now — influence the current turn after the next tool call"
++                >
++                  <Zap className="w-3 h-3" />
++                  Steer
++                </button>
++              )}
++              {onCancelQueued && (
++                <button
++                  type="button"
++                  onClick={() => onCancelQueued(msg.id)}
++                  className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-muted/60 text-muted-foreground hover:bg-muted border border-border transition-colors"
++                  title="Remove this queued message"
++                >
++                  <X className="w-3 h-3" />
++                  Cancel
++                </button>
++              )}
++            </div>
++          )}
+         </div>
+       );
+     }
+@@ -627,7 +847,7 @@ const MessageBubble = memo(
+           style={isQueen && queenAvatarUrl ? undefined : {
+             backgroundColor: `${color}18`,
+             border: `1.5px solid ${color}35`,
+-            boxShadow: isQueen ? `0 0 12px ${color}20` : undefined,
++            boxShadow: isQueen ? `0 0 6px ${color}10` : undefined,
+           }}
+           onClick={handleAvatarClick}
+           title={avatarTitle}
+@@ -653,17 +873,11 @@ const MessageBubble = memo(
+               <span
+                 className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${
+                   isQueen
+-                    ? "bg-primary/15 text-primary"
++                    ? queenPhaseBadgeClass(msg.phase ?? queenPhase)
+                     : "bg-muted text-muted-foreground"
+                 }`}
+               >
+-                {isQueen
+-                  ? (msg.phase ?? queenPhase) === "working"
+-                    ? "working"
+-                    : (msg.phase ?? queenPhase) === "reviewing"
+-                      ? "reviewing"
+-                      : "independent"
+-                  : "Worker"}
++                {isQueen ? queenPhaseLabel(msg.phase ?? queenPhase) : "Worker"}
+               </span>
+             )}
+             {msg.createdAt && (
+@@ -687,8 +901,11 @@ const MessageBubble = memo(
+     prev.msg.id === next.msg.id &&
+     prev.msg.content === next.msg.content &&
+     prev.msg.phase === next.msg.phase &&
++    prev.msg.queued === next.msg.queued &&
+     prev.queenPhase === next.queenPhase &&
+-    prev.showQueenPhaseBadge === next.showQueenPhaseBadge,
++    prev.showQueenPhaseBadge === next.showQueenPhaseBadge &&
++    prev.onSteer === next.onSteer &&
++    prev.onCancelQueued === next.onCancelQueued,
+ );
+ 
+ export default function ChatPanel({
+@@ -700,11 +917,10 @@ export default function ChatPanel({
+   activeThread,
+   disabled,
+   onCancel,
+-  pendingQuestion,
+-  pendingOptions,
++  onSteer,
++  onCancelQueued,
+   pendingQuestions,
+   onQuestionSubmit,
+-  onMultiQuestionSubmit,
+   onQuestionDismiss,
+   queenPhase,
+   showQueenPhaseBadge = true,
+@@ -713,6 +929,16 @@ export default function ChatPanel({
+   initialDraft,
+   queenProfileId,
+   queenId,
++  onColonyLinkClick,
++  colonySpawned,
++  spawnedColonyName,
++  queenDisplayName,
++  onCompactAndFork,
++  compactingAndForking,
++  onStartNewSession,
++  startingNewSession,
++  tokenUsage,
++  headerAction,
+ }: ChatPanelProps) {
+   const [input, setInput] = useState("");
+   const [pendingImages, setPendingImages] = useState<ImageContent[]>([]);
+@@ -827,6 +1053,19 @@ export default function ChatPanel({
+           // it. Break so the grouping stops and the queen pill
+           // renders inline.
+           if (m.type === "tool_status" && m.role === "queen") break;
++          // Trigger banner — scheduler/webhook fire marking a new
++          // queen turn. Must not fold into a stale worker run that
++          // happens to precede it (see also MessageBubble's
++          // ``type === "trigger"`` render at the amber banner).
++          if (m.type === "trigger") break;
++          // Other session-wide banners: colony link, inherited block,
++          // system notices — none of these belong inside a worker run.
++          if (
++            m.type === "colony_link" ||
++            m.type === "inherited_block" ||
++            m.type === "system"
++          )
++            break;
+           // Subagent message — different group type, stop here
+           if (m.nodeId?.includes(":subagent:")) break;
+ 
+@@ -1030,7 +1269,7 @@ export default function ChatPanel({
+     if (stickToBottom.current) {
+       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+     }
+-  }, [threadMessages, pendingQuestion, isWaiting, isWorkerWaiting]);
++  }, [threadMessages, pendingQuestions, isWaiting, isWorkerWaiting]);
+ 
+   // Always start pinned to bottom when switching threads
+   useEffect(() => {
+@@ -1075,6 +1314,7 @@ export default function ChatPanel({
+         <p className="text-[11px] text-muted-foreground font-medium uppercase tracking-wider">
+           Conversation
+         </p>
++        {headerAction && <div className="ml-auto">{headerAction}</div>}
+       </div>
+ 
+       {/* Messages */}
+@@ -1153,6 +1393,9 @@ export default function ChatPanel({
+                 showQueenPhaseBadge={showQueenPhaseBadge}
+                 queenProfileId={queenProfileId}
+                 queenAvatarUrl={queenAvatarUrl}
++                onColonyLinkClick={onColonyLinkClick}
++                onSteer={onSteer}
++                onCancelQueued={onCancelQueued}
+               />
+             </div>
+           );
+@@ -1166,7 +1409,7 @@ export default function ChatPanel({
+               style={queenAvatarUrl ? undefined : {
+                 backgroundColor: `${queenColor}18`,
+                 border: `1.5px solid ${queenColor}35`,
+-                boxShadow: `0 0 12px ${queenColor}20`,
++                boxShadow: `0 0 6px ${queenColor}10`,
+               }}
+             >
+               <QueenAvatarIcon url={queenAvatarUrl} size={9} />
+@@ -1221,109 +1464,147 @@ export default function ChatPanel({
+         <div ref={bottomRef} />
+       </div>
+ 
+-      {/* Context window usage bar — sits between messages and input */}
++      {/* Context & token usage — compact inline stats */}
+       {(() => {
+-        if (!contextUsage) return null;
+-        const queenUsage = contextUsage["__queen__"];
+-        const workerEntries = Object.entries(contextUsage).filter(
+-          ([k]) => k !== "__queen__",
+-        );
+-        const workerUsage =
+-          workerEntries.length > 0
+-            ? workerEntries.reduce(
+-                (best, [, v]) => (v.usagePct > best.usagePct ? v : best),
+-                workerEntries[0][1],
+-              )
+-            : undefined;
+-        if (!queenUsage && !workerUsage) return null;
++        const fmt = (tokens: number) => tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens);
++        const color = (pct: number) => pct >= 90 ? "text-red-400" : pct >= 70 ? "text-orange-400" : "text-muted-foreground/50";
++
++        let queenUsage: ContextUsageEntry | undefined;
++        if (contextUsage) {
++          queenUsage = contextUsage["__queen__"];
++        }
++
++        const hasContext = !!queenUsage;
++        const hasTokens = tokenUsage && (tokenUsage.input > 0 || tokenUsage.output > 0);
++        if (!hasContext && !hasTokens) return null;
++
+         return (
+-          <div className="flex items-center gap-3 mx-4 px-3 py-1 rounded-lg bg-muted/30 border border-border/20 group/ctx flex-shrink-0">
++          <div className="flex items-center justify-end gap-3 mx-4 px-2 py-0.5 flex-shrink-0 text-[10px] text-muted-foreground/50 tabular-nums">
+             {queenUsage && (
+-              <div
+-                className="flex items-center gap-2 flex-1 min-w-0"
+-                title={`Queen: ${(queenUsage.estimatedTokens / 1000).toFixed(1)}k / ${(queenUsage.maxTokens / 1000).toFixed(0)}k tokens \u00b7 ${queenUsage.messageCount} messages`}
+-              >
+-                <Crown
+-                  className="w-3 h-3 flex-shrink-0"
+-                  style={{ color: "hsl(45,95%,58%)" }}
+-                />
+-                <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden min-w-[60px]">
+-                  <div
+-                    className="h-full rounded-full transition-all duration-500 ease-out"
+-                    style={{
+-                      width: `${Math.min(queenUsage.usagePct, 100)}%`,
+-                      backgroundColor:
+-                        queenUsage.usagePct >= 90
+-                          ? "hsl(0,65%,55%)"
+-                          : queenUsage.usagePct >= 70
+-                            ? "hsl(35,90%,55%)"
+-                            : "hsl(45,95%,58%)",
+-                    }}
+-                  />
+-                </div>
+-                <span className="text-[10px] text-muted-foreground/70 flex-shrink-0 tabular-nums">
+-                  <span className="group-hover/ctx:hidden">
+-                    {queenUsage.usagePct}%
+-                  </span>
+-                  <span className="hidden group-hover/ctx:inline">
+-                    {(queenUsage.estimatedTokens / 1000).toFixed(1)}k /{" "}
+-                    {(queenUsage.maxTokens / 1000).toFixed(0)}k
+-                  </span>
+-                </span>
+-              </div>
++              <span className={color(queenUsage.usagePct)} title={`${queenUsage.messageCount} messages`}>
++                Context: {fmt(queenUsage.estimatedTokens)}/{fmt(queenUsage.maxTokens)}
++              </span>
+             )}
+-            {workerUsage && (
+-              <div
+-                className="flex items-center gap-2 flex-1 min-w-0"
+-                title={`Worker: ${(workerUsage.estimatedTokens / 1000).toFixed(1)}k / ${(workerUsage.maxTokens / 1000).toFixed(0)}k tokens \u00b7 ${workerUsage.messageCount} messages`}
+-              >
+-                <Cpu
+-                  className="w-3 h-3 flex-shrink-0"
+-                  style={{ color: "hsl(220,60%,55%)" }}
+-                />
+-                <div className="flex-1 h-1.5 rounded-full bg-muted/50 overflow-hidden min-w-[60px]">
+-                  <div
+-                    className="h-full rounded-full transition-all duration-500 ease-out"
+-                    style={{
+-                      width: `${Math.min(workerUsage.usagePct, 100)}%`,
+-                      backgroundColor:
+-                        workerUsage.usagePct >= 90
+-                          ? "hsl(0,65%,55%)"
+-                          : workerUsage.usagePct >= 70
+-                            ? "hsl(35,90%,55%)"
+-                            : "hsl(220,60%,55%)",
+-                    }}
+-                  />
+-                </div>
+-                <span className="text-[10px] text-muted-foreground/70 flex-shrink-0 tabular-nums">
+-                  <span className="group-hover/ctx:hidden">
+-                    {workerUsage.usagePct}%
+-                  </span>
+-                  <span className="hidden group-hover/ctx:inline">
+-                    {(workerUsage.estimatedTokens / 1000).toFixed(1)}k /{" "}
+-                    {(workerUsage.maxTokens / 1000).toFixed(0)}k
++            {hasTokens && (() => {
++              const cached = tokenUsage!.cached ?? 0;
++              const created = tokenUsage!.cacheCreated ?? 0;
++              const cost = tokenUsage!.costUsd ?? 0;
++              // cached/created are subsets of input — never sum; surface separately.
++              // Cost can be < $0.01; show 4 decimals so small-model sessions aren't "$0.00".
++              const costStr = cost > 0 ? `$${cost.toFixed(4)}` : "—";
++              return (
++                <span className="group relative cursor-help transition-colors hover:text-muted-foreground">
++                  Tokens: {fmt(tokenUsage!.output)}
++                  <span
++                    role="tooltip"
++                    className="pointer-events-none invisible absolute bottom-full right-0 z-50 mb-2 whitespace-nowrap rounded-md border border-border bg-popover px-3 py-2 text-[11px] text-popover-foreground opacity-0 shadow-lg transition-[opacity,transform] duration-150 translate-y-1 group-hover:visible group-hover:opacity-100 group-hover:translate-y-0"
++                  >
++                    <span className="mb-1.5 block text-muted-foreground">
++                      LLM tokens used this session
++                    </span>
++                    <span className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 tabular-nums">
++                      <span>Input</span>
++                      <span className="text-right">{fmt(tokenUsage!.input)}</span>
++                      <span className="pl-3 text-muted-foreground">cache read</span>
++                      <span className="text-right text-muted-foreground">{fmt(cached)}</span>
++                      <span className="pl-3 text-muted-foreground">cache write</span>
++                      <span className="text-right text-muted-foreground">{fmt(created)}</span>
++                      <span>Output</span>
++                      <span className="text-right">{fmt(tokenUsage!.output)}</span>
++                      <span className="mt-1 border-t border-border/50 pt-1">Cost</span>
++                      <span className="mt-1 border-t border-border/50 pt-1 text-right font-medium">
++                        {costStr}
++                      </span>
++                    </span>
+                   </span>
+                 </span>
+-              </div>
+-            )}
++              );
++            })()}
+           </div>
+         );
+       })()}
+ 
+-      {/* Input area — question widget replaces textarea when a question is pending */}
+-      {pendingQuestions &&
+-      pendingQuestions.length >= 2 &&
+-      onMultiQuestionSubmit ? (
++      {/* Input area — colony-spawned lock replaces everything; question widget
++          replaces textarea when a question is pending */}
++      {colonySpawned ? (
++        <div className="p-4 border-t border-border/50 bg-muted/20">
++          <div className="flex flex-col items-center gap-2 text-center">
++            <p className="text-xs text-muted-foreground max-w-md">
++              This conversation spawned colony{" "}
++              {spawnedColonyName ? (
++                <strong className="text-foreground">{spawnedColonyName}</strong>
++              ) : (
++                "a colony"
++              )}
++              . To keep chatting with{" "}
++              {queenDisplayName || "this queen"}, compact this session and start
++              a fresh one.
++            </p>
++            <div className="flex flex-wrap items-center justify-center gap-2">
++              <button
++                type="button"
++                onClick={onCompactAndFork}
++                disabled={
++                  !onCompactAndFork ||
++                  compactingAndForking ||
++                  startingNewSession
++                }
++                className="inline-flex items-center gap-2 text-xs font-medium text-primary-foreground bg-primary hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2 rounded-full transition-opacity"
++              >
++                {compactingAndForking ? (
++                  <>
++                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
++                    <span>Compacting…</span>
++                  </>
++                ) : (
++                  <span>
++                    Compact & start new session
++                    {queenDisplayName ? ` with ${queenDisplayName}` : ""}
++                  </span>
++                )}
++              </button>
++              {onStartNewSession && (
++                <button
++                  type="button"
++                  onClick={onStartNewSession}
++                  disabled={startingNewSession || compactingAndForking}
++                  className="inline-flex items-center gap-2 text-xs font-medium text-foreground bg-muted hover:bg-muted/70 disabled:opacity-50 disabled:cursor-not-allowed px-4 py-2 rounded-full transition-colors"
++                >
++                  {startingNewSession ? (
++                    <>
++                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
++                      <span>Starting…</span>
++                    </>
++                  ) : (
++                    <span>
++                      Start new session
++                      {queenDisplayName ? ` with ${queenDisplayName}` : ""}
++                    </span>
++                  )}
++                </button>
++              )}
++            </div>
++          </div>
++        </div>
++      ) : pendingQuestions &&
++        pendingQuestions.length >= 2 &&
++        onQuestionSubmit ? (
+         <MultiQuestionWidget
+           questions={pendingQuestions}
+-          onSubmit={onMultiQuestionSubmit}
++          onSubmit={onQuestionSubmit}
+           onDismiss={onQuestionDismiss}
+         />
+-      ) : pendingQuestion && pendingOptions && onQuestionSubmit ? (
++      ) : pendingQuestions &&
++        pendingQuestions.length === 1 &&
++        pendingQuestions[0].options &&
++        pendingQuestions[0].options.length >= 2 &&
++        onQuestionSubmit ? (
+         <QuestionWidget
+-          question={pendingQuestion}
+-          options={pendingOptions}
+-          onSubmit={onQuestionSubmit}
++          question={pendingQuestions[0].prompt}
++          options={pendingQuestions[0].options}
++          onSubmit={(answer) =>
++            onQuestionSubmit({ [pendingQuestions[0].id]: answer })
++          }
+           onDismiss={onQuestionDismiss}
+         />
+       ) : (
+@@ -1386,30 +1667,47 @@ export default function ChatPanel({
+                 }
+               }}
+               placeholder={
+-                disabled ? "Connecting to agent..." : "Message Queen Bee..."
++                disabled
++                  ? "Connecting to agent..."
++                  : isBusy
++                    ? "Queue a message — or click Steer to inject now..."
++                    : "Message Queen Bee..."
+               }
+               disabled={disabled}
+               className="flex-1 bg-transparent text-sm text-foreground outline-none placeholder:text-muted-foreground disabled:opacity-50 disabled:cursor-not-allowed resize-none overflow-y-auto"
+             />
+-            {isBusy && onCancel ? (
++            {isBusy && onCancel && (
+               <button
+                 type="button"
+                 onClick={onCancel}
++                title="Stop the queen's current turn"
+                 className="p-2 rounded-lg bg-amber-500/15 text-amber-400 border border-amber-500/40 hover:bg-amber-500/25 transition-colors"
+               >
+                 <Square className="w-4 h-4" />
+               </button>
+-            ) : (
+-              <button
+-                type="submit"
+-                disabled={
+-                  (!input.trim() && pendingImages.length === 0) || disabled
+-                }
+-                className="p-2 rounded-lg bg-primary text-primary-foreground disabled:opacity-30 hover:opacity-90 transition-opacity"
+-              >
+-                <Send className="w-4 h-4" />
+-              </button>
+             )}
++            <button
++              type="submit"
++              disabled={
++                (!input.trim() && pendingImages.length === 0) || disabled
++              }
++              title={
++                isBusy
++                  ? "Queue message — sent after the current turn, or click Steer on the bubble to send now"
++                  : "Send"
++              }
++              className={`p-2 rounded-lg disabled:opacity-30 hover:opacity-90 transition-opacity ${
++                isBusy
++                  ? "bg-amber-500/20 text-amber-600 border border-amber-500/40"
++                  : "bg-primary text-primary-foreground"
++              }`}
++            >
++              {isBusy ? (
++                <Zap className="w-4 h-4" />
++              ) : (
++                <Send className="w-4 h-4" />
++              )}
++            </button>
+           </div>
+         </form>
+       )}
+diff --git a/core/frontend/src/components/ColonyWorkersPanel.tsx b/core/frontend/src/components/ColonyWorkersPanel.tsx
+index 606e920c..e11daff8 100644
+--- a/core/frontend/src/components/ColonyWorkersPanel.tsx
++++ b/core/frontend/src/components/ColonyWorkersPanel.tsx
+@@ -818,11 +818,64 @@ function countdownLabel(nextFireIn: number | undefined): string | null {
+     : `next in ${m}m ${String(s).padStart(2, "0")}s`;
+ }
+ 
++/** Tick a live countdown against the server-provided absolute `next_fire_at`
++ *  (epoch ms). Falls back to converting `next_fire_in` (seconds delta) if
++ *  the absolute form is absent. Rolls forward by interval_minutes when
++ *  zero is crossed so the UI keeps counting between server pushes. */
++function useLiveCountdown(
++  nextFireAt: number | undefined,
++  nextFireIn: number | undefined,
++  isActive: boolean,
++  intervalMinutes: number | undefined,
++): { remainingSec: number | null; firesAtMs: number | null } {
++  const [firesAtMs, setFiresAtMs] = useState<number | null>(null);
++  const [remainingSec, setRemainingSec] = useState<number | null>(null);
++
++  useEffect(() => {
++    if (typeof nextFireAt === "number" && nextFireAt > 0) {
++      setFiresAtMs(nextFireAt);
++    } else if (typeof nextFireIn === "number" && nextFireIn >= 0) {
++      setFiresAtMs(Date.now() + nextFireIn * 1000);
++    } else {
++      setFiresAtMs(null);
++    }
++  }, [nextFireAt, nextFireIn]);
++
++  useEffect(() => {
++    if (!isActive || firesAtMs == null) {
++      setRemainingSec(null);
++      return;
++    }
++    const tick = () => {
++      const diff = (firesAtMs - Date.now()) / 1000;
++      if (diff > 0) {
++        setRemainingSec(diff);
++      } else if (intervalMinutes) {
++        setFiresAtMs((prev) => (prev != null ? prev + intervalMinutes * 60 * 1000 : prev));
++      } else {
++        setRemainingSec(0);
++      }
++    };
++    tick();
++    const id = window.setInterval(tick, 1000);
++    return () => window.clearInterval(id);
++  }, [firesAtMs, isActive, intervalMinutes]);
++
++  return { remainingSec, firesAtMs };
++}
++
+ function TriggerCard({ trigger, onClick }: { trigger: GraphNode; onClick: () => void }) {
+   const isActive = triggerIsActive(trigger);
+   const schedule = scheduleLabel(trigger.triggerConfig);
+   const nextFireIn = trigger.triggerConfig?.next_fire_in as number | undefined;
+-  const countdown = isActive ? countdownLabel(nextFireIn) : null;
++  const nextFireAt = trigger.triggerConfig?.next_fire_at as number | undefined;
++  const interval = trigger.triggerConfig?.interval_minutes as number | undefined;
++  const fireCount = trigger.triggerConfig?.fire_count as number | undefined;
++  const lastFiredAt = trigger.triggerConfig?.last_fired_at as number | undefined;
++  const { remainingSec } = useLiveCountdown(nextFireAt, nextFireIn, isActive, interval);
++  const now = useNow(1000);
++  const countdown = isActive && remainingSec != null ? countdownLabel(remainingSec) : null;
++  const agoLabel = lastFiredAt ? formatAgo(lastFiredAt, now) : null;
+ 
+   return (
+     <button
+@@ -854,6 +907,13 @@ function TriggerCard({ trigger, onClick }: { trigger: GraphNode; onClick: () =>
+       {countdown && (
+         <p className="text-[10px] text-muted-foreground mt-1.5 italic pl-8">{countdown}</p>
+       )}
++      {(fireCount != null && fireCount > 0) || agoLabel ? (
++        <p className="text-[10px] text-muted-foreground mt-0.5 pl-8">
++          {fireCount != null && fireCount > 0 ? `fired ${fireCount}×` : null}
++          {fireCount != null && fireCount > 0 && agoLabel ? " · " : null}
++          {agoLabel ? `last ${agoLabel}` : null}
++        </p>
++      ) : null}
+     </button>
+   );
+ }
+@@ -867,6 +927,31 @@ function formatCountdown(seconds: number): string {
+   return `${s}s`;
+ }
+ 
++/** Human-readable "X ago" for a wall-clock epoch ms. */
++function formatAgo(epochMs: number, nowMs: number): string {
++  const diff = Math.max(0, Math.floor((nowMs - epochMs) / 1000));
++  if (diff < 5) return "just now";
++  if (diff < 60) return `${diff}s ago`;
++  const m = Math.floor(diff / 60);
++  if (m < 60) return `${m}m ago`;
++  const h = Math.floor(m / 60);
++  if (h < 24) return `${h}h ago`;
++  const d = Math.floor(h / 24);
++  return `${d}d ago`;
++}
++
++/** Reactive Date.now() that re-renders on an interval. 1s default keeps
++ *  countdowns smooth; consumers that only need "ago" can pass a coarser
++ *  interval. */
++function useNow(intervalMs = 1000): number {
++  const [now, setNow] = useState(() => Date.now());
++  useEffect(() => {
++    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
++    return () => window.clearInterval(id);
++  }, [intervalMs]);
++  return now;
++}
++
+ function TriggerDetail({
+   sessionId,
+   trigger,
+@@ -877,14 +962,23 @@ function TriggerDetail({
+   onBack: () => void;
+ }) {
+   const [busy, setBusy] = useState(false);
++  const [runBusy, setRunBusy] = useState(false);
++  const [runNotice, setRunNotice] = useState<string | null>(null);
+   const [error, setError] = useState<string | null>(null);
+   const isActive = triggerIsActive(trigger);
+   const config = (trigger.triggerConfig || {}) as Record<string, unknown>;
+   const cron = config.cron as string | undefined;
+   const interval = config.interval_minutes as number | undefined;
+   const nextFireIn = config.next_fire_in as number | undefined;
++  const nextFireAt = config.next_fire_at as number | undefined;
++  const fireCount = config.fire_count as number | undefined;
++  const lastFiredAt = config.last_fired_at as number | undefined;
+   const triggerId = trigger.id.replace(/^__trigger_/, "");
+ 
++  const { remainingSec, firesAtMs } = useLiveCountdown(nextFireAt, nextFireIn, isActive, interval);
++  const now = useNow(1000);
++  const lastFiredAgo = lastFiredAt ? formatAgo(lastFiredAt, now) : null;
++
+   const handleToggle = async () => {
+     if (!sessionId || busy) return;
+     setBusy(true);
+@@ -904,6 +998,23 @@ function TriggerDetail({
+     }
+   };
+ 
++  const handleForceRun = async () => {
++    if (!sessionId || runBusy) return;
++    setRunBusy(true);
++    setError(null);
++    setRunNotice(null);
++    try {
++      await sessionsApi.runTrigger(sessionId, triggerId);
++      setRunNotice("Trigger fired");
++      // Clear the notice after a few seconds so it doesn't linger.
++      setTimeout(() => setRunNotice(null), 3000);
++    } catch (err) {
++      setError(err instanceof Error ? err.message : String(err));
++    } finally {
++      setRunBusy(false);
++    }
++  };
++
+   const schedule = cron
+     ? cronToLabel(cron)
+     : interval != null
+@@ -914,7 +1025,12 @@ function TriggerDetail({
+ 
+   // Hide UI-synthesised fields so the user sees only real operator config.
+   const displayEntries = Object.entries(config).filter(
+-    ([k]) => k !== "next_fire_in" && k !== "entry_node",
++    ([k]) =>
++      k !== "next_fire_in" &&
++      k !== "next_fire_at" &&
++      k !== "fire_count" &&
++      k !== "last_fired_at" &&
++      k !== "entry_node",
+   );
+ 
+   return (
+@@ -967,12 +1083,33 @@ function TriggerDetail({
+         </Section>
+       )}
+ 
+-      {isActive && nextFireIn != null && nextFireIn > 0 && (
++      {isActive && remainingSec != null && remainingSec > 0 && (
+         <Section label="Next fire">
+-          <p className="text-xs text-foreground italic">in {formatCountdown(nextFireIn)}</p>
++          <p className="text-xs text-foreground italic">in {formatCountdown(remainingSec)}</p>
++          {firesAtMs != null && (
++            <p className="text-[10px] text-muted-foreground mt-1">
++              at {new Date(firesAtMs).toLocaleTimeString()}
++            </p>
++          )}
+         </Section>
+       )}
+ 
++      {(fireCount != null && fireCount > 0) || lastFiredAgo ? (
++        <Section label="Last fire">
++          <div className="flex items-baseline justify-between gap-3">
++            <span className="text-xs text-foreground">{lastFiredAgo ?? "—"}</span>
++            {fireCount != null && fireCount > 0 && (
++              <span className="text-[10px] text-muted-foreground">fired {fireCount}×</span>
++            )}
++          </div>
++          {lastFiredAt && (
++            <p className="text-[10px] text-muted-foreground mt-1">
++              at {new Date(lastFiredAt).toLocaleTimeString()}
++            </p>
++          )}
++        </Section>
++      ) : null}
++
+       {displayEntries.length > 0 && (
+         <Section label="Config">
+           <div className="space-y-1">
+@@ -995,6 +1132,23 @@ function TriggerDetail({
+       {error && (
+         <p className="text-[10.5px] text-destructive leading-snug mb-2">{error}</p>
+       )}
++      {runNotice && (
++        <p className="text-[10.5px] text-emerald-400 leading-snug mb-2">{runNotice}</p>
++      )}
++      <button
++        type="button"
++        onClick={handleForceRun}
++        disabled={runBusy || !sessionId}
++        title="Fire this trigger once, bypassing the schedule"
++        className="w-full flex items-center justify-center gap-1.5 px-3 py-2 mb-2 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed bg-amber-500/15 text-amber-400 hover:bg-amber-500/25 border border-amber-500/30"
++      >
++        {runBusy ? (
++          <Loader2 className="w-3.5 h-3.5 animate-spin" />
++        ) : (
++          <Zap className="w-3.5 h-3.5" />
++        )}
++        {runBusy ? "Firing…" : "Force Run"}
++      </button>
+       <button
+         type="button"
+         onClick={handleToggle}
+diff --git a/core/frontend/src/components/QueenProfilePanel.tsx b/core/frontend/src/components/QueenProfilePanel.tsx
+index c329cb93..9cfbbbdf 100644
+--- a/core/frontend/src/components/QueenProfilePanel.tsx
++++ b/core/frontend/src/components/QueenProfilePanel.tsx
+@@ -1,10 +1,13 @@
+ import { useState, useEffect, useCallback, useRef } from "react";
+-import { NavLink, useLocation, useNavigate } from "react-router-dom";
+-import { X, MessageSquare, Crown, ChevronRight, Briefcase, Award, Pencil, Check, Loader2, Camera } from "lucide-react";
++import { NavLink, useNavigate } from "react-router-dom";
++import { X, MessageSquare, Crown, ChevronRight, Briefcase, Award, Pencil, Check, Loader2, Camera, Plus } from "lucide-react";
+ import { useColony } from "@/context/ColonyContext";
+ import { queensApi, type QueenProfile } from "@/api/queens";
++import { executionApi } from "@/api/execution";
+ import { compressImage } from "@/lib/image-utils";
+ import type { Colony } from "@/types/colony";
++import { slugToColonyId } from "@/lib/colony-registry";
++import QueenToolsSection from "./QueenToolsSection";
+ 
+ interface QueenProfilePanelProps {
+   queenId: string;
+@@ -27,7 +30,6 @@ function SectionHeader({ children, onEdit }: { children: React.ReactNode; onEdit
+ 
+ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenProfilePanelProps) {
+   const navigate = useNavigate();
+-  const location = useLocation();
+   const { queenProfiles, refresh } = useColony();
+   const summary = queenProfiles.find((q) => q.id === queenId);
+   const [profile, setProfile] = useState<QueenProfile | null>(null);
+@@ -47,8 +49,6 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
+   const [editSkills, setEditSkills] = useState("");
+   const [editAchievement, setEditAchievement] = useState("");
+ 
+-  const alreadyInQueenPm = location.pathname === `/queen/${queenId}`;
+-
+   useEffect(() => {
+     setLoading(true);
+     setProfile(null);
+@@ -112,6 +112,33 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
+     }
+   };
+ 
++  // Colony creation
++  const [colonyDialogOpen, setColonyDialogOpen] = useState(false);
++  const [colonyName, setColonyName] = useState("");
++  const [colonyTask, setColonyTask] = useState("");
++  const [creatingColony, setCreatingColony] = useState(false);
++
++  const handleCreateColony = async () => {
++    const cname = colonyName.trim();
++    if (!cname || creatingColony) return;
++    setCreatingColony(true);
++    try {
++      // Create a fresh queen session, then fork it into a colony
++      const { session_id } = await queensApi.createNewSession(queenId, colonyTask.trim() || undefined);
++      await executionApi.colonySpawn(session_id, cname, colonyTask.trim() || undefined);
++      setColonyDialogOpen(false);
++      setColonyName("");
++      setColonyTask("");
++      refresh();
++      onClose();
++      navigate(`/colony/${slugToColonyId(cname)}`);
++    } catch (err) {
++      console.error("Failed to create colony:", err);
++    } finally {
++      setCreatingColony(false);
++    }
++  };
++
+   const name = profile?.name ?? summary?.name ?? "Queen";
+   const title = profile?.title ?? summary?.title ?? "";
+ 
+@@ -268,13 +295,18 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
+               </button>
+             </div>
+ 
+-            {!alreadyInQueenPm && (
++            <div className="flex items-center gap-2 mb-6">
+               <button onClick={() => { navigate(`/queen/${queenId}`); onClose(); }}
+-                className="w-full flex items-center justify-center gap-2 rounded-lg border border-border/60 py-2.5 text-sm font-medium text-foreground hover:bg-muted/40 mb-6">
++                className="flex-1 flex items-center justify-center gap-2 rounded-lg border border-border/60 py-2.5 text-sm font-medium text-foreground hover:bg-muted/40">
+                 <MessageSquare className="w-4 h-4" />
+-                Message {name}
++                Message
+               </button>
+-            )}
++              <button onClick={() => setColonyDialogOpen(true)}
++                className="flex-1 flex items-center justify-center gap-2 rounded-lg border border-primary/30 bg-primary/[0.04] py-2.5 text-sm font-medium text-primary hover:bg-primary/[0.08]">
++                <Plus className="w-4 h-4" />
++                Create Colony
++              </button>
++            </div>
+ 
+             {profile?.summary && (
+               <div className="mb-6">
+@@ -323,6 +355,10 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
+               </div>
+             )}
+ 
++            <div className="mb-6">
++              <QueenToolsSection queenId={queenId} />
++            </div>
++
+             {colonies.length > 0 && (
+               <div>
+                 <h4 className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wider mb-2">Assigned Colonies</h4>
+@@ -340,6 +376,44 @@ export default function QueenProfilePanel({ queenId, colonies, onClose }: QueenP
+           </>
+         )}
+       </div>
++
++      {/* Create Colony dialog */}
++      {colonyDialogOpen && (
++        <div className="fixed inset-0 z-50 flex items-center justify-center">
++          <div className="absolute inset-0 bg-black/40" onClick={() => !creatingColony && setColonyDialogOpen(false)} />
++          <div className="relative bg-card border border-border/60 rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4">
++            <h2 className="text-sm font-semibold text-foreground">Create Colony</h2>
++            <p className="text-[11px] text-muted-foreground">
++              Create a new colony managed by {name}. The queen will bootstrap it with tools and context.
++            </p>
++            <div className="space-y-3">
++              <div>
++                <label className="block text-[11px] font-medium text-muted-foreground mb-1">Colony name <span className="text-primary">*</span></label>
++                <input type="text" value={colonyName} autoFocus
++                  onChange={(e) => setColonyName(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))}
++                  placeholder="e.g. research_team"
++                  className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary" />
++              </div>
++              <div>
++                <label className="block text-[11px] font-medium text-muted-foreground mb-1">Task <span className="text-muted-foreground/40">(optional)</span></label>
++                <input type="text" value={colonyTask} onChange={(e) => setColonyTask(e.target.value)}
++                  placeholder="Describe what this colony should work on"
++                  className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary" />
++              </div>
++            </div>
++            <div className="flex justify-end gap-2 pt-2">
++              <button onClick={() => { setColonyDialogOpen(false); setColonyName(""); setColonyTask(""); }} disabled={creatingColony}
++                className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50">
++                Cancel
++              </button>
++              <button onClick={handleCreateColony} disabled={creatingColony || !colonyName.trim()}
++                className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
++                {creatingColony ? "Creating..." : "Create"}
++              </button>
++            </div>
++          </div>
++        </div>
++      )}
+     </aside>
+   );
+ }
+diff --git a/core/frontend/src/components/SettingsModal.tsx b/core/frontend/src/components/SettingsModal.tsx
+index d6333880..47595829 100644
+--- a/core/frontend/src/components/SettingsModal.tsx
++++ b/core/frontend/src/components/SettingsModal.tsx
+@@ -6,11 +6,12 @@ import { useModel, LLM_PROVIDERS } from "@/context/ModelContext";
+ import { credentialsApi } from "@/api/credentials";
+ import { configApi, type ModelOption } from "@/api/config";
+ import { compressImage } from "@/lib/image-utils";
++import McpServersPanel from "./McpServersPanel";
+ 
+ interface SettingsModalProps {
+   open: boolean;
+   onClose: () => void;
+-  initialSection?: "profile" | "byok";
++  initialSection?: "profile" | "byok" | "mcp";
+ }
+ 
+ function ValidationBadge({ state }: { state: "validating" | { valid: boolean | null; message: string } | undefined }) {
+@@ -37,7 +38,7 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
+ 
+   const [displayName, setDisplayName] = useState(userProfile.displayName);
+   const [about, setAbout] = useState(userProfile.about);
+-  const [activeSection, setActiveSection] = useState<"profile" | "byok">(initialSection || "profile");
++  const [activeSection, setActiveSection] = useState<"profile" | "byok" | "mcp">(initialSection || "profile");
+   const [editingProvider, setEditingProvider] = useState<string | null>(null);
+   const [keyInput, setKeyInput] = useState("");
+   const [showKey, setShowKey] = useState(false);
+@@ -187,6 +188,12 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
+             >
+               BYOK
+             </button>
++            <button
++              onClick={() => setActiveSection("mcp")}
++              className={`text-left text-sm px-3 py-1.5 rounded-md ${activeSection === "mcp" ? "bg-primary/15 text-primary font-medium" : "text-muted-foreground hover:text-foreground hover:bg-muted/30"}`}
++            >
++              MCP Servers
++            </button>
+           </div>
+         </div>
+ 
+@@ -267,6 +274,8 @@ export default function SettingsModal({ open, onClose, initialSection }: Setting
+               </>
+             )}
+ 
++            {activeSection === "mcp" && <McpServersPanel />}
++
+             {activeSection === "byok" && (
+               <>
+                 <div>
+diff --git a/core/frontend/src/lib/chat-helpers.test.ts b/core/frontend/src/lib/chat-helpers.test.ts
+index b9f1e9aa..6374a7eb 100644
+--- a/core/frontend/src/lib/chat-helpers.test.ts
++++ b/core/frontend/src/lib/chat-helpers.test.ts
+@@ -1,5 +1,10 @@
+ import { describe, it, expect } from "vitest";
+-import { sseEventToChatMessage, formatAgentDisplayName } from "./chat-helpers";
++import {
++  extractLastPhase,
++  sseEventToChatMessage,
++  formatAgentDisplayName,
++  replayEventsToMessages,
++} from "./chat-helpers";
+ import type { AgentEvent } from "@/api/types";
+ 
+ // ---------------------------------------------------------------------------
+@@ -327,18 +332,6 @@ describe("sseEventToChatMessage", () => {
+     expect(result!.content).toBe("do the thing");
+   });
+ 
+-  it("captures client_message_id for optimistic user reconciliation", () => {
+-    const event = makeEvent({
+-      type: "client_input_received",
+-      node_id: "queen",
+-      execution_id: "abc",
+-      data: { content: "do the thing", client_message_id: "msg-123" },
+-    });
+-    const result = sseEventToChatMessage(event, "t");
+-    expect(result).not.toBeNull();
+-    expect(result!.clientMessageId).toBe("msg-123");
+-  });
+-
+   it("returns null for client_input_received with empty content", () => {
+     const event = makeEvent({
+       type: "client_input_received",
+@@ -426,6 +419,228 @@ describe("sseEventToChatMessage", () => {
+   });
+ });
+ 
++// ---------------------------------------------------------------------------
++// replayEventsToMessages
++// ---------------------------------------------------------------------------
++
++describe("replayEventsToMessages", () => {
++  it("merges queen inner turns from the same iteration into one restored bubble", () => {
++    const events = [
++      makeEvent({
++        type: "client_output_delta",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-1",
++        timestamp: "2026-04-20T12:45:25.234Z",
++        data: {
++          snapshot: "I will create the ERD.",
++          iteration: 0,
++          inner_turn: 0,
++        },
++      }),
++      makeEvent({
++        type: "tool_call_started",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-1",
++        timestamp: "2026-04-20T12:45:25.238Z",
++        data: {
++          tool_name: "write_file",
++          tool_use_id: "tool-1",
++        },
++      }),
++      makeEvent({
++        type: "tool_call_completed",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-1",
++        timestamp: "2026-04-20T12:45:25.250Z",
++        data: {
++          tool_name: "write_file",
++          tool_use_id: "tool-1",
++          result: "ok",
++        },
++      }),
++      makeEvent({
++        type: "client_output_delta",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-1",
++        timestamp: "2026-04-20T12:46:07.911Z",
++        data: {
++          snapshot: "Saved to `database_erd.md`.",
++          iteration: 0,
++          inner_turn: 2,
++        },
++      }),
++    ];
++
++    const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
++    const queenMessages = restored.filter(
++      (m) => m.role === "queen" && !m.type,
++    );
++
++    expect(queenMessages).toHaveLength(1);
++    expect(queenMessages[0].id).toBe("queen-stream-session-1-0");
++    expect(queenMessages[0].content).toBe(
++      "I will create the ERD.\nSaved to `database_erd.md`.",
++    );
++    expect(queenMessages[0].createdAt).toBe(
++      new Date("2026-04-20T12:45:25.234Z").getTime(),
++    );
++  });
++
++  it("keeps worker inner turns as distinct restored bubbles", () => {
++    const events = [
++      makeEvent({
++        type: "llm_text_delta",
++        stream_id: "worker",
++        node_id: "research",
++        execution_id: "session-1",
++        data: { snapshot: "First pass", iteration: 0, inner_turn: 0 },
++      }),
++      makeEvent({
++        type: "llm_text_delta",
++        stream_id: "worker",
++        node_id: "research",
++        execution_id: "session-1",
++        data: { snapshot: "After tool", iteration: 0, inner_turn: 1 },
++      }),
++    ];
++
++    const restored = replayEventsToMessages(events, "agent", "Research Agent");
++
++    expect(restored.map((m) => m.id)).toEqual([
++      "stream-session-1-0-research",
++      "stream-session-1-0-t1-research",
++    ]);
++  });
++
++  it("does not carry completed queen tools into a scheduler run", () => {
++    const events = [
++      makeEvent({
++        type: "tool_call_started",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-setup",
++        data: { tool_name: "create_colony", tool_use_id: "tool-create" },
++      }),
++      makeEvent({
++        type: "tool_call_completed",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-setup",
++        data: { tool_name: "create_colony", tool_use_id: "tool-create" },
++      }),
++      makeEvent({
++        type: "llm_turn_complete",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-setup",
++      }),
++      makeEvent({
++        type: "node_loop_started",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-scheduler",
++      }),
++      makeEvent({
++        type: "tool_call_started",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-scheduler",
++        data: {
++          tool_name: "list_worker_questions",
++          tool_use_id: "tool-questions",
++        },
++      }),
++      makeEvent({
++        type: "tool_call_started",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-scheduler",
++        data: { tool_name: "get_worker_status", tool_use_id: "tool-status" },
++      }),
++      makeEvent({
++        type: "tool_call_completed",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-scheduler",
++        data: {
++          tool_name: "list_worker_questions",
++          tool_use_id: "tool-questions",
++        },
++      }),
++      makeEvent({
++        type: "tool_call_completed",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "session-scheduler",
++        data: { tool_name: "get_worker_status", tool_use_id: "tool-status" },
++      }),
++    ];
++
++    const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
++    const schedulerToolRow = restored.find(
++      (m) => m.id === "tool-pill-queen-session-scheduler-1",
++    );
++
++    expect(schedulerToolRow).toBeDefined();
++    expect(JSON.parse(schedulerToolRow!.content)).toEqual({
++      tools: [
++        { name: "list_worker_questions", done: true },
++        { name: "get_worker_status", done: true },
++      ],
++      allDone: true,
++    });
++  });
++
++  it("uses execution id when resolving tool completions", () => {
++    const events = [
++      makeEvent({
++        type: "tool_call_started",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "exec-a",
++        data: { tool_name: "first_run_tool", tool_use_id: "shared-id" },
++      }),
++      makeEvent({
++        type: "tool_call_started",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "exec-b",
++        data: { tool_name: "second_run_tool", tool_use_id: "shared-id" },
++      }),
++      makeEvent({
++        type: "tool_call_completed",
++        stream_id: "queen",
++        node_id: "queen",
++        execution_id: "exec-a",
++        data: { tool_name: "first_run_tool", tool_use_id: "shared-id" },
++      }),
++    ];
++
++    const restored = replayEventsToMessages(events, "queen-dm", "Alexandra");
++    const firstRunRow = restored.find(
++      (m) => m.id === "tool-pill-queen-exec-a-0",
++    );
++    const secondRunRow = restored.find(
++      (m) => m.id === "tool-pill-queen-exec-b-0",
++    );
++
++    expect(firstRunRow).toBeDefined();
++    expect(secondRunRow).toBeDefined();
++    expect(JSON.parse(firstRunRow!.content)).toEqual({
++      tools: [{ name: "first_run_tool", done: true }],
++      allDone: true,
++    });
++    expect(JSON.parse(secondRunRow!.content)).toEqual({
++      tools: [{ name: "second_run_tool", done: false }],
++      allDone: false,
++    });
++  });
++});
++
+ // ---------------------------------------------------------------------------
+ // formatAgentDisplayName
+ // ---------------------------------------------------------------------------
+@@ -455,3 +670,35 @@ describe("formatAgentDisplayName", () => {
+     expect(formatAgentDisplayName("agent")).toBe("Agent");
+   });
+ });
++
++// ---------------------------------------------------------------------------
++// extractLastPhase
++// ---------------------------------------------------------------------------
++
++describe("extractLastPhase", () => {
++  it("keeps incubating as a valid queen phase", () => {
++    expect(
++      extractLastPhase([
++        makeEvent({
++          type: "queen_phase_changed",
++          data: { phase: "independent" },
++        }),
++        makeEvent({
++          type: "queen_phase_changed",
++          data: { phase: "incubating" },
++        }),
++      ]),
++    ).toBe("incubating");
++  });
++
++  it("reads phase metadata from node loop iterations", () => {
++    expect(
++      extractLastPhase([
++        makeEvent({
++          type: "node_loop_iteration",
++          data: { phase: "working" },
++        }),
++      ]),
++    ).toBe("working");
++  });
++});
+diff --git a/core/frontend/src/lib/chat-helpers.ts b/core/frontend/src/lib/chat-helpers.ts
+index 60cbe041..d893059c 100644
+--- a/core/frontend/src/lib/chat-helpers.ts
++++ b/core/frontend/src/lib/chat-helpers.ts
+@@ -147,9 +147,6 @@ export function sseEventToChatMessage(
+     case "client_input_received": {
+       const userContent = (event.data?.content as string) || "";
+       if (!userContent) return null;
+-      const clientMessageIdRaw = event.data?.client_message_id;
+-      const clientMessageId =
+-        typeof clientMessageIdRaw === "string" ? clientMessageIdRaw.trim() : "";
+       return {
+         id: `user-input-${event.timestamp}`,
+         agent: "You",
+@@ -159,8 +156,10 @@ export function sseEventToChatMessage(
+         type: "user",
+         thread,
+         createdAt,
++        // Carrying execution_id here lets the optimistic-message reconciler
++        // distinguish server-echoed user bubbles from still-unflushed ones.
++        executionId: event.execution_id || undefined,
+         streamId: event.stream_id || undefined,
+-        clientMessageId: clientMessageId || undefined,
+       };
+     }
+ 
+@@ -215,6 +214,34 @@ export function sseEventToChatMessage(
+       };
+     }
+ 
++    case "trigger_fired": {
++      // Surface each scheduler/webhook fire as a banner in the chat, so the
++      // user can see exactly when the queen was invoked by a trigger vs. by
++      // a typed message. The banner sits at the start of the turn the queen
++      // is about to run in response.
++      const triggerId = event.data?.trigger_id as string | undefined;
++      if (!triggerId) return null;
++      const payload = {
++        trigger_id: triggerId,
++        trigger_type: event.data?.trigger_type as string | undefined,
++        name: event.data?.name as string | undefined,
++        task: event.data?.task as string | undefined,
++        fire_count: event.data?.fire_count as number | undefined,
++        last_fired_at: event.data?.last_fired_at as number | undefined,
++      };
++      return {
++        id: `trigger-${triggerId}-${payload.last_fired_at ?? event.timestamp}`,
++        agent: "Trigger",
++        agentColor: "",
++        content: JSON.stringify(payload),
++        timestamp: "",
++        type: "trigger",
++        thread,
++        createdAt,
++        streamId: event.stream_id || undefined,
++      };
++    }
++
+     default:
+       return null;
+   }
+@@ -226,22 +253,50 @@ export function sseEventToChatMessage(
+ 
+ /**
+  * State maintained while replaying an event stream. Tracks per-stream turn
+- * counters, the set of active tool calls (so tool_status pill content
+- * reflects "tool A done, tool B running" correctly), and a tool_use_id →
+- * pill_msg_id map so deferred `tool_call_completed` events can find the
+- * pill they belong to after the turn counter moves on.
++ * counters, materialized tool rows, and a pending tool_use_id → row map so
++ * deferred `tool_call_completed` events can find the exact pill they belong
++ * to after the turn counter moves on.
+  */
++type ToolRowState = {
++  streamId: string;
++  executionId: string;
++  tools: Record<string, { name: string; done: boolean }>;
++};
++
+ export interface ReplayState {
+   turnCounters: Record<string, number>;
+-  activeToolCalls: Record<
++  toolRows: Record<string, ToolRowState>;
++  toolUseToPill: Record<
+     string,
+-    { name: string; done: boolean; streamId: string }
++    { msgId: string; toolKey: string; name: string }
+   >;
+-  toolUseToPill: Record<string, { msgId: string; name: string }>;
++  queenIterText: Record<string, Record<number, string>>;
+ }
+ 
+ export function newReplayState(): ReplayState {
+-  return { turnCounters: {}, activeToolCalls: {}, toolUseToPill: {} };
++  return {
++    turnCounters: {},
++    toolRows: {},
++    toolUseToPill: {},
++    queenIterText: {},
++  };
++}
++
++function toolLookupKey(
++  streamId: string,
++  executionId: string | null | undefined,
++  toolUseId: string,
++): string {
++  return `${streamId}:${executionId || "exec"}:${toolUseId}`;
++}
++
++function toolRowContent(row: ToolRowState): string {
++  const tools = Object.values(row.tools).map((t) => ({
++    name: t.name,
++    done: t.done,
++  }));
++  const allDone = tools.length > 0 && tools.every((t) => t.done);
++  return JSON.stringify({ tools, allDone });
+ }
+ 
+ /**
+@@ -267,9 +322,11 @@ export function replayEvent(
+   event: AgentEvent,
+   thread: string,
+   agentDisplayName: string | undefined,
++  queenDisplayName?: string,
+ ): ChatMessage[] {
+   const streamId = event.stream_id;
+   const isQueen = streamId === "queen";
++  const effectiveName = isQueen ? (queenDisplayName || agentDisplayName) : agentDisplayName;
+   const role: "queen" | "worker" = isQueen ? "queen" : "worker";
+   const turnKey = streamId;
+   const currentTurn = state.turnCounters[turnKey] ?? 0;
+@@ -279,21 +336,12 @@ export function replayEvent(
+ 
+   const out: ChatMessage[] = [];
+ 
+-  // Update state machine BEFORE the generic converter runs so the
+-  // regular message emitted for this event sees the post-update
+-  // counter (matches live handler ordering at colony-chat.tsx:525).
++  // Update state machine BEFORE the generic converter runs so regular
++  // messages and synthesized tool pills use the same turn counters in
++  // both live SSE handling and cold replay.
+   switch (event.type) {
+     case "execution_started":
+       state.turnCounters[turnKey] = currentTurn + 1;
+-      // New execution for a worker resets its active tools, mirroring
+-      // the live handler's setAgentState at colony-chat.tsx:566.
+-      if (!isQueen) {
+-        const keepActive: typeof state.activeToolCalls = {};
+-        for (const [k, v] of Object.entries(state.activeToolCalls)) {
+-          if (v.streamId !== streamId) keepActive[k] = v;
+-        }
+-        state.activeToolCalls = keepActive;
+-      }
+       break;
+     case "llm_turn_complete":
+       state.turnCounters[turnKey] = currentTurn + 1;
+@@ -302,24 +350,31 @@ export function replayEvent(
+       if (!event.node_id) break;
+       const toolName = (event.data?.tool_name as string) || "unknown";
+       const toolUseId = (event.data?.tool_use_id as string) || "";
+-      state.activeToolCalls[toolUseId] = {
++      const pillId = `tool-pill-${streamId}-${event.execution_id || "exec"}-${currentTurn}`;
++      const row =
++        state.toolRows[pillId] ||
++        (state.toolRows[pillId] = {
++          streamId,
++          executionId: event.execution_id || "exec",
++          tools: {},
++        });
++      const toolKey = toolUseId || `anonymous-${Object.keys(row.tools).length}`;
++      row.tools[toolKey] = {
+         name: toolName,
+         done: false,
+-        streamId,
+       };
+-      const pillId = `tool-pill-${streamId}-${event.execution_id || "exec"}-${currentTurn}`;
+       if (toolUseId) {
+-        state.toolUseToPill[toolUseId] = { msgId: pillId, name: toolName };
++        state.toolUseToPill[toolLookupKey(streamId, event.execution_id, toolUseId)] = {
++          msgId: pillId,
++          toolKey,
++          name: toolName,
++        };
+       }
+-      const tools = Object.values(state.activeToolCalls)
+-        .filter((t) => t.streamId === streamId)
+-        .map((t) => ({ name: t.name, done: t.done }));
+-      const allDone = tools.length > 0 && tools.every((t) => t.done);
+       out.push({
+         id: pillId,
+-        agent: agentDisplayName || event.node_id || "Agent",
++        agent: effectiveName || event.node_id || "Agent",
+         agentColor: "",
+-        content: JSON.stringify({ tools, allDone }),
++        content: toolRowContent(row),
+         timestamp: "",
+         type: "tool_status",
+         role,
+@@ -334,23 +389,21 @@ export function replayEvent(
+     case "tool_call_completed": {
+       if (!event.node_id) break;
+       const toolUseId = (event.data?.tool_use_id as string) || "";
+-      const tracked = state.toolUseToPill[toolUseId];
+-      if (toolUseId) delete state.toolUseToPill[toolUseId];
+-      if (toolUseId && state.activeToolCalls[toolUseId]) {
+-        state.activeToolCalls[toolUseId].done = true;
+-      }
++      const lookupKey = toolLookupKey(streamId, event.execution_id, toolUseId);
++      const tracked = state.toolUseToPill[lookupKey];
++      if (toolUseId) delete state.toolUseToPill[lookupKey];
+       if (!tracked) break;
+-      const tools = Object.values(state.activeToolCalls)
+-        .filter((t) => t.streamId === streamId)
+-        .map((t) => ({ name: t.name, done: t.done }));
+-      const allDone = tools.length > 0 && tools.every((t) => t.done);
+-      // Re-emit the SAME pill id with updated content. Caller upserts
+-      // by id, so this replaces the row from tool_call_started.
++      const row = state.toolRows[tracked.msgId];
++      if (!row) break;
++      row.tools[tracked.toolKey] = {
++        name: row.tools[tracked.toolKey]?.name || tracked.name,
++        done: true,
++      };
+       out.push({
+         id: tracked.msgId,
+-        agent: agentDisplayName || event.node_id || "Agent",
++        agent: effectiveName || event.node_id || "Agent",
+         agentColor: "",
+-        content: JSON.stringify({ tools, allDone }),
++        content: toolRowContent(row),
+         timestamp: "",
+         type: "tool_status",
+         role,
+@@ -368,11 +421,31 @@ export function replayEvent(
+   const msg = sseEventToChatMessage(
+     event,
+     thread,
+-    agentDisplayName,
++    effectiveName,
+     state.turnCounters[turnKey] ?? 0,
+   );
+   if (msg) {
+-    if (isQueen) msg.role = "queen";
++    if (isQueen) {
++      msg.role = "queen";
++      if (
++        event.execution_id &&
++        (event.type === "client_output_delta" || event.type === "llm_text_delta")
++      ) {
++        const iter = (event.data?.iteration as number | undefined) ?? 0;
++        const inner = (event.data?.inner_turn as number | undefined) ?? 0;
++        const iterKey = `${event.execution_id}:${iter}`;
++        if (!state.queenIterText[iterKey]) {
++          state.queenIterText[iterKey] = {};
++        }
++        state.queenIterText[iterKey][inner] = msg.content;
++        const parts = state.queenIterText[iterKey];
++        const sorted = Object.keys(parts)
++          .map(Number)
++          .sort((a, b) => a - b);
++        msg.content = sorted.map((k) => parts[k]).join("\n");
++        msg.id = `queen-stream-${event.execution_id}-${iter}`;
++      }
++    }
+     out.push(msg);
+   }
+ 
+@@ -383,27 +456,101 @@ export function replayEvent(
+  * Replay an entire event array and return a deduplicated, chronologically
+  * sorted ChatMessage list. Used by cold-restore paths so refreshed
+  * sessions match the live stream exactly.
++ *
++ * If the events stream contains a ``colony_fork_marker`` event (emitted
++ * by ``fork_session_into_colony`` after compacting the parent transcript),
++ * every message produced from events PRECEDING the marker is folded into
++ * a single ``inherited_block`` ChatMessage. The colony page renders that
++ * block as a collapsible widget so the inherited DM history is one click
++ * away without dominating the colony's own chat.
+  */
+ export function replayEventsToMessages(
+   events: AgentEvent[],
+   thread: string,
+   agentDisplayName: string | undefined,
++  queenDisplayName?: string,
++  state: ReplayState = newReplayState(),
+ ): ChatMessage[] {
+-  const state = newReplayState();
+   // Upsert by id — later emissions for the same pill replace earlier ones.
+   const byId = new Map<string, ChatMessage>();
++
++  // Track the marker (if any) and which message ids belong to the
++  // inherited prefix. A single fork can only happen once per session so
++  // we only need to remember the first marker we encounter.
++  let markerEvent: AgentEvent | null = null;
++  let markerCreatedAt: number | null = null;
++  const inheritedIds = new Set<string>();
++
+   for (const evt of events) {
+-    for (const m of replayEvent(state, evt, thread, agentDisplayName)) {
+-      byId.set(m.id, m);
++    if (evt.type === "colony_fork_marker") {
++      if (markerEvent === null) {
++        markerEvent = evt;
++        markerCreatedAt = evt.timestamp
++          ? new Date(evt.timestamp).getTime()
++          : Date.now();
++        // Snapshot every id seen so far — those are the ones to fold
++        // into the inherited block.
++        for (const id of byId.keys()) inheritedIds.add(id);
++      }
++      continue;
++    }
++    for (const m of replayEvent(state, evt, thread, agentDisplayName, queenDisplayName)) {
++      const previous = byId.get(m.id);
++      byId.set(
++        m.id,
++        previous ? { ...m, createdAt: previous.createdAt ?? m.createdAt } : m,
++      );
+     }
+   }
+-  return Array.from(byId.values()).sort(
++
++  const all = Array.from(byId.values()).sort(
+     (a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0),
+   );
++
++  if (markerEvent === null || inheritedIds.size === 0) return all;
++
++  const inherited: ChatMessage[] = [];
++  const native: ChatMessage[] = [];
++  for (const msg of all) {
++    if (inheritedIds.has(msg.id)) inherited.push(msg);
++    else native.push(msg);
++  }
++  if (inherited.length === 0) return all;
++
++  const markerData = markerEvent.data || {};
++  const block: ChatMessage = {
++    id: `inherited-block-${markerEvent.timestamp || "fork"}`,
++    agent: "System",
++    agentColor: "",
++    type: "inherited_block",
++    content: JSON.stringify({
++      parent_session_id: markerData.parent_session_id ?? null,
++      fork_time: markerData.fork_time ?? markerEvent.timestamp ?? null,
++      summary_preview: markerData.summary_preview ?? "",
++      inherited_message_count:
++        typeof markerData.inherited_message_count === "number"
++          ? markerData.inherited_message_count
++          : inherited.length,
++      messages: inherited,
++    }),
++    timestamp: markerEvent.timestamp || "",
++    thread,
++    // Place the block at the marker's timestamp so it sorts immediately
++    // before the first native message (the marker is always written
++    // AFTER the inherited content).
++    createdAt: markerCreatedAt ?? inherited[inherited.length - 1].createdAt ?? 0,
++  };
++
++  return [block, ...native];
+ }
+ 
+-type QueenPhase = "planning" | "building" | "staging" | "running" | "independent";
+-const VALID_PHASES = new Set<string>(["planning", "building", "staging", "running", "independent"]);
++type QueenPhase = "independent" | "incubating" | "working" | "reviewing";
++const VALID_PHASES = new Set<string>([
++  "independent",
++  "incubating",
++  "working",
++  "reviewing",
++]);
+ 
+ /**
+  * Scan an array of persisted events and return the last queen phase seen,
+diff --git a/core/frontend/src/lib/colony-session-restore.ts b/core/frontend/src/lib/colony-session-restore.ts
+index 48bcab41..1e55d5b2 100644
+--- a/core/frontend/src/lib/colony-session-restore.ts
++++ b/core/frontend/src/lib/colony-session-restore.ts
+@@ -1,4 +1,11 @@
+-export type ColonyRestorePhase = "independent" | "working" | "reviewing";
++// "incubating" is queen-DM-only; the colony page never enters it (the queen
++// auto-switches back to independent before the lock fires). Keep it in the
++// union so the type lines up with LiveSession.queen_phase.
++export type ColonyRestorePhase =
++  | "independent"
++  | "incubating"
++  | "working"
++  | "reviewing";
+ 
+ export function shouldUsePrefetchedColonyRestore(
+   prefetchedSessionId: string | undefined,
+diff --git a/core/frontend/src/pages/colony-chat.tsx b/core/frontend/src/pages/colony-chat.tsx
+index ab509577..50ac04b2 100644
+--- a/core/frontend/src/pages/colony-chat.tsx
++++ b/core/frontend/src/pages/colony-chat.tsx
+@@ -10,11 +10,14 @@ import CredentialsModal, {
+ import { executionApi } from "@/api/execution";
+ import { sessionsApi } from "@/api/sessions";
+ import { useMultiSSE } from "@/hooks/use-sse";
++import { usePendingQueue } from "@/hooks/use-pending-queue";
+ import type { LiveSession, AgentEvent } from "@/api/types";
+ import {
+-  sseEventToChatMessage,
+   formatAgentDisplayName,
++  newReplayState,
++  replayEvent,
+   replayEventsToMessages,
++  type ReplayState,
+ } from "@/lib/chat-helpers";
+ import {
+   resolveInitialColonyPhase,
+@@ -47,7 +50,8 @@ function truncate(s: string, max: number): string {
+ 
+ type SessionRestoreResult = {
+   messages: ChatMessage[];
+-  restoredPhase: "independent" | "working" | "reviewing" | null;
++  replayState: ReplayState;
++  restoredPhase: "independent" | "incubating" | "working" | "reviewing" | null;
+   truncated: boolean;
+   droppedCount: number;
+ };
+@@ -56,6 +60,7 @@ async function restoreSessionMessages(
+   sessionId: string,
+   thread: string,
+   agentDisplayName: string,
++  queenDisplayName?: string,
+ ): Promise<SessionRestoreResult> {
+   try {
+     const { events, truncated, total, returned } =
+@@ -81,7 +86,14 @@ async function restoreSessionMessages(
+         }
+       }
+ 
+-      const messages = replayEventsToMessages(events, thread, agentDisplayName);
++      const replayState = newReplayState();
++      const messages = replayEventsToMessages(
++        events,
++        thread,
++        agentDisplayName,
++        queenDisplayName,
++        replayState,
++      );
+       // Stamp the latest phase on every queen message so the UI's
+       // phase-badge rendering matches what the live path would have
+       // displayed at the time of the refresh.
+@@ -110,6 +122,7 @@ async function restoreSessionMessages(
+       }
+       return {
+         messages,
++        replayState,
+         restoredPhase: runningPhase ?? null,
+         truncated,
+         droppedCount,
+@@ -118,7 +131,13 @@ async function restoreSessionMessages(
+   } catch {
+     // Event log not available
+   }
+-  return { messages: [], restoredPhase: null, truncated: false, droppedCount: 0 };
++  return {
++    messages: [],
++    replayState: newReplayState(),
++    restoredPhase: null,
++    truncated: false,
++    droppedCount: 0,
++  };
+ }
+ 
+ // ── Agent backend state ──────────────────────────────────────────────────────
+@@ -139,7 +158,7 @@ interface AgentState {
+   displayName: string | null;
+   awaitingInput: boolean;
+   workerInputMessageId: string | null;
+-  queenPhase: "independent" | "working" | "reviewing";
++  queenPhase: "independent" | "incubating" | "working" | "reviewing";
+   agentPath: string | null;
+   currentRunId: string | null;
+   nodeLogs: Record<string, string[]>;
+@@ -155,9 +174,6 @@ interface AgentState {
+   queenIsTyping: boolean;
+   workerIsTyping: boolean;
+   llmSnapshots: Record<string, string>;
+-  activeToolCalls: Record<string, { name: string; done: boolean; streamId: string }>;
+-  pendingQuestion: string | null;
+-  pendingOptions: string[] | null;
+   pendingQuestions: { id: string; prompt: string; options?: string[] }[] | null;
+   pendingQuestionSource: "queen" | null;
+   contextUsage: Record<
+@@ -189,9 +205,6 @@ function defaultAgentState(): AgentState {
+     queenIsTyping: false,
+     workerIsTyping: false,
+     llmSnapshots: {},
+-    activeToolCalls: {},
+-    pendingQuestion: null,
+-    pendingOptions: null,
+     pendingQuestions: null,
+     pendingQuestionSource: null,
+     contextUsage: {},
+@@ -204,7 +217,7 @@ function defaultAgentState(): AgentState {
+ export default function ColonyChat() {
+   const { colonyId } = useParams<{ colonyId: string }>();
+   const location = useLocation();
+-  const { colonies, markVisited, refresh: refreshColonies } = useColony();
++  const { colonies, queenProfiles, markVisited, refresh: refreshColonies } = useColony();
+   const { setActions } = useHeaderActions();
+   const { toggleColonyWorkers } = useColonyWorkers();
+ 
+@@ -219,7 +232,14 @@ export default function ColonyChat() {
+   const colony = colonies.find((c) => c.id === colonyId);
+   const agentPath = colony?.agentPath ?? routeState.agentPath ?? "";
+   const slug = agentPath ? agentSlug(agentPath) : "";
+-  const queenInfo = getQueenForAgent(slug);
++  const fallbackQueenInfo = getQueenForAgent(slug);
++  // Resolve queen name from the linked queen profile, falling back to registry
++  const linkedQueenProfile = colony?.queenProfileId
++    ? queenProfiles.find((q) => q.id === colony.queenProfileId)
++    : null;
++  const queenInfo = linkedQueenProfile
++    ? { name: linkedQueenProfile.name, role: linkedQueenProfile.title }
++    : fallbackQueenInfo;
+   const colonyName = colony?.name ?? colonyId ?? "Colony";
+ 
+   // Mark colony as visited when navigating to it
+@@ -297,15 +317,15 @@ export default function ColonyChat() {
+   const agentStateRef = useRef(agentState);
+   agentStateRef.current = agentState;
+ 
+-  const turnCounterRef = useRef<Record<string, number>>({});
+-  // Maps tool_use_id → the pill message ID and tool name that was created for it.
+-  // Survives turn counter resets so deferred completions (e.g. ask_user) can
+-  // find and update the correct pill even after the counter changes.
+-  const toolUseToPillRef = useRef<
+-    Record<string, { msgId: string; name: string }>
+-  >({});
++  const replayStateRef = useRef(newReplayState());
++  // Timestamp of the latest restored message — SSE events older than this
++  // are duplicates from the ring-buffer replay and should be skipped.
++  const restoreCutoffRef = useRef<number>(0);
+   const queenPhaseRef = useRef<string>("independent");
+-  const queenIterTextRef = useRef<Record<string, Record<number, string>>>({});
++  // Flipped true by the auto-flush path; consumed by the next empty-prompt
++  // client_input_requested so we don't flicker the typing bubble off while
++  // the queen is about to resume on the flushed input.
++  const queenAboutToResumeRef = useRef(false);
+   const suppressIntroRef = useRef(false);
+   const loadingRef = useRef(false);
+ 
+@@ -325,34 +345,17 @@ export default function ColonyChat() {
+           );
+         }
+         if (options?.reconcileOptimisticUser && chatMsg.type === "user" && prev.length > 0) {
+-          const incomingClientMessageId = chatMsg.clientMessageId?.trim();
+-          if (incomingClientMessageId) {
+-            const byClientIdIdx = prev.findIndex(
+-              (m) =>
+-                m.type === "user" &&
+-                (m.clientMessageId?.trim() || "") === incomingClientMessageId,
+-            );
+-            if (byClientIdIdx !== -1) {
+-              return prev.map((m, i) =>
+-                i === byClientIdIdx ? { ...m, id: chatMsg.id, queued: undefined } : m,
+-              );
+-            }
+-          }
+-          // Match by content + timestamp across the whole list (not just
+-          // the last slot) so a queued user message still reconciles
+-          // even when the queen's previous reply slotted in between.
+-          // Also drops the "queued" indicator since the backend has
+-          // now confirmed receipt.
+-          const incomingTs = chatMsg.createdAt ?? Date.now();
+-          const matchIdx = prev.findIndex(
+-            (m) =>
+-              m.type === "user" &&
+-              m.content === chatMsg.content &&
+-              Math.abs(incomingTs - (m.createdAt ?? incomingTs)) <= 15000,
++          // Optimistic user bubbles have no executionId; server echoes do.
++          // Match the oldest unreconciled optimistic with the same content —
++          // that's the FIFO-correct pick for both auto-flush and Steer.
++          const idx = prev.findIndex(
++            (m) => m.type === "user" && !m.executionId && m.content === chatMsg.content,
+           );
+-          if (matchIdx !== -1) {
++          if (idx !== -1) {
+             return prev.map((m, i) =>
+-              i === matchIdx ? { ...m, id: chatMsg.id, queued: undefined } : m,
++              i === idx
++                ? { ...m, id: chatMsg.id, executionId: chatMsg.executionId }
++                : m,
+             );
+           }
+         }
+@@ -469,7 +472,7 @@ export default function ColonyChat() {
+         }
+       }
+ 
+-      let restoredPhase: "independent" | "working" | "reviewing" | null = null;
++      let restoredPhase: "independent" | "incubating" | "working" | "reviewing" | null = null;
+ 
+       if (!liveSession) {
+         if (coldRestoreId) {
+@@ -478,6 +481,7 @@ export default function ColonyChat() {
+             coldRestoreId,
+             agentPath,
+             displayName,
++            queenInfo.name,
+           );
+         }
+ 
+@@ -492,6 +496,7 @@ export default function ColonyChat() {
+       const session = liveSession!;
+       const displayName = formatAgentDisplayName(session.colony_name || agentPath);
+       let restoredMessages: ChatMessage[] = [];
++      let restoredReplayState: ReplayState | null = null;
+       const reusePrefetchedRestore = shouldUsePrefetchedColonyRestore(
+         coldRestoreId,
+         session.session_id,
+@@ -503,14 +508,17 @@ export default function ColonyChat() {
+           session.session_id,
+           agentPath,
+           displayName,
++          queenInfo.name,
+         );
+         if (restored.messages.length > 0) {
+           restoredMessages = restored.messages;
+         }
++        restoredReplayState = restored.replayState;
+         restoredPhase = restored.restoredPhase;
+       } else if (prefetchedRestore) {
+         if (reusePrefetchedRestore) {
+           restoredMessages = prefetchedRestore.messages;
++          restoredReplayState = prefetchedRestore.replayState;
+           restoredPhase = prefetchedRestore.restoredPhase;
+         } else {
+           // The backend corrected the resume target to the colony's forked
+@@ -520,15 +528,24 @@ export default function ColonyChat() {
+             session.session_id,
+             agentPath,
+             displayName,
++            queenInfo.name,
+           );
+           restoredMessages = restored.messages;
++          restoredReplayState = restored.replayState;
+           restoredPhase = restored.restoredPhase;
+         }
+       }
+ 
++      if (restoredReplayState) {
++        replayStateRef.current = restoredReplayState;
++      }
++
+       if (restoredMessages.length > 0) {
+         restoredMessages.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+         setMessages(restoredMessages);
++        // Record the latest restored timestamp so SSE replay duplicates are skipped
++        const maxTs = Math.max(...restoredMessages.map((m) => m.createdAt ?? 0));
++        restoreCutoffRef.current = maxTs;
+       }
+ 
+       const initialPhase = resolveInitialColonyPhase({
+@@ -576,11 +593,10 @@ export default function ColonyChat() {
+       setMessages([]);
+       setGraphNodes([]);
+       setAgentState(defaultAgentState());
+-      turnCounterRef.current = {};
+-      toolUseToPillRef.current = {};
++      replayStateRef.current = newReplayState();
+       queenPhaseRef.current = "independent";
+-      queenIterTextRef.current = {};
+       suppressIntroRef.current = false;
++      restoreCutoffRef.current = 0;
+       loadingRef.current = false;
+       loadSession();
+     }
+@@ -595,20 +611,32 @@ export default function ColonyChat() {
+       const suppressQueenMessages = isQueen && suppressIntroRef.current;
+       const state = agentStateRef.current;
+       const agentDisplayName = state.displayName;
+-      const displayName = isQueen ? queenInfo.name : agentDisplayName || undefined;
+-      const role = isQueen ? ("queen" as const) : ("worker" as const);
+       const ts = fmtLogTs(event.timestamp);
+-      const turnKey = streamId;
+-      const currentTurn = turnCounterRef.current[turnKey] ?? 0;
+       const eventCreatedAt = event.timestamp
+         ? new Date(event.timestamp).getTime()
+         : Date.now();
++
++      // Skip SSE replay events that were already restored from history
++      if (
++        restoreCutoffRef.current > 0 &&
++        eventCreatedAt <= restoreCutoffRef.current &&
++        (event.type === "client_output_delta" || event.type === "llm_text_delta" || event.type === "client_input_received")
++      ) {
++        return;
++      }
++
+       const shouldMarkQueenReady = isQueen && !state.queenReady;
++      const emittedMessages = replayEvent(
++        replayStateRef.current,
++        event,
++        agentPath,
++        agentDisplayName || undefined,
++        queenInfo.name,
++      );
+ 
+       switch (event.type) {
+         case "execution_started":
+           if (isQueen) {
+-            turnCounterRef.current[turnKey] = currentTurn + 1;
+             updateState({
+               isTyping: true,
+               queenIsTyping: true,
+@@ -630,7 +658,6 @@ export default function ColonyChat() {
+                 createdAt: eventCreatedAt,
+               });
+             }
+-            turnCounterRef.current[turnKey] = currentTurn + 1;
+             updateState({
+               isTyping: true,
+               isStreaming: false,
+@@ -640,9 +667,6 @@ export default function ColonyChat() {
+               nodeLogs: {},
+               subagentReports: [],
+               llmSnapshots: {},
+-              activeToolCalls: {},
+-              pendingQuestion: null,
+-              pendingOptions: null,
+               pendingQuestions: null,
+               pendingQuestionSource: null,
+             });
+@@ -662,8 +686,6 @@ export default function ColonyChat() {
+               awaitingInput: false,
+               workerInputMessageId: null,
+               llmSnapshots: {},
+-              pendingQuestion: null,
+-              pendingOptions: null,
+               pendingQuestions: null,
+               pendingQuestionSource: null,
+             });
+@@ -671,43 +693,32 @@ export default function ColonyChat() {
+           }
+           break;
+ 
++        case "llm_turn_complete":
++          // Flush one queued message per queen LLM-turn boundary. Workers'
++          // LLM turns don't drain the queen queue. execution_completed
++          // fires only at session shutdown (the queen's loop parks in
++          // _await_user_input between turns), so this is the real "turn
++          // ended" signal. Mid-tool-call boundaries count too.
++          if (isQueen) {
++            flushNextPendingRef.current();
++          }
++          break;
++
+         case "execution_paused":
+         case "execution_failed":
+         case "client_output_delta":
+         case "client_input_received":
+         case "client_input_requested":
+         case "llm_text_delta": {
+-          const chatMsg = sseEventToChatMessage(event, agentPath, displayName, currentTurn);
+-          if (chatMsg && !suppressQueenMessages) {
+-            // Merge queen inner_turns within same iteration
+-            if (
+-              isQueen &&
+-              (event.type === "client_output_delta" || event.type === "llm_text_delta") &&
+-              event.execution_id
+-            ) {
+-              const iter = event.data?.iteration ?? 0;
+-              const inner = (event.data?.inner_turn as number) ?? 0;
+-              const iterKey = `${event.execution_id}:${iter}`;
+-              if (!queenIterTextRef.current[iterKey]) {
+-                queenIterTextRef.current[iterKey] = {};
++          if (!suppressQueenMessages) {
++            for (const msg of emittedMessages) {
++              if (isQueen) {
++                msg.phase = queenPhaseRef.current as ChatMessage["phase"];
+               }
+-              const snapshot =
+-                (event.data?.snapshot as string) || (event.data?.content as string) || "";
+-              queenIterTextRef.current[iterKey][inner] = snapshot;
+-              const parts = queenIterTextRef.current[iterKey];
+-              const sorted = Object.keys(parts)
+-                .map(Number)
+-                .sort((a, b) => a - b);
+-              chatMsg.content = sorted.map((k) => parts[k]).join("\n");
+-              chatMsg.id = `queen-stream-${event.execution_id}-${iter}`;
+-            }
+-            if (isQueen) {
+-              chatMsg.role = role;
+-              chatMsg.phase = queenPhaseRef.current as ChatMessage["phase"];
++              upsertMessage(msg, {
++                reconcileOptimisticUser: event.type === "client_input_received",
++              });
+             }
+-            upsertMessage(chatMsg, {
+-              reconcileOptimisticUser: event.type === "client_input_received",
+-            });
+           }
+ 
+           if (event.type === "llm_text_delta" || event.type === "client_output_delta") {
+@@ -728,24 +739,27 @@ export default function ColonyChat() {
+           }
+ 
+           if (event.type === "client_input_requested") {
+-            const rawOptions = event.data?.options;
+-            const options = Array.isArray(rawOptions) ? (rawOptions as string[]) : null;
+             const rawQuestions = event.data?.questions;
+             const questions = Array.isArray(rawQuestions)
+               ? (rawQuestions as { id: string; prompt: string; options?: string[] }[])
+               : null;
+             if (isQueen) {
+-              const prompt = (event.data?.prompt as string) || "";
+-              updateState({
+-                awaitingInput: true,
+-                isTyping: false,
+-                isStreaming: false,
+-                queenIsTyping: false,
+-                pendingQuestion: prompt || null,
+-                pendingOptions: options,
+-                pendingQuestions: questions,
+-                pendingQuestionSource: "queen",
+-              });
++              // An empty-prompt client_input_requested means the queen parked
++              // in auto-wait. If we just auto-flushed a queued message, our
++              // inject will unblock her in a moment — skip flipping isTyping
++              // off so the thinking bubble doesn't flicker.
++              if (queenAboutToResumeRef.current && !questions) {
++                queenAboutToResumeRef.current = false;
++              } else {
++                updateState({
++                  awaitingInput: true,
++                  isTyping: false,
++                  isStreaming: false,
++                  queenIsTyping: false,
++                  pendingQuestions: questions,
++                  pendingQuestionSource: "queen",
++                });
++              }
+             }
+           }
+ 
+@@ -756,8 +770,6 @@ export default function ColonyChat() {
+               queenIsTyping: false,
+               workerIsTyping: false,
+               awaitingInput: false,
+-              pendingQuestion: null,
+-              pendingOptions: null,
+               pendingQuestions: null,
+               pendingQuestionSource: null,
+             });
+@@ -773,8 +785,6 @@ export default function ColonyChat() {
+               queenIsTyping: false,
+               workerIsTyping: false,
+               awaitingInput: false,
+-              pendingQuestion: null,
+-              pendingOptions: null,
+               pendingQuestions: null,
+               pendingQuestionSource: null,
+             });
+@@ -791,8 +801,7 @@ export default function ColonyChat() {
+         }
+ 
+         case "node_loop_started":
+-          turnCounterRef.current[turnKey] = currentTurn + 1;
+-          updateState({ isTyping: true, activeToolCalls: {} });
++          updateState({ isTyping: true });
+           if (!isQueen && event.node_id) {
+             const existing = graphNodes.find((n) => n.id === event.node_id);
+             const isRevisit = existing?.status === "complete";
+@@ -804,14 +813,10 @@ export default function ColonyChat() {
+           break;
+ 
+         case "node_loop_iteration":
+-          turnCounterRef.current[turnKey] = currentTurn + 1;
+           if (isQueen) {
+             updateState({
+               isStreaming: false,
+-              activeToolCalls: {},
+               awaitingInput: false,
+-              pendingQuestion: null,
+-              pendingOptions: null,
+               pendingQuestions: null,
+               pendingQuestionSource: null,
+             });
+@@ -819,10 +824,7 @@ export default function ColonyChat() {
+             updateState({
+               isStreaming: false,
+               workerIsTyping: true,
+-              activeToolCalls: {},
+               awaitingInput: false,
+-              pendingQuestion: null,
+-              pendingOptions: null,
+               pendingQuestions: null,
+               pendingQuestionSource: null,
+             });
+@@ -888,41 +890,13 @@ export default function ColonyChat() {
+               );
+             }
+ 
+-            const toolName = (event.data?.tool_name as string) || "unknown";
+-            const toolUseId = (event.data?.tool_use_id as string) || "";
+-
+-            const sid = event.stream_id;
+-            // Track which pill message this tool belongs to so deferred
+-            // completions (ask_user) can find it after the turn counter changes.
+-            toolUseToPillRef.current[toolUseId] = {
+-              msgId: `tool-pill-${sid}-${event.execution_id || "exec"}-${currentTurn}`,
+-              name: toolName,
+-            };
+-            setAgentState((prev) => {
+-              const newActive = {
+-                ...prev.activeToolCalls,
+-                [toolUseId]: { name: toolName, done: false, streamId: sid },
+-              };
+-              const tools = Object.values(newActive)
+-                .filter((t) => t.streamId === sid)
+-                .map((t) => ({ name: t.name, done: t.done }));
+-              const allDone = tools.length > 0 && tools.every((t) => t.done);
+-              upsertMessage({
+-                id: `tool-pill-${sid}-${event.execution_id || "exec"}-${currentTurn}`,
+-                agent: agentDisplayName || event.node_id || "Agent",
+-                agentColor: "",
+-                content: JSON.stringify({ tools, allDone }),
+-                timestamp: "",
+-                type: "tool_status",
+-                role,
+-                thread: agentPath,
+-                createdAt: eventCreatedAt,
+-                nodeId: event.node_id || undefined,
+-                executionId: event.execution_id || undefined,
+-                streamId: sid || undefined,
+-              });
+-              return { ...prev, isStreaming: false, activeToolCalls: newActive };
+-            });
++            for (const msg of emittedMessages) {
++              if (msg.role === "queen") {
++                msg.phase = queenPhaseRef.current as ChatMessage["phase"];
++              }
++              upsertMessage(msg);
++            }
++            updateState({ isStreaming: false });
+           }
+           break;
+         }
+@@ -930,7 +904,6 @@ export default function ColonyChat() {
+         case "tool_call_completed": {
+           if (event.node_id) {
+             const toolName = (event.data?.tool_name as string) || "unknown";
+-            const toolUseId = (event.data?.tool_use_id as string) || "";
+             const isError = event.data?.is_error as boolean | undefined;
+             const result = event.data?.result as string | undefined;
+             if (isError) {
+@@ -943,74 +916,12 @@ export default function ColonyChat() {
+               appendNodeLog(event.node_id, `${ts} INFO  ${toolName} done${resultStr}`);
+             }
+ 
+-            // Look up the original pill message this tool belongs to.
+-            // For deferred completions (ask_user), the turn counter and
+-            // activeToolCalls have already been reset, so we rely on the
+-            // ref recorded during tool_call_started.
+-            const tracked = toolUseToPillRef.current[toolUseId];
+-            delete toolUseToPillRef.current[toolUseId];
+-
+-            const sid = event.stream_id;
+-
+-            // Mark done in activeToolCalls if still present (normal case)
+-            setAgentState((prev) => {
+-              if (!prev.activeToolCalls[toolUseId]) return prev;
+-              return {
+-                ...prev,
+-                activeToolCalls: {
+-                  ...prev.activeToolCalls,
+-                  [toolUseId]: {
+-                    ...prev.activeToolCalls[toolUseId],
+-                    done: true,
+-                  },
+-                },
+-              };
+-            });
+-
+-            // Determine the correct pill message ID
+-            const pillMsgId =
+-              tracked?.msgId ??
+-              `tool-pill-${sid}-${event.execution_id || "exec"}-${currentTurn}`;
+-            const trackedName = tracked?.name;
+-
+-            // Update the pill message content directly
+-            setMessages((prevMsgs) => {
+-              const idx = prevMsgs.findIndex((m) => m.id === pillMsgId);
+-              if (idx < 0) return prevMsgs;
+-
+-              try {
+-                const parsed = JSON.parse(prevMsgs[idx].content);
+-                const tools: { name: string; done: boolean }[] =
+-                  parsed.tools || [];
+-
+-                if (trackedName) {
+-                  let marked = false;
+-                  for (let i = 0; i < tools.length; i++) {
+-                    if (
+-                      tools[i].name === trackedName &&
+-                      !tools[i].done &&
+-                      !marked
+-                    ) {
+-                      tools[i] = { ...tools[i], done: true };
+-                      marked = true;
+-                    }
+-                  }
+-                }
+-
+-                const allDone =
+-                  tools.length > 0 && tools.every((t) => t.done);
+-                return prevMsgs.map((m, i) =>
+-                  i === idx
+-                    ? {
+-                        ...m,
+-                        content: JSON.stringify({ tools, allDone }),
+-                      }
+-                    : m,
+-                );
+-              } catch {
+-                return prevMsgs;
++            for (const msg of emittedMessages) {
++              if (msg.role === "queen") {
++                msg.phase = queenPhaseRef.current as ChatMessage["phase"];
+               }
+-            });
++              upsertMessage(msg);
++            }
+           }
+           break;
+         }
+@@ -1136,10 +1047,14 @@ export default function ColonyChat() {
+             setGraphNodes((prev) =>
+               prev.map((n) => {
+                 if (n.id !== `__trigger_${triggerId}`) return n;
+-                const { next_fire_in: _, ...restConfig } = (n.triggerConfig || {}) as Record<
+-                  string,
+-                  unknown
+-                > & { next_fire_in?: unknown };
++                const {
++                  next_fire_in: _nfi,
++                  next_fire_at: _nfa,
++                  ...restConfig
++                } = (n.triggerConfig || {}) as Record<string, unknown> & {
++                  next_fire_in?: unknown;
++                  next_fire_at?: unknown;
++                };
+                 return { ...n, status: "pending" as NodeStatus, triggerConfig: restConfig };
+               }),
+             );
+@@ -1151,8 +1066,49 @@ export default function ColonyChat() {
+           const triggerId = event.data?.trigger_id as string;
+           if (triggerId) {
+             const nodeId = `__trigger_${triggerId}`;
++            // Merge refreshed fire stats + next-fire anchor into the node's
++            // triggerConfig so the countdown re-anchors and the card shows
++            // an up-to-date "fired Nx · last 2m ago" badge.
++            const fireCount = event.data?.fire_count as number | undefined;
++            const lastFiredAt = event.data?.last_fired_at as number | undefined;
++            const nextFireAt = event.data?.next_fire_at as number | undefined;
++            const nextFireIn = event.data?.next_fire_in as number | undefined;
++            setGraphNodes((prev) =>
++              prev.map((n) => {
++                if (n.id !== nodeId) return n;
++                const config = { ...(n.triggerConfig || {}) };
++                if (fireCount != null) config.fire_count = fireCount;
++                if (lastFiredAt != null) config.last_fired_at = lastFiredAt;
++                if (nextFireAt != null) config.next_fire_at = nextFireAt;
++                if (nextFireIn != null) config.next_fire_in = nextFireIn;
++                return { ...n, triggerConfig: config };
++              }),
++            );
+             updateGraphNodeStatus(nodeId, "complete");
+             setTimeout(() => updateGraphNodeStatus(nodeId, "running"), 1500);
++
++            // Render a banner in the chat marking the start of the turn the
++            // queen is about to run in response. Matches the replay path in
++            // chat-helpers.ts (case "trigger_fired") so live + restore look
++            // identical.
++            const bannerPayload = {
++              trigger_id: triggerId,
++              trigger_type: event.data?.trigger_type as string | undefined,
++              name: event.data?.name as string | undefined,
++              task: event.data?.task as string | undefined,
++              fire_count: fireCount,
++              last_fired_at: lastFiredAt,
++            };
++            upsertMessage({
++              id: `trigger-${triggerId}-${lastFiredAt ?? event.timestamp}`,
++              agent: "Trigger",
++              agentColor: "",
++              content: JSON.stringify(bannerPayload),
++              timestamp: "",
++              type: "trigger",
++              thread: agentPath,
++              createdAt: lastFiredAt ?? Date.now(),
++            });
+           }
+           break;
+         }
+@@ -1186,30 +1142,86 @@ export default function ColonyChat() {
+ 
+   // ── Action handlers ────────────────────────────────────────────────────
+ 
++  // Core backend send — bypasses queue logic. Used both for the normal path
++  // (agent idle) and for Steer / auto-flush paths.
++  const sendToBackend = useCallback(
++    (text: string, images?: ImageContent[]) => {
++      if (!agentState.sessionId || !agentState.ready) return;
++      executionApi.chat(agentState.sessionId, text, images).catch((err: unknown) => {
++        const errMsg = err instanceof Error ? err.message : String(err);
++        upsertMessage({
++          id: makeId(),
++          agent: "System",
++          agentColor: "",
++          content: `Failed to send message: ${errMsg}`,
++          timestamp: "",
++          type: "system",
++          thread: agentPath,
++          createdAt: Date.now(),
++        });
++        updateState({ isTyping: false, isStreaming: false, queenIsTyping: false });
++      });
++    },
++    [agentPath, agentState.sessionId, agentState.ready, updateState, upsertMessage],
++  );
++
++  const {
++    enqueue: enqueuePending,
++    steer: handleSteer,
++    cancelQueued: handleCancelQueued,
++    flushNext: flushNextPending,
++    flushNextRef: flushNextPendingRef,
++    clear: clearPendingQueue,
++  } = usePendingQueue({
++    sendToBackend,
++    setMessages,
++    onFlushStart: useCallback(() => {
++      updateState({ isTyping: true, queenIsTyping: true });
++      queenAboutToResumeRef.current = true;
++    }, [updateState]),
++  });
++
++  // Reset the queue whenever we navigate to a different colony (or to
++  // new-chat). The hook outlives the route change, so without this, a
++  // message queued in colony A would auto-flush into colony B's next
++  // execution_completed.
++  useEffect(() => {
++    clearPendingQueue();
++  }, [agentPath, isNewChat, clearPendingQueue]);
++
+   const handleCancelQueen = useCallback(async () => {
+     if (!agentState.sessionId) return;
+     try {
+       await executionApi.cancelQueen(agentState.sessionId);
+       updateState({ isTyping: false, isStreaming: false, queenIsTyping: false });
++      // After cancelling the current turn, immediately send the oldest
++      // queued message (if any). The remaining queued messages stay put
++      // so the user can review them or Steer/Cancel individually.
++      flushNextPending();
+     } catch {
+       // fire-and-forget
+     }
+-  }, [agentState.sessionId, updateState]);
++  }, [agentState.sessionId, updateState, flushNextPending]);
+ 
+   const handleSend = useCallback(
+     (text: string, _thread: string, images?: ImageContent[]) => {
+-      if (agentState.pendingQuestionSource === "queen") {
++      const answeringQuestion = agentState.pendingQuestionSource === "queen";
++      if (answeringQuestion) {
+         updateState({
+-          pendingQuestion: null,
+-          pendingOptions: null,
+           pendingQuestions: null,
+           pendingQuestionSource: null,
+         });
+       }
+ 
+-      const clientMessageId = makeId();
++      // Queue when the queen is mid-turn — unless the user is answering an
++      // ask_user prompt, in which case we send immediately so the loop can
++      // resume. Queued messages are held locally (not sent to the backend)
++      // until the user clicks Steer or the queen goes idle.
++      const shouldQueue = !answeringQuestion && (agentState.queenIsTyping ?? false);
++
++      const msgId = makeId();
+       const userMsg: ChatMessage = {
+-        id: clientMessageId,
++        id: msgId,
+         agent: "You",
+         agentColor: "",
+         content: text,
+@@ -1218,75 +1230,57 @@ export default function ColonyChat() {
+         thread: agentPath,
+         createdAt: Date.now(),
+         images,
+-        clientMessageId,
++        queued: shouldQueue,
+       };
+       setMessages((prev) => [...prev, userMsg]);
+       suppressIntroRef.current = false;
+-      updateState({ isTyping: true, queenIsTyping: true });
+ 
+-      if (agentState.sessionId && agentState.ready) {
+-        executionApi
+-          .chat(agentState.sessionId, text, images, undefined, clientMessageId)
+-          .catch((err: unknown) => {
+-          const errMsg = err instanceof Error ? err.message : String(err);
+-          upsertMessage({
+-            id: makeId(),
+-            agent: "System",
+-            agentColor: "",
+-            content: `Failed to send message: ${errMsg}`,
+-            timestamp: "",
+-            type: "system",
+-            thread: agentPath,
+-            createdAt: Date.now(),
+-          });
+-          updateState({ isTyping: false, isStreaming: false, queenIsTyping: false });
+-          });
++      if (shouldQueue) {
++        enqueuePending(msgId, { text, images });
++        return;
+       }
+-    },
+-    [agentPath, agentState.sessionId, agentState.ready, agentState.pendingQuestionSource, updateState, upsertMessage],
+-  );
+ 
+-  const handleQueenQuestionAnswer = useCallback(
+-    (answer: string) => {
+-      updateState({
+-        pendingQuestion: null,
+-        pendingOptions: null,
+-        pendingQuestions: null,
+-        pendingQuestionSource: null,
+-      });
+-      handleSend(answer, agentPath);
++      updateState({ isTyping: true, queenIsTyping: true });
++      sendToBackend(text, images);
+     },
+-    [agentPath, handleSend, updateState],
++    [
++      agentPath,
++      agentState.queenIsTyping,
++      agentState.pendingQuestionSource,
++      updateState,
++      sendToBackend,
++      enqueuePending,
++    ],
+   );
+ 
+-  const handleMultiQuestionAnswer = useCallback(
++  const handleQueenQuestionAnswer = useCallback(
+     (answers: Record<string, string>) => {
+       updateState({
+-        pendingQuestion: null,
+-        pendingOptions: null,
+         pendingQuestions: null,
+         pendingQuestionSource: null,
+       });
+-      const lines = Object.entries(answers).map(([id, answer]) => `[${id}]: ${answer}`);
+-      handleSend(lines.join("\n"), agentPath);
++      const entries = Object.entries(answers);
++      const payload =
++        entries.length === 1
++          ? entries[0][1]
++          : entries.map(([id, answer]) => `[${id}]: ${answer}`).join("\n");
++      handleSend(payload, agentPath);
+     },
+     [agentPath, handleSend, updateState],
+   );
+ 
+   const handleQuestionDismiss = useCallback(() => {
+     if (!agentState.sessionId) return;
+-    const question = agentState.pendingQuestion || "";
++    const firstPrompt = agentState.pendingQuestions?.[0]?.prompt ?? "";
+     updateState({
+-      pendingQuestion: null,
+-      pendingOptions: null,
+       pendingQuestions: null,
+       pendingQuestionSource: null,
+       awaitingInput: false,
+     });
+     executionApi
+-      .chat(agentState.sessionId, `[User dismissed the question: "${question}"]`)
++      .chat(agentState.sessionId, `[User dismissed the question: "${firstPrompt}"]`)
+       .catch(() => {});
+-  }, [agentState.sessionId, agentState.pendingQuestion, updateState]);
++  }, [agentState.sessionId, agentState.pendingQuestions, updateState]);
+ 
+   const triggers = useMemo(
+     () => graphNodes.filter((n) => n.nodeType === "trigger"),
+@@ -1401,21 +1395,21 @@ export default function ColonyChat() {
+             messages={messages}
+             onSend={handleSend}
+             onCancel={handleCancelQueen}
++            onSteer={handleSteer}
++            onCancelQueued={handleCancelQueued}
+             activeThread={agentPath}
+             isWaiting={(agentState.queenIsTyping && !agentState.isStreaming) ?? false}
+             isWorkerWaiting={(agentState.workerIsTyping && !agentState.isStreaming) ?? false}
+             isBusy={agentState.queenIsTyping ?? false}
+             disabled={agentState.loading || !agentState.queenReady}
+             queenPhase={agentState.queenPhase}
+-            pendingQuestion={agentState.awaitingInput ? agentState.pendingQuestion : null}
+-            pendingOptions={agentState.awaitingInput ? agentState.pendingOptions : null}
+             pendingQuestions={agentState.awaitingInput ? agentState.pendingQuestions : null}
+             onQuestionSubmit={handleQueenQuestionAnswer}
+-            onMultiQuestionSubmit={handleMultiQuestionAnswer}
+             onQuestionDismiss={handleQuestionDismiss}
+             contextUsage={agentState.contextUsage}
+             supportsImages={agentState.queenSupportsImages}
+             queenProfileId={colony?.queenProfileId ?? null}
++            queenId={colony?.queenProfileId ?? undefined}
+           />
+         </div>
+ 
+diff --git a/core/frontend/src/pages/queen-dm.tsx b/core/frontend/src/pages/queen-dm.tsx
+index 9f7d0cf9..dd26690e 100644
+--- a/core/frontend/src/pages/queen-dm.tsx
++++ b/core/frontend/src/pages/queen-dm.tsx
+@@ -1,6 +1,6 @@
+ import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+ import { useParams, useSearchParams } from "react-router-dom";
+-import { Loader2, Users } from "lucide-react";
++import { Loader2, Minus, Plus } from "lucide-react";
+ import ChatPanel, {
+   type ChatMessage,
+   type ImageContent,
+@@ -10,9 +10,11 @@ import { executionApi } from "@/api/execution";
+ import { sessionsApi } from "@/api/sessions";
+ import { queensApi } from "@/api/queens";
+ import { useMultiSSE } from "@/hooks/use-sse";
++import { usePendingQueue } from "@/hooks/use-pending-queue";
+ import type { AgentEvent, HistorySession } from "@/api/types";
+ import {
+-  sseEventToChatMessage,
++  newReplayState,
++  replayEvent,
+   replayEventsToMessages,
+ } from "@/lib/chat-helpers";
+ import { useColony } from "@/context/ColonyContext";
+@@ -21,6 +23,32 @@ import { getQueenForAgent, slugToColonyId } from "@/lib/colony-registry";
+ 
+ const makeId = () => Math.random().toString(36).slice(2, 9);
+ 
++// Remembers the last session the user had open in each queen DM so that
++// navigating away (e.g. to another queen) and back lands on the session
++// they were just in, instead of whichever session the server picks.
++const lastSessionKey = (queenId: string) => `hive:queen:${queenId}:lastSession`;
++const readLastSession = (queenId: string): string | null => {
++  try {
++    return localStorage.getItem(lastSessionKey(queenId));
++  } catch {
++    return null;
++  }
++};
++const writeLastSession = (queenId: string, sessionId: string) => {
++  try {
++    localStorage.setItem(lastSessionKey(queenId), sessionId);
++  } catch {
++    /* storage disabled/full — best-effort */
++  }
++};
++const clearLastSession = (queenId: string) => {
++  try {
++    localStorage.removeItem(lastSessionKey(queenId));
++  } catch {
++    /* ignore */
++  }
++};
++
+ export default function QueenDM() {
+   const { queenId } = useParams<{ queenId: string }>();
+   const [searchParams, setSearchParams] = useSearchParams();
+@@ -39,37 +67,56 @@ export default function QueenDM() {
+   const [queenReady, setQueenReady] = useState(false);
+   const [isTyping, setIsTyping] = useState(false);
+   const [isStreaming, setIsStreaming] = useState(false);
+-  const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
+-  const [pendingOptions, setPendingOptions] = useState<string[] | null>(null);
+   const [pendingQuestions, setPendingQuestions] = useState<
+     { id: string; prompt: string; options?: string[] }[] | null
+   >(null);
+   const [awaitingInput, setAwaitingInput] = useState(false);
+-  const [, setActiveToolCalls] = useState<
+-    Record<string, { name: string; done: boolean }>
+-  >({});
++  // `cached` and `cacheCreated` are subsets of `input` (providers count both
++  // inside prompt_tokens already) — display them, never add them to a total.
++  // `costUsd` is the session-total USD cost when the provider supplies one
++  // (Anthropic, OpenAI, OpenRouter); 0 means unreported, not free.
++  const [tokenUsage, setTokenUsage] = useState({
++    input: 0,
++    output: 0,
++    cached: 0,
++    cacheCreated: 0,
++    costUsd: 0,
++  });
+   const [historySessions, setHistorySessions] = useState<HistorySession[]>([]);
+   const [historyLoading, setHistoryLoading] = useState(false);
+   const [switchingSessionId, setSwitchingSessionId] = useState<string | null>(
+     null,
+   );
+   const [creatingNewSession, setCreatingNewSession] = useState(false);
+-  const [spawning, setSpawning] = useState(false);
+   const [initialDraft, setInitialDraft] = useState<string | null>(null);
+   const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
+   const [cloneColonyName, setCloneColonyName] = useState("");
+   const [cloneTask, setCloneTask] = useState("");
++  const [cloneOutputs, setCloneOutputs] = useState("");
++  const [cloneDataSources, setCloneDataSources] = useState("");
++  const [cloneSchedule, setCloneSchedule] = useState("");
++  const [cloneConcurrency, setCloneConcurrency] = useState("");
++  const [showCloneOutputs, setShowCloneOutputs] = useState(false);
++  const [showCloneDataSources, setShowCloneDataSources] = useState(false);
++  const [showCloneSchedule, setShowCloneSchedule] = useState(false);
++  const [showCloneConcurrency, setShowCloneConcurrency] = useState(false);
++  // Colony-spawned lock state. Once a colony has been spawned from this DM
++  // and the user clicked into it, /chat is rejected server-side and the
++  // composer is replaced with a "compact + new session" button. Hydrated
++  // from the session detail and updated optimistically on click.
++  const [colonySpawned, setColonySpawned] = useState(false);
++  const [spawnedColonyName, setSpawnedColonyName] = useState<string | null>(
++    null,
++  );
++  const [compactingAndForking, setCompactingAndForking] = useState(false);
+ 
+-  const turnCounterRef = useRef(0);
+-  // Maps tool_use_id → the pill message ID and tool name that was created for it.
+-  // Survives turn counter resets so deferred completions (e.g. ask_user) can
+-  // find and update the correct pill even after llm_turn_complete bumps the counter.
+-  const toolUseToPillRef = useRef<
+-    Record<string, { msgId: string; name: string }>
+-  >({});
+-  const queenIterTextRef = useRef<Record<string, Record<number, string>>>({});
++  const replayStateRef = useRef(newReplayState());
++  // Flipped true by the auto-flush path; consumed by the next empty-prompt
++  // client_input_requested so we don't flicker the typing bubble off while
++  // the queen is about to resume on the flushed input.
++  const queenAboutToResumeRef = useRef(false);
+   const [queenPhase, setQueenPhase] = useState<
+-    "independent" | "working" | "reviewing"
++    "independent" | "incubating" | "working" | "reviewing"
+   >("independent");
+ 
+   const resetViewState = useCallback(() => {
+@@ -78,18 +125,57 @@ export default function QueenDM() {
+     setQueenReady(false);
+     setIsTyping(false);
+     setIsStreaming(false);
+-    setPendingQuestion(null);
+-    setPendingOptions(null);
+     setPendingQuestions(null);
+     setAwaitingInput(false);
+-    setActiveToolCalls({});
+     setQueenPhase("independent");
++    setTokenUsage({ input: 0, output: 0, cached: 0, cacheCreated: 0, costUsd: 0 });
+     setInitialDraft(null);
+-    turnCounterRef.current = 0;
+-    toolUseToPillRef.current = {};
+-    queenIterTextRef.current = {};
++    setColonySpawned(false);
++    setSpawnedColonyName(null);
++    setCompactingAndForking(false);
++    replayStateRef.current = newReplayState();
+   }, []);
+ 
++  const upsertMessage = useCallback(
++    (chatMsg: ChatMessage, options?: { reconcileOptimisticUser?: boolean }) => {
++      setMessages((prev) => {
++        const idx = prev.findIndex((m) => m.id === chatMsg.id);
++        if (idx >= 0) {
++          return prev.map((m, i) =>
++            i === idx ? { ...chatMsg, createdAt: m.createdAt ?? chatMsg.createdAt } : m,
++          );
++        }
++        if (options?.reconcileOptimisticUser && chatMsg.type === "user") {
++          const incomingTs = chatMsg.createdAt ?? Date.now();
++          const matchIdx = prev.findIndex(
++            (m) =>
++              m.type === "user" &&
++              m.content === chatMsg.content &&
++              Math.abs(incomingTs - (m.createdAt ?? incomingTs)) <= 15000,
++          );
++          if (matchIdx !== -1) {
++            return prev.map((m, i) =>
++              i === matchIdx ? { ...m, id: chatMsg.id, queued: undefined } : m,
++            );
++          }
++        }
++
++        const ts = chatMsg.createdAt ?? Date.now();
++        let insertIdx = prev.length - 1;
++        while (insertIdx >= 0 && (prev[insertIdx].createdAt ?? 0) > ts) {
++          insertIdx--;
++        }
++        if (insertIdx === -1 || insertIdx === prev.length - 1) {
++          return [...prev, chatMsg];
++        }
++        const next = [...prev];
++        next.splice(insertIdx + 1, 0, chatMsg);
++        return next;
++      });
++    },
++    [],
++  );
++
+   const restoreMessages = useCallback(
+     async (sid: string, cancelled: () => boolean) => {
+       try {
+@@ -100,7 +186,15 @@ export default function QueenDM() {
+         // Use the stateful replay so tool_status pills are synthesized
+         // the same way the live SSE handler does — without this the
+         // refreshed queen DM shows zero tool activity.
+-        const restored = replayEventsToMessages(events, "queen-dm", queenName);
++        const replayState = newReplayState();
++        const restored = replayEventsToMessages(
++          events,
++          "queen-dm",
++          queenName,
++          undefined,
++          replayState,
++        );
++        replayStateRef.current = replayState;
+ 
+         // Show a banner if the server truncated older events.
+         const droppedCount = Math.max(0, total - returned);
+@@ -141,6 +235,19 @@ export default function QueenDM() {
+   useEffect(() => {
+     if (!queenId) return;
+ 
++    // If we arrived without an explicit session in the URL and aren't
++    // bootstrapping a new one, redirect to the last session the user had
++    // open for this queen. Session IDs are always of the form
++    // "session_<timestamp>_<hex>", so we gate on that prefix to avoid
++    // redirecting to anything unexpected that landed in storage.
++    if (!selectedSessionParam && newSessionFlag !== "1") {
++      const stored = readLastSession(queenId);
++      if (stored && stored.startsWith("session_")) {
++        setSearchParams({ session: stored }, { replace: true });
++        return;
++      }
++    }
++
+     resetViewState();
+     setLoading(true);
+ 
+@@ -256,7 +363,17 @@ export default function QueenDM() {
+         await restoreMessages(sid, () => cancelled);
+         refresh();
+       } catch {
+-        // Session creation failed
++        // Session creation/selection failed. If the URL param came from
++        // our own localStorage restore, the stored session is stale (e.g.
++        // deleted on disk) — clear it so the next navigation falls
++        // through to getOrCreate instead of looping on the bad id.
++        if (
++          queenId &&
++          selectedSessionParam &&
++          selectedSessionParam === readLastSession(queenId)
++        ) {
++          clearLastSession(queenId);
++        }
+       } finally {
+         if (!cancelled) {
+           setLoading(false);
+@@ -279,6 +396,13 @@ export default function QueenDM() {
+     setSearchParams,
+   ]);
+ 
++  // Remember the session the user is currently viewing so switching queens
++  // and coming back lands on it instead of whatever the server picks.
++  useEffect(() => {
++    if (!queenId || !sessionId) return;
++    writeLastSession(queenId, sessionId);
++  }, [queenId, sessionId]);
++
+   useEffect(() => {
+     if (!queenId) return;
+     let cancelled = false;
+@@ -305,48 +429,76 @@ export default function QueenDM() {
+     };
+   }, [queenId, sessionId]);
+ 
+-  const handleColonySpawn = useCallback(async () => {
+-    if (!sessionId || spawning) return;
+-    const colony = cloneColonyName.trim();
+-    if (!colony) return;
+-    setSpawning(true);
++  // Hydrate the colony-spawned lock + queen phase from the session detail
++  // whenever the session ID changes. /sessions/{id} carries both flags
++  // (and the cold-info path returns colony_spawned after a server restart),
++  // so this single fetch covers live, page-reload, and post-restart states.
++  // Without seeding queen_phase here the badge starts at the useState
++  // default ("independent") and only updates when a fresh
++  // QUEEN_PHASE_CHANGED SSE event fires — a reload mid-incubation would
++  // briefly mis-render.
++  useEffect(() => {
++    if (!sessionId) return;
++    let cancelled = false;
++    sessionsApi
++      .get(sessionId)
++      .then((data) => {
++        if (cancelled) return;
++        const detail = data as {
++          colony_spawned?: boolean;
++          spawned_colony_name?: string | null;
++          queen_phase?: "independent" | "incubating" | "working" | "reviewing";
++        };
++        setColonySpawned(Boolean(detail.colony_spawned));
++        setSpawnedColonyName(detail.spawned_colony_name ?? null);
++        if (
++          detail.queen_phase === "independent" ||
++          detail.queen_phase === "incubating" ||
++          detail.queen_phase === "working" ||
++          detail.queen_phase === "reviewing"
++        ) {
++          setQueenPhase(detail.queen_phase);
++        }
++      })
++      .catch(() => {
++        // Non-fatal — lock + phase simply won't activate until a fresh
++        // SSE event arrives.
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [sessionId]);
++
++  const handleColonyLinkClick = useCallback(
++    (colonyName: string) => {
++      if (!sessionId || !colonyName) return;
++      // Optimistically lock so the textarea swaps to the button before the
++      // user navigates back. Backend persists the same flag in meta.json so
++      // a refresh would re-hydrate the locked state anyway.
++      setColonySpawned(true);
++      setSpawnedColonyName(colonyName);
++      executionApi.markColonySpawned(sessionId, colonyName).catch(() => {
++        // Revert on failure so the user isn't stranded with no composer.
++        setColonySpawned(false);
++        setSpawnedColonyName(null);
++      });
++    },
++    [sessionId],
++  );
++
++  const handleCompactAndFork = useCallback(async () => {
++    if (!sessionId || compactingAndForking || !queenId) return;
++    setCompactingAndForking(true);
+     try {
+-      const result = await executionApi.colonySpawn(
+-        sessionId,
+-        colony,
+-        cloneTask.trim() || undefined,
+-      );
+-      const msg: ChatMessage = {
+-        id: makeId(),
+-        agent: "System",
+-        agentColor: "",
+-        content: `Forked to colony "${result.colony_name}"${result.is_new ? " (new)" : ""} — session ${result.queen_session_id}`,
+-        timestamp: "",
+-        type: "system",
+-        thread: "queen-dm",
+-        createdAt: Date.now(),
+-      };
+-      setMessages((prev) => [...prev, msg]);
+-      setCloneDialogOpen(false);
+-      setCloneColonyName("");
+-      setCloneTask("");
+-    } catch (err) {
+-      const errMsg = err instanceof Error ? err.message : String(err);
+-      const msg: ChatMessage = {
+-        id: makeId(),
+-        agent: "System",
+-        agentColor: "",
+-        content: `Clone failed: ${errMsg}`,
+-        timestamp: "",
+-        type: "system",
+-        thread: "queen-dm",
+-        createdAt: Date.now(),
+-      };
+-      setMessages((prev) => [...prev, msg]);
+-    } finally {
+-      setSpawning(false);
++      const result = await executionApi.compactAndFork(sessionId);
++      // Navigate to the freshly-forked session for the same queen. Replacing
++      // the URL keeps the back button on the home/history page rather than
++      // bouncing back to the now-locked DM.
++      setSearchParams({ session: result.new_session_id }, { replace: true });
++    } catch {
++      setCompactingAndForking(false);
+     }
+-  }, [sessionId, spawning, cloneColonyName, cloneTask]);
++  }, [sessionId, compactingAndForking, queenId, setSearchParams]);
+ 
+   const handleSelectHistoricalSession = useCallback(
+     (nextSessionId: string) => {
+@@ -378,15 +530,6 @@ export default function QueenDM() {
+     if (!queenId) return;
+     setActions(
+       <>
+-        <button
+-          onClick={() => setCloneDialogOpen(true)}
+-          disabled={!sessionId}
+-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0 disabled:opacity-50"
+-          title="Clone queen to a colony"
+-        >
+-          <Users className="w-3.5 h-3.5" />
+-          Clone Colony
+-        </button>
+         <QueenSessionSwitcher
+           sessions={historySessions}
+           currentSessionId={sessionId}
+@@ -416,19 +559,22 @@ export default function QueenDM() {
+     (_agentType: string, event: AgentEvent) => {
+       const isQueen = event.stream_id === "queen";
+       if (!isQueen) return;
++      const emittedMessages = replayEvent(
++        replayStateRef.current,
++        event,
++        "queen-dm",
++        queenName,
++      );
+ 
+       switch (event.type) {
+         case "execution_started":
+-          turnCounterRef.current++;
+           setIsTyping(true);
+           setQueenReady(true);
+-          setActiveToolCalls({});
+-          toolUseToPillRef.current = {};
+-          // Clear queued flag on all user messages now that the queen is processing
+-          setMessages((prev) => {
+-            if (!prev.some((m) => m.queued)) return prev;
+-            return prev.map((m) => (m.queued ? { ...m, queued: undefined } : m));
+-          });
++          // Do NOT clear `queued` on user messages here. The pending queue
++          // hook owns that flag — it's cleared on steer / cancel / flush.
++          // If the user has queued messages that haven't been flushed yet,
++          // the queen starting a new turn (e.g. from a steer or from the
++          // flush itself) shouldn't hide the still-queued ones.
+           break;
+ 
+         case "execution_completed":
+@@ -437,64 +583,39 @@ export default function QueenDM() {
+           break;
+ 
+         case "llm_turn_complete":
+-          turnCounterRef.current++;
+-          setActiveToolCalls({});
++          if (event.data) {
++            const inp = (event.data.input_tokens as number) || 0;
++            const out = (event.data.output_tokens as number) || 0;
++            // cached / cache_creation are subsets of input — accumulate
++            // separately for display, do NOT roll into input/total.
++            const cached = (event.data.cached_tokens as number) || 0;
++            const cacheCreated = (event.data.cache_creation_tokens as number) || 0;
++            const costUsd = (event.data.cost_usd as number) || 0;
++            setTokenUsage((prev) => ({
++              input: prev.input + inp,
++              output: prev.output + out,
++              cached: prev.cached + cached,
++              cacheCreated: prev.cacheCreated + cacheCreated,
++              costUsd: prev.costUsd + costUsd,
++            }));
++          }
++          // Flush one queued message per LLM turn boundary. This is the
++          // real "turn ended" signal in a queen DM — execution_completed
++          // only fires at session shutdown because the event loop parks in
++          // _await_user_input between turns. Mid-tool-call boundaries
++          // count too: sending now lets the queen pick up the message on
++          // her next drain, same as clicking Steer.
++          flushNextPendingRef.current();
+           break;
+ 
+         case "client_output_delta":
+         case "llm_text_delta": {
+-          const chatMsg = sseEventToChatMessage(
+-            event,
+-            "queen-dm",
+-            queenName,
+-            turnCounterRef.current,
+-          );
+-          if (chatMsg) {
+-            if (event.execution_id) {
+-              const iter = event.data?.iteration ?? 0;
+-              const inner = (event.data?.inner_turn as number) ?? 0;
+-              const iterKey = `${event.execution_id}:${iter}`;
+-              if (!queenIterTextRef.current[iterKey]) {
+-                queenIterTextRef.current[iterKey] = {};
+-              }
+-              const snapshot =
+-                (event.data?.snapshot as string) ||
+-                (event.data?.content as string) ||
+-                "";
+-              queenIterTextRef.current[iterKey][inner] = snapshot;
+-              const parts = queenIterTextRef.current[iterKey];
+-              const sorted = Object.keys(parts)
+-                .map(Number)
+-                .sort((a, b) => a - b);
+-              chatMsg.content = sorted.map((k) => parts[k]).join("\n");
+-              chatMsg.id = `queen-stream-${event.execution_id}-${iter}`;
+-            }
+-            chatMsg.role = "queen";
+-
+-            setMessages((prev) => {
+-              const idx = prev.findIndex((m) => m.id === chatMsg.id);
+-              if (idx >= 0) {
+-                // Preserve the original createdAt so the displayed timestamp
+-                // doesn't tick forward as new deltas stream in.
+-                return prev.map((m, i) =>
+-                  i === idx
+-                    ? { ...chatMsg, createdAt: m.createdAt ?? chatMsg.createdAt }
+-                    : m,
+-                );
+-              }
+-              return [...prev, chatMsg];
+-            });
+-          }
++          for (const msg of emittedMessages) upsertMessage(msg);
+           setIsStreaming(true);
+           break;
+         }
+ 
+         case "client_input_requested": {
+-          const prompt = (event.data?.prompt as string) || "";
+-          const rawOptions = event.data?.options;
+-          const options = Array.isArray(rawOptions)
+-            ? (rawOptions as string[])
+-            : null;
+           const rawQuestions = event.data?.questions;
+           const questions = Array.isArray(rawQuestions)
+             ? (rawQuestions as {
+@@ -503,63 +624,24 @@ export default function QueenDM() {
+                 options?: string[];
+               }[])
+             : null;
++          // An empty-prompt client_input_requested means the queen parked
++          // in auto-wait. If we just auto-flushed a queued message, our
++          // inject will unblock her in a moment — skip flipping isTyping
++          // off so the thinking bubble doesn't flicker.
++          if (queenAboutToResumeRef.current && !questions) {
++            queenAboutToResumeRef.current = false;
++            break;
++          }
+           setAwaitingInput(true);
+           setIsTyping(false);
+           setIsStreaming(false);
+-          setPendingQuestion(prompt || null);
+-          setPendingOptions(options);
+           setPendingQuestions(questions);
+           break;
+         }
+ 
+         case "client_input_received": {
+-          const chatMsg = sseEventToChatMessage(
+-            event,
+-            "queen-dm",
+-            queenName,
+-            turnCounterRef.current,
+-          );
+-          if (chatMsg) {
+-            setMessages((prev) => {
+-              // Reconcile optimistic user message. A matching echo from
+-              // the backend means the queen has now received this
+-              // message, so drop the "queued" indicator (it was set when
+-              // the user sent while the queen was still busy).
+-              if (chatMsg.type === "user" && prev.length > 0) {
+-                const incomingClientMessageId = chatMsg.clientMessageId?.trim();
+-                if (incomingClientMessageId) {
+-                  const byClientIdIdx = prev.findIndex(
+-                    (m) =>
+-                      m.type === "user" &&
+-                      (m.clientMessageId?.trim() || "") === incomingClientMessageId,
+-                  );
+-                  if (byClientIdIdx !== -1) {
+-                    return prev.map((m, i) =>
+-                      i === byClientIdIdx
+-                        ? {
+-                            ...m,
+-                            id: chatMsg.id,
+-                            queued: undefined,
+-                          }
+-                        : m,
+-                    );
+-                  }
+-                }
+-                const idx = prev.findIndex(
+-                  (m) =>
+-                    m.type === "user" &&
+-                    m.content === chatMsg.content &&
+-                    Math.abs((chatMsg.createdAt ?? 0) - (m.createdAt ?? 0)) <=
+-                      15000,
+-                );
+-                if (idx !== -1) {
+-                  return prev.map((m, i) =>
+-                    i === idx ? { ...m, id: chatMsg.id, queued: undefined } : m,
+-                  );
+-                }
+-              }
+-              return [...prev, chatMsg];
+-            });
++          for (const msg of emittedMessages) {
++            upsertMessage(msg, { reconcileOptimisticUser: true });
+           }
+           break;
+         }
+@@ -568,6 +650,7 @@ export default function QueenDM() {
+           const rawPhase = event.data?.phase as string;
+           if (
+             rawPhase === "independent" ||
++            rawPhase === "incubating" ||
+             rawPhase === "working" ||
+             rawPhase === "reviewing"
+           ) {
+@@ -613,133 +696,12 @@ export default function QueenDM() {
+         }
+ 
+         case "tool_call_started": {
+-          const toolName = (event.data?.tool_name as string) || "unknown";
+-          const toolUseId = (event.data?.tool_use_id as string) || "";
+-          const sid = event.stream_id;
+-          const execId = event.execution_id || "exec";
+-          const eventCreatedAt = event.timestamp
+-            ? new Date(event.timestamp).getTime()
+-            : Date.now();
+-
+-          // Track which pill message this tool belongs to so deferred
+-          // completions (ask_user) can find it after the turn counter changes.
+-          const msgId = `tool-pill-${sid}-${execId}-${turnCounterRef.current}`;
+-          toolUseToPillRef.current[toolUseId] = { msgId, name: toolName };
+-
+-          setActiveToolCalls((prev) => {
+-            const newActive = {
+-              ...prev,
+-              [toolUseId]: { name: toolName, done: false },
+-            };
+-            const tools = Object.entries(newActive).map(([, t]) => ({
+-              name: t.name,
+-              done: t.done,
+-            }));
+-            const allDone = tools.length > 0 && tools.every((t) => t.done);
+-            const toolMsg: ChatMessage = {
+-              id: msgId,
+-              agent: queenName,
+-              agentColor: "",
+-              content: JSON.stringify({ tools, allDone }),
+-              timestamp: "",
+-              type: "tool_status",
+-              role: "queen",
+-              thread: "queen-dm",
+-              createdAt: eventCreatedAt,
+-              nodeId: event.node_id || undefined,
+-              executionId: event.execution_id || undefined,
+-              streamId: sid || undefined,
+-            };
+-            setMessages((prevMsgs) => {
+-              const idx = prevMsgs.findIndex((m) => m.id === msgId);
+-              if (idx >= 0) {
+-                return prevMsgs.map((m, i) =>
+-                  i === idx ? { ...toolMsg, createdAt: m.createdAt ?? toolMsg.createdAt } : m,
+-                );
+-              }
+-              // Insert in sorted position by createdAt
+-              const ts = toolMsg.createdAt ?? Date.now();
+-              let insertIdx = prevMsgs.length - 1;
+-              while (insertIdx >= 0 && (prevMsgs[insertIdx].createdAt ?? 0) > ts) {
+-                insertIdx--;
+-              }
+-              if (insertIdx === -1 || insertIdx === prevMsgs.length - 1) {
+-                return [...prevMsgs, toolMsg];
+-              }
+-              const next = [...prevMsgs];
+-              next.splice(insertIdx + 1, 0, toolMsg);
+-              return next;
+-            });
+-            return newActive;
+-          });
++          for (const msg of emittedMessages) upsertMessage(msg);
+           break;
+         }
+ 
+         case "tool_call_completed": {
+-          const toolUseId = (event.data?.tool_use_id as string) || "";
+-
+-          // Look up the original pill message this tool belongs to.
+-          // For deferred completions (ask_user), the turn counter and
+-          // activeToolCalls have already been reset by llm_turn_complete,
+-          // so we rely on the ref recorded during tool_call_started.
+-          const tracked = toolUseToPillRef.current[toolUseId];
+-          delete toolUseToPillRef.current[toolUseId];
+-
+-          // Mark done in activeToolCalls if still present (normal case)
+-          setActiveToolCalls((prev) => {
+-            if (!prev[toolUseId]) return prev;
+-            return {
+-              ...prev,
+-              [toolUseId]: { ...prev[toolUseId], done: true },
+-            };
+-          });
+-
+-          // Determine the correct pill message ID
+-          const sid = event.stream_id;
+-          const execId = event.execution_id || "exec";
+-          const pillMsgId =
+-            tracked?.msgId ??
+-            `tool-pill-${sid}-${execId}-${turnCounterRef.current}`;
+-          const toolName = tracked?.name;
+-
+-          // Update the pill message content directly
+-          setMessages((prevMsgs) => {
+-            const idx = prevMsgs.findIndex((m) => m.id === pillMsgId);
+-            if (idx < 0) return prevMsgs;
+-
+-            try {
+-              const parsed = JSON.parse(prevMsgs[idx].content);
+-              const tools: { name: string; done: boolean }[] =
+-                parsed.tools || [];
+-
+-              if (toolName) {
+-                let marked = false;
+-                for (let i = 0; i < tools.length; i++) {
+-                  if (
+-                    tools[i].name === toolName &&
+-                    !tools[i].done &&
+-                    !marked
+-                  ) {
+-                    tools[i] = { ...tools[i], done: true };
+-                    marked = true;
+-                  }
+-                }
+-              }
+-
+-              const allDone =
+-                tools.length > 0 && tools.every((t) => t.done);
+-              return prevMsgs.map((m, i) =>
+-                i === idx
+-                  ? {
+-                      ...m,
+-                      content: JSON.stringify({ tools, allDone }),
+-                    }
+-                  : m,
+-              );
+-            } catch {
+-              return prevMsgs;
+-            }
+-          });
++          for (const msg of emittedMessages) upsertMessage(msg);
+           break;
+         }
+ 
+@@ -747,7 +709,7 @@ export default function QueenDM() {
+           break;
+       }
+     },
+-    [queenName, refresh],
++    [queenName, refresh, upsertMessage],
+   );
+ 
+   const sseSessions = useMemo((): Record<string, string> => {
+@@ -757,19 +719,60 @@ export default function QueenDM() {
+ 
+   useMultiSSE({ sessions: sseSessions, onEvent: handleSSEEvent });
+ 
+-  // Send handler
++  // Core backend send — used both for immediate sends and for Steer /
++  // auto-flush paths out of the pending queue.
++  const sendToBackend = useCallback(
++    (text: string, images?: ImageContent[]) => {
++      if (!sessionId) return;
++      executionApi.chat(sessionId, text, images).catch(() => {
++        setIsTyping(false);
++        setIsStreaming(false);
++      });
++    },
++    [sessionId],
++  );
++
++  const {
++    enqueue: enqueuePending,
++    steer: handleSteer,
++    cancelQueued: handleCancelQueued,
++    flushNext: flushNextPending,
++    flushNextRef: flushNextPendingRef,
++    clear: clearPendingQueue,
++  } = usePendingQueue({
++    sendToBackend,
++    setMessages,
++    onFlushStart: useCallback(() => {
++      setIsTyping(true);
++      queenAboutToResumeRef.current = true;
++    }, []),
++  });
++
++  // Reset the queue whenever we navigate to a different queen. The hook
++  // outlives the route change (same component instance), so without this,
++  // a message queued for Queen A would auto-flush into Queen B's session
++  // on B's next execution_completed.
++  useEffect(() => {
++    clearPendingQueue();
++  }, [queenId, clearPendingQueue]);
++
++  // Send handler. Queues when the queen is mid-turn (unless the user is
++  // answering an ask_user prompt, which must send immediately to unblock
++  // the loop). Queued messages are held locally until Steer, Cancel, or
++  // the next `execution_completed` auto-flush.
+   const handleSend = useCallback(
+     (text: string, _thread: string, images?: ImageContent[]) => {
+-      if (awaitingInput) {
++      const answeringQuestion = awaitingInput;
++      if (answeringQuestion) {
+         setAwaitingInput(false);
+-        setPendingQuestion(null);
+-        setPendingOptions(null);
++        setPendingQuestions(null);
+       }
+ 
+-      const isQueenBusy = isTyping;
+-      const clientMessageId = makeId();
++      const shouldQueue = !answeringQuestion && isTyping;
++
++      const msgId = makeId();
+       const userMsg: ChatMessage = {
+-        id: clientMessageId,
++        id: msgId,
+         agent: "You",
+         agentColor: "",
+         content: text,
+@@ -778,41 +781,88 @@ export default function QueenDM() {
+         thread: "queen-dm",
+         createdAt: Date.now(),
+         images,
+-        queued: isQueenBusy || undefined,
+-        clientMessageId,
++        queued: shouldQueue,
+       };
+       setMessages((prev) => [...prev, userMsg]);
+-      setIsTyping(true);
+ 
+-      if (sessionId) {
+-        executionApi.chat(sessionId, text, images, undefined, clientMessageId).catch(() => {
+-          setIsTyping(false);
+-          setIsStreaming(false);
+-        });
++      if (shouldQueue) {
++        enqueuePending(msgId, { text, images });
++        return;
+       }
+-    },
+-    [sessionId, awaitingInput, isTyping],
+-  );
+ 
+-  const handleQuestionAnswer = useCallback(
+-    (answer: string) => {
+-      setAwaitingInput(false);
+-      setPendingQuestion(null);
+-      setPendingOptions(null);
+-      handleSend(answer, "queen-dm");
++      setIsTyping(true);
++      sendToBackend(text, images);
+     },
+-    [handleSend],
++    [awaitingInput, isTyping, sendToBackend, enqueuePending],
+   );
+ 
+-  const handleMultiQuestionAnswer = useCallback(
++  const handleColonySpawn = useCallback(() => {
++    const colony = cloneColonyName.trim();
++    if (!colony) return;
++    const task = cloneTask.trim();
++
++    const briefLines = [
++      `Colony name: ${colony}`,
++      `Purpose: ${task || "Use the current conversation to propose the colony's purpose."}`,
++    ];
++    if (showCloneOutputs && cloneOutputs.trim()) {
++      briefLines.push(`Expected outputs: ${cloneOutputs.trim()}`);
++    }
++    if (showCloneDataSources && cloneDataSources.trim()) {
++      briefLines.push(`Inputs, data sources, tools, or credentials: ${cloneDataSources.trim()}`);
++    }
++    if (showCloneSchedule && cloneSchedule.trim()) {
++      briefLines.push(`Schedule/triggers: ${cloneSchedule.trim()}`);
++    }
++    if (showCloneConcurrency && cloneConcurrency.trim()) {
++      briefLines.push(`Concurrency: ${cloneConcurrency.trim()}`);
++    }
++
++    const message = [
++      "I want to set up a persistent colony.",
++      "",
++      briefLines.join("\n"),
++      "",
++      "Please use start_incubating_colony if this is appropriate. Ask me for any missing details before calling create_colony, then generate the self-contained task, skill name, skill description, skill body, and any optional triggers or concurrency hint needed by the colony.",
++    ].join("\n");
++
++    handleSend(message, "queen-dm");
++    setCloneDialogOpen(false);
++    setCloneColonyName("");
++    setCloneTask("");
++    setCloneOutputs("");
++    setCloneDataSources("");
++    setCloneSchedule("");
++    setCloneConcurrency("");
++    setShowCloneOutputs(false);
++    setShowCloneDataSources(false);
++    setShowCloneSchedule(false);
++    setShowCloneConcurrency(false);
++  }, [
++    cloneColonyName,
++    cloneConcurrency,
++    cloneDataSources,
++    cloneOutputs,
++    cloneSchedule,
++    cloneTask,
++    handleSend,
++    showCloneDataSources,
++    showCloneConcurrency,
++    showCloneOutputs,
++    showCloneSchedule,
++  ]);
++
++  const handleQuestionAnswer = useCallback(
+     (answers: Record<string, string>) => {
+       setAwaitingInput(false);
+-      setPendingQuestion(null);
+-      setPendingOptions(null);
+       setPendingQuestions(null);
+-      const formatted = Object.entries(answers)
+-        .map(([id, val]) => `${id}: ${val}`)
+-        .join("\n");
++      // For a single question, send just the answer text. For a batch,
++      // send "id: answer" lines so the agent can map replies back.
++      const entries = Object.entries(answers);
++      const formatted =
++        entries.length === 1
++          ? entries[0][1]
++          : entries.map(([id, val]) => `${id}: ${val}`).join("\n");
+       handleSend(formatted, "queen-dm");
+     },
+     [handleSend],
+@@ -824,17 +874,15 @@ export default function QueenDM() {
+       await executionApi.cancelQueen(sessionId);
+       setIsTyping(false);
+       setIsStreaming(false);
+-      setActiveToolCalls({});
+-      toolUseToPillRef.current = {};
+-      // Clear queued flags since the queen is now idle
+-      setMessages((prev) => {
+-        if (!prev.some((m) => m.queued)) return prev;
+-        return prev.map((m) => (m.queued ? { ...m, queued: undefined } : m));
+-      });
++      replayStateRef.current = newReplayState();
++      // After cancelling the current turn, immediately send the oldest
++      // queued message (if any). The remaining queued messages stay put
++      // so the user can review them or Steer/Cancel individually.
++      flushNextPending();
+     } catch {
+       // ignore
+     }
+-  }, [sessionId]);
++  }, [sessionId, flushNextPending]);
+ 
+   return (
+     <div className="flex flex-col h-full">
+@@ -857,26 +905,43 @@ export default function QueenDM() {
+           messages={messages}
+           onSend={handleSend}
+           onCancel={handleCancelQueen}
++          onSteer={handleSteer}
++          onCancelQueued={handleCancelQueued}
+           activeThread="queen-dm"
+           isWaiting={isTyping && !isStreaming}
+           isBusy={isTyping}
+           disabled={loading || !queenReady}
+           queenPhase={queenPhase}
+-          showQueenPhaseBadge={false}
+-          pendingQuestion={awaitingInput ? pendingQuestion : null}
+-          pendingOptions={awaitingInput ? pendingOptions : null}
++          showQueenPhaseBadge
+           pendingQuestions={awaitingInput ? pendingQuestions : null}
+           onQuestionSubmit={handleQuestionAnswer}
+-          onMultiQuestionSubmit={handleMultiQuestionAnswer}
+           onQuestionDismiss={() => {
+             setAwaitingInput(false);
+-            setPendingQuestion(null);
+-            setPendingOptions(null);
++            setPendingQuestions(null);
+           }}
+           supportsImages={true}
+           initialDraft={initialDraft}
+           queenProfileId={queenId ?? null}
+           queenId={queenId}
++          onColonyLinkClick={handleColonyLinkClick}
++          colonySpawned={colonySpawned}
++          spawnedColonyName={spawnedColonyName}
++          queenDisplayName={queenName}
++          onCompactAndFork={handleCompactAndFork}
++          compactingAndForking={compactingAndForking}
++          onStartNewSession={handleCreateNewSession}
++          startingNewSession={creatingNewSession}
++          tokenUsage={tokenUsage}
++          headerAction={
++            <button
++              onClick={() => setCloneDialogOpen(true)}
++              disabled={!sessionId}
++              className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium text-primary hover:bg-primary/10 transition-colors disabled:opacity-40"
++            >
++              <Plus className="w-3 h-3" />
++              Start Colony Setup
++            </button>
++          }
+         />
+       </div>
+ 
+@@ -884,17 +949,19 @@ export default function QueenDM() {
+         <div className="fixed inset-0 z-50 flex items-center justify-center">
+           <div
+             className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+-            onClick={() => !spawning && setCloneDialogOpen(false)}
++            onClick={() => setCloneDialogOpen(false)}
+           />
+-          <div className="relative bg-card border border-border/60 rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4">
+-            <h2 className="text-sm font-semibold text-foreground">
+-              Fork to Colony
+-            </h2>
+-            <p className="text-[11px] text-muted-foreground">
+-              Forks the queen's full session into a new colony. Multiple
+-              sessions can run against it in parallel.
+-            </p>
+-            <div className="space-y-3">
++          <div className="relative flex w-full max-w-lg h-[min(560px,88vh)] flex-col overflow-hidden rounded-xl border border-border/60 bg-card shadow-2xl">
++            <div className="px-6 pt-5 pb-3 space-y-1">
++              <h2 className="text-sm font-semibold text-foreground">
++                Set Up a Colony
++              </h2>
++              <p className="text-[11px] text-muted-foreground">
++                Share the brief. The queen will fill gaps, write the worker skill,
++                and create the colony when the setup is ready.
++              </p>
++            </div>
++            <div className="flex-1 overflow-y-auto px-6 pb-4 space-y-3">
+               <div>
+                 <label className="block text-[11px] font-medium text-muted-foreground mb-1">
+                   Colony name
+@@ -914,36 +981,184 @@ export default function QueenDM() {
+               </div>
+               <div>
+                 <label className="block text-[11px] font-medium text-muted-foreground mb-1">
+-                  Task{" "}
+-                  <span className="text-muted-foreground/40">(optional)</span>
++                  What should it do?
+                 </label>
+-                <input
+-                  type="text"
++                <textarea
+                   value={cloneTask}
+                   onChange={(e) => setCloneTask(e.target.value)}
+-                  placeholder="Continue the work from the queen's session"
+-                  className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
++                  placeholder="Monitor launches, process a backlog, prepare a report, or continue this session's work."
++                  rows={3}
++                  className="w-full resize-none rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
+                 />
+               </div>
++
++              <div className="space-y-2 pt-1">
++                {!showCloneOutputs ? (
++                  <button
++                    type="button"
++                    onClick={() => setShowCloneOutputs(true)}
++                    className="flex w-full items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
++                  >
++                    <Plus className="h-3.5 w-3.5 shrink-0" />
++                    Expected output
++                  </button>
++                ) : (
++                  <div className="rounded-md border border-border/60 p-3 space-y-2">
++                    <button
++                      type="button"
++                      onClick={() => setShowCloneOutputs(false)}
++                      className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
++                      aria-label="Hide expected output"
++                    >
++                      <span className="text-[11px] font-medium">
++                        Expected output
++                      </span>
++                      <span className="inline-flex items-center gap-1 text-[11px] font-medium">
++                        <Minus className="h-3.5 w-3.5" />
++                        Hide
++                      </span>
++                    </button>
++                    <textarea
++                      value={cloneOutputs}
++                      onChange={(e) => setCloneOutputs(e.target.value)}
++                      placeholder="A digest, saved rows, alerts, files, or a final summary."
++                      rows={2}
++                      className="w-full resize-none rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
++                    />
++                  </div>
++                )}
++
++                {!showCloneDataSources ? (
++                  <button
++                    type="button"
++                    onClick={() => setShowCloneDataSources(true)}
++                    className="flex w-full items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
++                  >
++                    <Plus className="h-3.5 w-3.5 shrink-0" />
++                    Inputs, tools, or credentials
++                  </button>
++                ) : (
++                  <div className="rounded-md border border-border/60 p-3 space-y-2">
++                    <button
++                      type="button"
++                      onClick={() => setShowCloneDataSources(false)}
++                      className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
++                      aria-label="Hide inputs, tools, or credentials"
++                    >
++                      <span className="text-[11px] font-medium">
++                        Inputs, tools, or credentials
++                      </span>
++                      <span className="inline-flex items-center gap-1 text-[11px] font-medium">
++                        <Minus className="h-3.5 w-3.5" />
++                        Hide
++                      </span>
++                    </button>
++                    <textarea
++                      value={cloneDataSources}
++                      onChange={(e) => setCloneDataSources(e.target.value)}
++                      placeholder="APIs, websites, files, accounts, OAuth tools, or credentials it will need."
++                      rows={2}
++                      className="w-full resize-none rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
++                    />
++                  </div>
++                )}
++
++                {!showCloneSchedule ? (
++                  <button
++                    type="button"
++                    onClick={() => setShowCloneSchedule(true)}
++                    className="flex w-full items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
++                  >
++                    <Plus className="h-3.5 w-3.5 shrink-0" />
++                    Schedule / triggers
++                  </button>
++                ) : (
++                  <div className="rounded-md border border-border/60 p-3 space-y-2">
++                    <button
++                      type="button"
++                      onClick={() => setShowCloneSchedule(false)}
++                      className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
++                      aria-label="Hide schedule or triggers"
++                    >
++                      <span className="text-[11px] font-medium">
++                        Schedule / triggers
++                      </span>
++                      <span className="inline-flex items-center gap-1 text-[11px] font-medium">
++                        <Minus className="h-3.5 w-3.5" />
++                        Hide
++                      </span>
++                    </button>
++                    <textarea
++                      value={cloneSchedule}
++                      onChange={(e) => setCloneSchedule(e.target.value)}
++                      placeholder="Manual only, every weekday at 9 AM, every 30 minutes, or webhook path."
++                      rows={2}
++                      className="w-full resize-none rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
++                    />
++                  </div>
++                )}
++
++                {!showCloneConcurrency ? (
++                  <button
++                    type="button"
++                    onClick={() => setShowCloneConcurrency(true)}
++                    className="flex w-full items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
++                  >
++                    <Plus className="h-3.5 w-3.5 shrink-0" />
++                    Concurrency
++                  </button>
++                ) : (
++                  <div className="rounded-md border border-border/60 p-3 space-y-2">
++                    <button
++                      type="button"
++                      onClick={() => setShowCloneConcurrency(false)}
++                      className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
++                      aria-label="Hide concurrency"
++                    >
++                      <span className="text-[11px] font-medium">
++                        Concurrency
++                      </span>
++                      <span className="inline-flex items-center gap-1 text-[11px] font-medium">
++                        <Minus className="h-3.5 w-3.5" />
++                        Hide
++                      </span>
++                    </button>
++                    <input
++                      type="text"
++                      value={cloneConcurrency}
++                      onChange={(e) => setCloneConcurrency(e.target.value)}
++                      placeholder="1 for a single worker, 5 for a parallel backlog, or any limit to respect."
++                      className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
++                    />
++                  </div>
++                )}
++              </div>
+             </div>
+-            <div className="flex justify-end gap-2 pt-2">
++            <div className="mt-auto flex justify-end gap-2 border-t border-border/50 px-6 py-4">
+               <button
+                 onClick={() => {
+                   setCloneDialogOpen(false);
+                   setCloneColonyName("");
+                   setCloneTask("");
++                  setCloneOutputs("");
++                  setCloneDataSources("");
++                  setCloneSchedule("");
++                  setCloneConcurrency("");
++                  setShowCloneOutputs(false);
++                  setShowCloneDataSources(false);
++                  setShowCloneSchedule(false);
++                  setShowCloneConcurrency(false);
+                 }}
+-                disabled={spawning}
+                 className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+               >
+                 Cancel
+               </button>
+               <button
+                 onClick={handleColonySpawn}
+-                disabled={spawning || !cloneColonyName.trim()}
++                disabled={!cloneColonyName.trim()}
+                 className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+               >
+-                {spawning ? "Forking..." : "Fork"}
++                Start setup
+               </button>
+             </div>
+           </div>

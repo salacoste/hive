@@ -10,6 +10,10 @@ Container-first path is preferred for portable local-prod operations.
 - `scripts/hive_ops_run.sh`
   - Wrapper for one-shot commands via `docker compose --profile ops run --rm --no-deps hive-ops ...`.
   - Uses persistent host caches (`.cache/uv`, `.cache/uvproj`) to avoid cold-start penalty on repeated runs.
+  - Builds/uses dedicated `hive-ops` image (`HIVE_OPS_IMAGE`, default `hive-hive-ops`)
+    with ops-specific toolchain args (`HIVE_DOCKER_INSTALL_*_OPS`), including Node by default.
+  - Initializes writable ownership for mounted cache/volume paths so non-root `hiveuser`
+    can run `uv`/`npm` without permission issues.
 - `scripts/hive_ops_preflight.sh`
   - One-command preflight chain for backlog validation, docs/runbook checks, upstream contract checks,
     runtime parity, and backlog status artifact refresh.
@@ -114,6 +118,12 @@ Container-first path is preferred for portable local-prod operations.
 
 - `scripts/acceptance_weekly_maintenance.sh`
   - One-command digest + hygiene + regression guard.
+  - Optional deep profile hook:
+    - `HIVE_ACCEPTANCE_WEEKLY_DEEP_PROFILE=true`
+    - `HIVE_ACCEPTANCE_WEEKLY_DEEP_PROJECT_ID=<project-id>`
+- `scripts/acceptance_deep_profile.sh`
+  - One-command container-first deep execution:
+    - `full-deep` gate preset + backlog status artifact refresh + ops summary json.
 - `scripts/install_acceptance_weekly_launchd.sh`
 - `scripts/status_acceptance_weekly_launchd.sh`
 - `scripts/uninstall_acceptance_weekly_launchd.sh`
@@ -237,3 +247,5 @@ Container-first path is preferred for portable local-prod operations.
    - `HIVE_ACCEPTANCE_SELF_CHECK_RUN_PRESET_SMOKE=true HIVE_ACCEPTANCE_SELF_CHECK_RUN_RUNTIME_PARITY=true ./scripts/acceptance_toolchain_self_check.sh`
 11. Full deep self-check wrapper:
    - `./scripts/acceptance_toolchain_self_check_deep.sh`
+12. One-command deep acceptance execution:
+   - `./scripts/acceptance_deep_profile.sh --project <project-id>`

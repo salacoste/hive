@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T10:13:16Z",
+  "wave": "Wave16-R12B",
+  "title": "Autonomous policy/review continuity expansion lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "policy and review-feedback continuity expansion remains stable across evaluate/auto-next/report flows",
+      "report/read-model behavior remains stable across no-checks/manual-pending/deferred/reject branches with review-comment publishing path",
+      "no regressions observed in targeted Wave16-R12B bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_evaluate_endpoint_accepts_status_field or pipeline_loop_tick_dispatches_next_when_idle or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "8 passed, 185 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R12B lane closed as keep-local with green policy/review continuity expansion bundle",
+      "next lane continues tick/run-cycle/report continuity consolidation"
+    ]
+  }
+}

@@ -241,6 +241,14 @@ Optional compiler/toolchain profiles (on demand):
   - `HIVE_DOCKER_INSTALL_RUST=0|1`
   - `HIVE_DOCKER_INSTALL_JAVA=0|1`
 - This avoids baking every compiler into every local image by default.
+- `hive-ops` uses a dedicated image (`HIVE_OPS_IMAGE`, default `hive-hive-ops`)
+  with independent build args:
+  - `HIVE_DOCKER_INSTALL_NODE_OPS=0|1` (default `1`)
+  - `HIVE_DOCKER_INSTALL_GO_OPS=0|1`
+  - `HIVE_DOCKER_INSTALL_RUST_OPS=0|1`
+  - `HIVE_DOCKER_INSTALL_JAVA_OPS=0|1`
+  - `HIVE_DOCKER_INSTALL_PLAYWRIGHT_OPS=0|1` (default `0`)
+- This keeps `hive-core` lean by default while enabling container-first frontend/tooling checks in `hive-ops`.
 
 Toolchain planning (dry-run):
 
@@ -302,6 +310,10 @@ Container-only ops runner (fast repeatable checks on workspace bind mount):
 
 # Targeted test example:
 ./scripts/hive_ops_run.sh uv run pytest core/tests/test_queen_memory.py -q
+
+# Frontend checks in container-first mode:
+./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm ci --no-audit --no-fund && npm run test -- src/api/ops.test.ts'
+./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm run build'
 ```
 
 Notes:
@@ -309,6 +321,11 @@ Notes:
 - `hive_ops_run.sh` uses `docker compose --profile ops run ... hive-ops` with persistent cache dirs:
   - `.cache/uv`
   - `.cache/uvproj`
+- `hive-ops` mounts isolated volume for `core/frontend/node_modules`
+  (`hive-frontend-node-modules`) to avoid host/container optional-dependency
+  conflicts (darwin vs linux rollup binaries).
+- `hive_ops_run.sh` pre-initializes writable ownership for mounted cache/volume
+  paths, so non-root `hiveuser` can run `uv` and `npm` without `EACCES`.
 - This avoids repeated heavy one-off `docker run` environment setup while keeping execution fully containerized.
 
 One-shot setup:
@@ -431,7 +448,13 @@ Runtime parity check (container vs expected API contract):
 ./scripts/check_runtime_parity.sh
 ```
 
-If parity check fails on `ops/status` contract fields (`alerts`, `loop`, `summary.include_runs`),
+Current parity gate validates:
+
+- `/api/autonomous/ops/status` contract (`alerts`, `loop`, `summary.include_runs/project_filter`);
+- `/api/llm/queue/status` contract (`queue.*` and `fallback.policy/history`);
+- `/api/telegram/bridge/status` and `/api/telegram/bridge/bindings` contracts.
+
+If parity check fails on these contract fields,
 rebuild/redeploy `hive-core` from current repo state and rerun the check.
 
 Full autonomous ops drill (recommended before/after prod changes):
@@ -584,6 +607,12 @@ Acceptance artifact lifecycle knobs:
 - `HIVE_ACCEPTANCE_RUN_DOCS_NAV_CHECK` (`false` default; `true` runs docs navigation check inside gate)
 - `HIVE_ACCEPTANCE_RUN_PRESET_SMOKE` (`false` default; `true` runs preset smoke matrix inside gate)
 - `HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE` (`false` default; `true` runs real/template autonomous delivery e2e smoke)
+- `HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET` (`true` default; runs release minimal regression set: self-check + mcp health + API contracts)
+- `HIVE_ACCEPTANCE_MCP_HEALTH_SINCE_MINUTES` (default `30`; lookback window for gate `mcp_health_summary`)
+- `HIVE_ACCEPTANCE_GATE_RESULTS_JSON_PATH` (default `docs/ops/acceptance-reports/gate-latest.json`)
+- `HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH` (default `~/.hive/server/acceptance/gate-latest.json`; shared matrix snapshot path for runtime consumers such as Telegram digest)
+- `HIVE_ACCEPTANCE_WEEKLY_DEEP_PROFILE` (`false` default; when `true`, weekly maintenance also runs deep profile)
+- `HIVE_ACCEPTANCE_WEEKLY_DEEP_PROJECT_ID` (project scope for weekly deep profile hook; default `default`)
 
 Acceptance gate toggles quick reference:
 
@@ -595,6 +624,7 @@ Acceptance gate toggles quick reference:
 - `HIVE_ACCEPTANCE_RUN_DOCS_NAV_CHECK=true`: enforce docs navigation integrity in gate.
 - `HIVE_ACCEPTANCE_RUN_PRESET_SMOKE=true`: run preset matrix smoke (`fast|strict|full`) in gate.
 - `HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE=true`: run autonomous delivery e2e smoke (`real_repo` + `template_repo`).
+- `HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET=true`: enforce release baseline (`self-check`, `mcp_health_summary`, `ops health`, `api health/ops/telegram` contracts).
 
 Weekly trend digest:
 
@@ -613,9 +643,17 @@ Weekly trend digest:
 # one-command weekly maintenance
 ./scripts/acceptance_weekly_maintenance.sh
 
+# weekly maintenance + deep acceptance profile hook (container-first)
+HIVE_ACCEPTANCE_WEEKLY_DEEP_PROFILE=true \
+HIVE_ACCEPTANCE_WEEKLY_DEEP_PROJECT_ID=default \
+./scripts/acceptance_weekly_maintenance.sh
+
 # compact ops snapshot from latest artifacts
 ./scripts/hive_ops_run.sh uv run --no-project python scripts/acceptance_ops_summary.py
 ./scripts/hive_ops_run.sh uv run --no-project python scripts/acceptance_ops_summary.py --json
+
+# latest release matrix from acceptance gate execution
+cat docs/ops/acceptance-reports/gate-latest.json
 
 # scheduler state + recent logs snapshot
 ./scripts/acceptance_scheduler_snapshot.sh
@@ -683,6 +721,18 @@ HIVE_ACCEPTANCE_SELF_CHECK_RUN_RUNTIME_PARITY=true \
 
 # backlog archive index consistency (no unknown timestamps, no stale refs)
 ./scripts/hive_ops_run.sh uv run --no-project python scripts/check_backlog_archive_index.py
+
+# upstream destructive-lane guardrail (run before any upstream apply/replay)
+./scripts/hive_ops_run.sh uv run --no-project python scripts/check_upstream_destructive_lanes.py \
+  --base-ref HEAD --upstream-ref upstream/main
+
+# upstream post-apply regression gate (smoke profile)
+./scripts/upstream_sync_regression_gate.sh
+
+# upstream post-apply regression gate (full profile before lane sign-off)
+HIVE_UPSTREAM_SYNC_GATE_PROFILE=full \
+HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default \
+./scripts/upstream_sync_regression_gate.sh
 ```
 
 Acceptance report artifacts index:
@@ -743,6 +793,9 @@ HIVE_ACCEPTANCE_RUN_DOCS_NAV_CHECK=true \
 ./scripts/acceptance_gate_presets.sh strict
 ./scripts/acceptance_gate_presets.sh full
 ./scripts/acceptance_gate_presets.sh full-deep
+
+# one-command deep profile (full-deep gate + backlog artifact refresh + ops summary json)
+./scripts/acceptance_deep_profile.sh --project default
 
 # preview preset env without running gate
 ./scripts/acceptance_gate_presets.sh fast --print-env-only
@@ -1081,6 +1134,10 @@ CLI overrides (higher priority than env):
 What they validate:
 
 - backlog task/status structure and `Current Focus` consistency
+- single-repo autonomous cycle contract
+  (`project onboarding -> backlog -> execute-next -> run-until-terminal -> report`)
+  and locked fallback matrix:
+  (`onboarding deferred`, `no_checks_policy`, `GitHub evaluate fallback`)
 - compact backlog execution summary (focus/in-progress/status counts)
 - machine-readable backlog summary for automation hooks (`backlog_status.py --json`)
 - backlog status artifacts (`docs/ops/backlog-status/latest.json` + timestamp snapshots)
@@ -1123,6 +1180,7 @@ Backlog compaction cadence:
 - End of each execution wave: run full checklist in
   `docs/autonomous-factory/BACKLOG_COMPACTION_CHECKLIST.md`.
 - Weekly maintenance: rerun checklist even without wave closure.
+- Active wave acceptance (current): `docs/ops/wave-17-acceptance-checklist.md`.
 
 Backlog status auto-refresh playbook:
 
@@ -1149,6 +1207,35 @@ Backlog status drift troubleshooting:
 - If drift reason is `live_backlog_status_unavailable`, run:
   - `./scripts/hive_ops_run.sh uv run --no-project python scripts/backlog_status.py --json`
   and inspect script/runtime errors before rerunning drift check.
+
+Autonomous intake contract (wave-18):
+
+1. Get canonical payload template:
+   - `GET /api/autonomous/backlog/intake/template`
+2. Validate payload before creating backlog task:
+   - `POST /api/autonomous/backlog/intake/validate`
+3. Enforce strict contract on creation:
+   - add `"strict_intake": true` to backlog create payload, or set `HIVE_AUTONOMOUS_INTAKE_STRICT=1`.
+4. Telegram helper:
+   - `/intake_template` shows required fields and example JSON.
+5. Web UI helper:
+   - in colony chat top bar click `Intake` to open template + validator modal.
+
+Autonomous run guardrails (wave-18):
+
+1. Configure per-project via execution template:
+   - `PATCH /api/projects/{project_id}/execution-template`
+   - field: `execution_template.run_guardrails`
+2. Supported keys:
+   - `max_run_seconds`
+   - `max_tool_calls_execution_stage`
+   - `max_loop_ticks_per_run`
+   - `stop_action` (`failed|escalated`)
+   - `fail_on_unknown_action`
+   - `container_only`
+3. Visibility:
+   - run report includes `report.guardrail_stop` on terminal guardrail action;
+   - ops summary includes `guardrail_stops_total` and `guardrail_stops_by_reason`.
 
 Fast local rebuild mode (skip Playwright browser deps in image):
 
@@ -1223,6 +1310,11 @@ Expected signals:
 - bot returns a reply for each input
 - no `ERROR`/`Traceback` during flow
 
+Container note (Data button behavior):
+
+- In Docker runtime, opening host folder via `xdg-open` is not available by design.
+- Use in-app `Session Data Explorer` / `Download .zip` as the supported path for session files.
+
 Record template:
 
 ```text
@@ -1265,6 +1357,68 @@ Operator mode switching guide:
 2. If another process owns bot updates, disable Hive polling with `HIVE_TELEGRAM_BRIDGE_ENABLED=0` to avoid poller conflicts.
 3. After restart, verify ownership via `/api/telegram/bridge/status` (`poller_owner=true`, `running=true`).
 4. In steady-state logs there should be no recurring `getUpdates ... Conflict` / `409` lines.
+5. Use bridge telemetry fields to confirm stabilization:
+   - `poll_conflict_409_count` (grows only when real conflict happens),
+   - `last_poll_conflict_recover_result` (`delete_webhook_ok|cooldown|disabled_by_env|delete_webhook_failed:...`),
+   - `last_poll_conflict_409_at` / `last_poll_conflict_recover_at`,
+   - `poll_conflict_warning_active` (soft warning flag when conflict rate is rising),
+   - `last_poll_conflict_age_seconds` (seconds since last conflict).
+6. Tune soft warning sensitivity if needed:
+   - `HIVE_TELEGRAM_CONFLICT_WARN_THRESHOLD` (default `3`),
+   - `HIVE_TELEGRAM_CONFLICT_WARN_WINDOW_SECONDS` (default `3600`).
+
+`409 Conflict: terminated by other getUpdates request` quick playbook:
+
+1. Confirm current bridge owner/status:
+
+```bash
+curl -sS http://localhost:${HIVE_CORE_PORT:-8787}/api/telegram/bridge/status | jq .
+```
+
+2. Check whether webhook mode is enabled accidentally (must be empty for polling mode):
+
+```bash
+docker exec hive-core sh -lc 'python - <<'"'"'PY'"'"'
+import os, json, urllib.request
+from urllib.parse import quote
+token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+url = "https://api.telegram.org/bot" + quote(token, safe="") + "/getWebhookInfo"
+with urllib.request.urlopen(url, timeout=20) as r:
+    data = json.loads(r.read().decode())
+res = data.get("result", {}) if isinstance(data, dict) else {}
+print(json.dumps({
+    "ok": data.get("ok"),
+    "has_webhook": bool(res.get("url")),
+    "url": res.get("url") or "",
+    "pending_update_count": res.get("pending_update_count"),
+    "last_error_message": res.get("last_error_message"),
+}))
+PY'
+```
+
+3. If webhook is set but you use polling, clear it:
+
+```bash
+docker exec hive-core sh -lc 'python - <<'"'"'PY'"'"'
+import os, json, urllib.request
+from urllib.parse import quote
+token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+url = "https://api.telegram.org/bot" + quote(token, safe="") + "/deleteWebhook?drop_pending_updates=true"
+with urllib.request.urlopen(url, timeout=20) as r:
+    print(r.read().decode())
+PY'
+```
+
+4. If webhook is already empty and `409` still repeats, another poller with the same bot token is running on another host/process. Stop that consumer or disable Hive polling there:
+   - `HIVE_TELEGRAM_BRIDGE_ENABLED=0`
+   - then restart local `hive-core` once and re-check `/api/telegram/bridge/status`.
+5. For operator-driven recovery without container restart, call:
+
+```bash
+curl -sS -X POST http://localhost:${HIVE_CORE_PORT:-8787}/api/telegram/bridge/recover \
+  -H 'Content-Type: application/json' \
+  -d '{"force_delete_webhook":true,"drop_pending_updates":false,"reset_conflict_telemetry":true,"clear_last_error":true}' | jq .
+```
 
 ## 10) Telegram-First Autonomous Development (Operator Flow)
 

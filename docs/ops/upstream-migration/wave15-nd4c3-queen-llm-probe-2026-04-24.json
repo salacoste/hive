@@ -1,0 +1,30 @@
+{
+  "generated_at_utc": "2026-04-24T16:39:00Z",
+  "lane": "ND-4C3",
+  "title": "Queen + LLM bounded replay probe",
+  "patch": "docs/ops/upstream-migration/wave15-nd4c3-queen-llm.patch",
+  "probe_command": "git apply --check docs/ops/upstream-migration/wave15-nd4c3-queen-llm.patch",
+  "exit_code": 1,
+  "classification": "reconcile-required",
+  "conflicts": [
+    "core/framework/agents/queen/nodes/__init__.py",
+    "core/framework/llm/litellm.py"
+  ],
+  "scope_files": [
+    "core/framework/agents/queen/incubating_evaluator.py",
+    "core/framework/agents/queen/mcp_servers.json",
+    "core/framework/agents/queen/nodes/__init__.py",
+    "core/framework/agents/queen/queen_memory_v2.py",
+    "core/framework/agents/queen/queen_profiles.py",
+    "core/framework/agents/queen/queen_tools_config.py",
+    "core/framework/agents/queen/queen_tools_defaults.py",
+    "core/framework/agents/queen/recall_selector.py",
+    "core/framework/agents/queen/reflection_agent.py",
+    "core/framework/llm/antigravity.py",
+    "core/framework/llm/litellm.py",
+    "core/framework/llm/mock.py",
+    "core/framework/llm/model_catalog.json",
+    "core/framework/llm/provider.py",
+    "core/framework/llm/stream_events.py"
+  ]
+}

@@ -27,6 +27,20 @@ export default memo(function ColonyHeader({
   const [hovered, setHovered] = useState(false);
   const showPause = runState === "running" && hovered;
 
+  const handleReveal = async () => {
+    if (!sessionId) return;
+    try {
+      const result = await sessionsApi.revealFolder(sessionId);
+      if (!result.opened) {
+        const encoded = encodeURIComponent(sessionId);
+        window.open(`/api/sessions/${encoded}/export`, "_blank", "noopener,noreferrer");
+      }
+    } catch {
+      const encoded = encodeURIComponent(sessionId);
+      window.open(`/api/sessions/${encoded}/export`, "_blank", "noopener,noreferrer");
+    }
+  };
+
   return (
     <div className="h-12 flex items-center justify-between px-5 border-b border-border/60 bg-card/50 backdrop-blur-sm flex-shrink-0">
       {/* Left: colony name */}
@@ -44,16 +58,17 @@ export default memo(function ColonyHeader({
           <KeyRound className="w-3.5 h-3.5" />
           Credentials
         </button>
-        {sessionId && (
-          <button
-            onClick={() => sessionsApi.revealFolder(sessionId).catch(() => {})}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
-            title="Open session data folder"
-          >
-            <FolderOpen className="w-3.5 h-3.5" />
-            Data
-          </button>
-        )}
+        <button
+          onClick={() => {
+            void handleReveal();
+          }}
+          disabled={!sessionId}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
+          title="Open session data folder"
+        >
+          <FolderOpen className="w-3.5 h-3.5" />
+          Data
+        </button>
         <BrowserStatusBadge />
 
         <span className="w-px h-4 bg-border/60" />

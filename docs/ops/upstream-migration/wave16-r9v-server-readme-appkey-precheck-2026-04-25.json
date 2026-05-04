@@ -1,0 +1,31 @@
+{
+  "generated_at_utc": "2026-04-25T20:01:08Z",
+  "wave": "Wave16-R9V",
+  "title": "Server README AppKey docs alignment lane precheck",
+  "scope": [
+    "core/framework/server/README.md"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/server/README.md",
+      "add": 1,
+      "del": 1,
+      "total": 2
+    }
+  },
+  "delta_summary": [
+    "docs aligned from raw `request.app[\"manager\"]` to typed `request.app[APP_KEY_MANAGER]` access pattern"
+  ],
+  "risk_signals": [
+    {
+      "type": "docs-contract-drift",
+      "evidence": "codebase uses APP_KEY constants for aiohttp AppKey compatibility",
+      "impact": "outdated docs can regress future edits back to raw-string access"
+    }
+  ],
+  "planned_validation": [
+    "documentation lane; no runtime behavior change expected",
+    "rely on already green server API bundles from adjacent AppKey lanes"
+  ],
+  "decision_gate": "prefer keep_local when docs align with current typed AppKey contract"
+}

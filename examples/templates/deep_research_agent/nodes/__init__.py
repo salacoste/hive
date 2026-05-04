@@ -11,7 +11,7 @@ intake_node = NodeSpec(
     node_type="event_loop",
     client_facing=True,
     max_node_visits=0,
-    input_keys=["task", "topic", "user_request", "contract", "source", "autonomous_mode"],
+    input_keys=["user_request"],
     output_keys=["research_brief"],
     success_criteria=(
         "The research brief is specific and actionable: it states the topic, "
@@ -25,11 +25,6 @@ You are a research intake specialist. Your ONLY job is to have a brief conversat
 - You do NOT fetch sources
 - The research happens in the NEXT stage after you complete intake
 - Do NOT ask for or expect web_search or web_scrape tools
-
-If autonomous_mode is true OR source == "autonomous_pipeline":
-- Do not ask clarifying questions.
-- Build a concise research brief directly from task/topic/user_request.
-- Immediately call set_output("research_brief", "...") and finish this node.
 
 **STEP 1 — Read and respond (text only, NO tool calls):**
 1. Read the user_request provided
@@ -55,7 +50,7 @@ research_node = NodeSpec(
     description="Search the web, fetch source content, and compile findings",
     node_type="event_loop",
     max_node_visits=0,
-    input_keys=["research_brief", "feedback", "source", "autonomous_mode", "task", "topic", "user_request"],
+    input_keys=["research_brief", "feedback"],
     output_keys=["findings", "sources", "gaps"],
     nullable_output_keys=["feedback"],
     success_criteria=(
@@ -66,10 +61,6 @@ research_node = NodeSpec(
 You are a research agent. Given a research brief, find and analyze sources.
 
 If feedback is provided, this is a follow-up round — focus on the gaps identified.
-
-If autonomous_mode is true OR source == "autonomous_pipeline":
-- Keep the run bounded and deterministic: target 3-5 strong sources, then finalize outputs.
-- Do not wait for extra user interaction in this node.
 
 Work in phases:
 1. **Search**: Use web_search with 3-5 diverse queries covering different angles.
@@ -93,7 +84,6 @@ Context management:
 references remain in the conversation — use load_data() to recover any content you need.
 - Use append_data('research_notes.md', ...) to maintain a running log of key findings \
 as you go. This survives compaction and helps the report node produce a detailed report.
-- Never pass data_dir="." or data_dir="/app". Omit data_dir and let runtime inject it.
 
 When done, use set_output (one key at a time, separate turns):
 - set_output("findings", "Structured summary: key findings with source URLs for each claim. \
@@ -120,7 +110,7 @@ review_node = NodeSpec(
     node_type="event_loop",
     client_facing=True,
     max_node_visits=0,
-    input_keys=["findings", "sources", "gaps", "research_brief", "source", "autonomous_mode"],
+    input_keys=["findings", "sources", "gaps", "research_brief"],
     output_keys=["needs_more_research", "feedback"],
     success_criteria=(
         "The user has been presented with findings and has explicitly indicated "
@@ -128,13 +118,6 @@ review_node = NodeSpec(
     ),
     system_prompt="""\
 Present the research findings to the user clearly and concisely.
-
-If autonomous_mode is true OR source == "autonomous_pipeline":
-- Skip user Q&A.
-- Set outputs immediately:
-  - set_output("needs_more_research", "false")
-  - set_output("feedback", "")
-- Finish this node.
 
 **STEP 1 — Present (your first message, text only, NO tool calls):**
 1. **Summary** (2-3 sentences of what was found)
@@ -162,7 +145,7 @@ report_node = NodeSpec(
     node_type="event_loop",
     client_facing=True,
     max_node_visits=0,
-    input_keys=["findings", "sources", "research_brief", "source", "autonomous_mode"],
+    input_keys=["findings", "sources", "research_brief"],
     output_keys=["delivery_status", "next_action"],
     success_criteria=(
         "An HTML report has been saved, the file link has been presented to the user, "
@@ -272,12 +255,6 @@ report covers. Ask if they have questions.
   - set_output("delivery_status", "completed")
   - set_output("next_action", "new_topic")       — if they want a new topic
   - set_output("next_action", "more_research")   — if they want deeper research
-
-Autonomous mode override:
-- If autonomous_mode is true OR source == "autonomous_pipeline", do not wait for user follow-up.
-- After serving the file, set:
-  - set_output("delivery_status", "completed")
-  - set_output("next_action", "new_topic")
 
 **IMPORTANT:**
 - Every factual claim MUST cite its source with [n] notation

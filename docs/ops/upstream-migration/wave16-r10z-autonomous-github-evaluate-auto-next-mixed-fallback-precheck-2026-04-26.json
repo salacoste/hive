@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-26T18:31:46Z",
+  "wave": "Wave16-R10Z",
+  "title": "Autonomous GitHub evaluate + auto-next mixed payload + fallback continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify evaluate continuity under partial/mixed GitHub payload fields",
+    "verify auto-next fallback/deferred behavior continuity under constrained policy conditions"
+  ],
+  "targeted_tests": [
+    "pipeline_evaluate_github_no_checks_success_policy",
+    "pipeline_evaluate_github_uses_pr_url_when_ref_missing",
+    "pipeline_evaluate_endpoint_accepts_status_field",
+    "pipeline_auto_next_no_checks_manual_pending_policy",
+    "pipeline_auto_next_deferred_without_token_in_manual_mode",
+    "pipeline_auto_next_endpoint"
+  ]
+}

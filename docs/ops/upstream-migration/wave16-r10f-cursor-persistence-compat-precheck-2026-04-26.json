@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-26T02:23:45Z",
+  "wave": "Wave16-R10F",
+  "title": "Cursor persistence event/trigger formatting compatibility lane precheck",
+  "scope": [
+    "core/framework/agent_loop/internals/cursor_persistence.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/agent_loop/internals/cursor_persistence.py",
+      "add": 5,
+      "del": 15,
+      "total": 20
+    }
+  },
+  "delta_summary": [
+    "removed timestamp prefixing from injected user/trigger messages",
+    "preserves external-event marker while storing client input verbatim",
+    "drops is_trigger write-path and keeps generic add_user_message persistence"
+  ],
+  "risk_signals": [
+    {
+      "type": "conversation-contract",
+      "evidence": "message text formatting changed for trigger/injection persistence",
+      "impact": "prompt-context or UI banner behavior can drift if downstream relies on old stamps"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_event_loop_node.py -k 'inject_event or cursor' -q",
+    "uv run --package framework pytest core/tests/test_node_conversation.py -q"
+  ],
+  "decision_gate": "keep_local acceptable if event-loop/node-conversation suites stay green with current message formatting"
+}

@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-25T13:20:49Z",
+  "wave": "Wave16-R9O",
+  "title": "Runtime package boundary lane precheck",
+  "scope": [
+    "core/framework/runtime/__init__.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/runtime/__init__.py",
+      "add": 5,
+      "del": 0,
+      "total": 5
+    }
+  },
+  "delta_summary": [
+    "local package initializer exports Runtime at `framework.runtime` boundary",
+    "keeps import ergonomics stable for runtime callers"
+  ],
+  "risk_signals": [
+    {
+      "type": "import-boundary-contract",
+      "evidence": "without __init__ export, callers depend on deep import path `framework.runtime.core`",
+      "impact": "upstream replay can break stable runtime import contract"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_runtime.py -q",
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'autonomous or execution' -q",
+    "uv run --package framework python - <<'PY' ... import framework.runtime export check ... PY"
+  ],
+  "decision_gate": "prefer keep_local if package export contract is required and targeted runtime/server bundles are green"
+}

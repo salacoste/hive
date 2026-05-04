@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T10:07:13Z",
+  "wave": "Wave16-R12A",
+  "title": "Autonomous wave handoff baseline continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "post-handoff baseline continuity across run-cycle/tick/evaluate/auto-next/report remains stable",
+      "report/read-model baseline consistency remains stable for handoff branches",
+      "no regressions observed in targeted Wave16-R12A baseline bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_report_endpoint or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "9 passed, 184 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R12A lane closed as keep-local with green handoff baseline continuity bundle",
+      "next lane continues Wave16-R12 policy+review continuity expansion"
+    ]
+  }
+}

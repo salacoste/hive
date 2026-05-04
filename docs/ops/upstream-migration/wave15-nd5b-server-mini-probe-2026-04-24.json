@@ -1,0 +1,20 @@
+{
+  "generated_at_utc": "2026-04-24T18:14:49Z",
+  "item": 286,
+  "lane": "ND-5B",
+  "title": "Server mini-lane probe (README + routes_events)",
+  "patch": "docs/ops/upstream-migration/wave15-nd5b-server-mini.patch",
+  "scope": [
+    "core/framework/server/README.md",
+    "core/framework/server/routes_events.py"
+  ],
+  "probe": {
+    "command": "git apply --check docs/ops/upstream-migration/wave15-nd5b-server-mini.patch",
+    "exit_code": 1,
+    "status": "reconcile_required",
+    "errors": [
+      "patch failed: core/framework/server/README.md:304",
+      "patch failed: core/framework/server/routes_events.py:209"
+    ]
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-24T15:38:31Z",
+  "lane": "ND-4A",
+  "title": "Frontend tools surface bounded replay execution",
+  "scope_files": [
+    "core/frontend/src/api/colonies.ts",
+    "core/frontend/src/api/mcp.ts",
+    "core/frontend/src/api/skills.ts",
+    "core/frontend/src/components/ColonyToolsSection.tsx",
+    "core/frontend/src/components/McpServersPanel.tsx",
+    "core/frontend/src/components/QueenToolsSection.tsx",
+    "core/frontend/src/components/ToolsEditor.tsx",
+    "core/frontend/src/hooks/use-pending-queue.ts",
+    "core/frontend/src/pages/skills-library.tsx",
+    "core/frontend/src/pages/tool-library.tsx",
+    "core/frontend/src/App.tsx",
+    "core/frontend/src/components/Sidebar.tsx",
+    "core/frontend/src/pages/org-chart.tsx",
+    "core/frontend/src/types/colony.ts"
+  ],
+  "apply": {
+    "primary_patch": "docs/ops/upstream-migration/wave15-nd4a-frontend-tools.patch",
+    "result": "ok",
+    "reconcile_followups": [
+      "applied upstream deltas for core/frontend/src/api/queens.ts",
+      "applied upstream deltas for core/frontend/src/lib/colony-registry.ts",
+      "applied upstream deltas for core/frontend/src/context/ColonyContext.tsx",
+      "applied upstream deltas for core/frontend/src/api/agents.ts",
+      "added compatibility fields in core/frontend/src/api/types.ts: DiscoverEntry.created_at/icon",
+      "updated colony timestamp typing and org-chart date format helpers for number|string inputs"
+    ]
+  },
+  "validation": {
+    "frontend_tests": {
+      "command": "cd core/frontend && npm test -- --run",
+      "result": "49 passed"
+    },
+    "frontend_build": {
+      "command": "cd core/frontend && npm run build",
+      "result": "ok"
+    },
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  }
+}

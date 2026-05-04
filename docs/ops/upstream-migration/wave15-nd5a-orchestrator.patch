@@ -1,0 +1,76 @@
+diff --git a/core/framework/orchestrator/client_io.py b/core/framework/orchestrator/client_io.py
+index 1fbc66c9..767a04d5 100644
+--- a/core/framework/orchestrator/client_io.py
++++ b/core/framework/orchestrator/client_io.py
+@@ -89,10 +89,12 @@ async def request_input(self, prompt: str = "", timeout: float | None = None) ->
+         self._input_result = None
+ 
+         if self._event_bus is not None:
++            # `prompt` is consumed by the caller separately (callers emit
++            # it as a text delta when needed). The event only carries the
++            # structured questions payload for widget rendering.
+             await self._event_bus.emit_client_input_requested(
+                 stream_id=self.node_id,
+                 node_id=self.node_id,
+-                prompt=prompt,
+                 execution_id=self._execution_id or None,
+             )
+ 
+diff --git a/core/framework/orchestrator/gcu.py b/core/framework/orchestrator/gcu.py
+index 620a7ea5..13575120 100644
+--- a/core/framework/orchestrator/gcu.py
++++ b/core/framework/orchestrator/gcu.py
+@@ -9,8 +9,8 @@
+ agent.json config.
+ 
+ Note: the canonical source of truth for browser automation guidance is
+-the ``browser-automation`` default skill at
+-``core/framework/skills/_default_skills/browser-automation/SKILL.md``.
++the ``browser-automation`` preset skill at
++``core/framework/skills/_preset_skills/browser-automation/SKILL.md``.
+ Activate that skill for the full decision tree. This module holds a
+ compact subset suitable for direct inlining into a node's system prompt
+ when a skill activation is not desired.
+diff --git a/core/framework/orchestrator/node.py b/core/framework/orchestrator/node.py
+index 961ee08a..6ba3ebfc 100644
+--- a/core/framework/orchestrator/node.py
++++ b/core/framework/orchestrator/node.py
+@@ -543,6 +543,10 @@ def effective_run_id(self) -> str | None:
+     # Dynamic memory provider — when set, EventLoopNode rebuilds the
+     # system prompt with the latest memory block each iteration.
+     dynamic_memory_provider: Any = None  # Callable[[], str] | None
++    # Surgical skills-catalog refresh, same contract as AgentContext's
++    # field of the same name. Lets workers pick up UI-driven skill
++    # toggles without rebuilding the full system prompt each turn.
++    dynamic_skills_catalog_provider: Any = None  # Callable[[], str] | None
+ 
+     # Skill system prompts — injected by the skill discovery pipeline
+     skills_catalog_prompt: str = ""  # Available skills XML catalog
+diff --git a/core/framework/orchestrator/safe_eval.py b/core/framework/orchestrator/safe_eval.py
+index 3697c4c3..ba9af87c 100644
+--- a/core/framework/orchestrator/safe_eval.py
++++ b/core/framework/orchestrator/safe_eval.py
+@@ -12,7 +12,9 @@
+ MAX_POWER_RESULT_BITS = 4_096
+ # Typical edge-condition evaluations in this repo complete well under 1ms.
+ # 100ms leaves ample headroom for legitimate checks while failing fast on abuse.
+-DEFAULT_TIMEOUT_MS = 100
++# On Windows (where SIGALRM is unavailable) the fallback relies on periodic
++# perf_counter polling which is less precise, so we use a wider margin.
++DEFAULT_TIMEOUT_MS = 100 if hasattr(signal, "SIGALRM") else 500
+ 
+ 
+ def _safe_pow(base: Any, exp: Any) -> Any:
+@@ -169,11 +171,7 @@ def visit_Tuple(self, node: ast.Tuple) -> tuple:
+         return tuple(self.visit(elt) for elt in node.elts)
+ 
+     def visit_Dict(self, node: ast.Dict) -> dict:
+-        return {
+-            self.visit(k): self.visit(v)
+-            for k, v in zip(node.keys, node.values, strict=False)
+-            if k is not None
+-        }
++        return {self.visit(k): self.visit(v) for k, v in zip(node.keys, node.values, strict=False) if k is not None}
+ 
+     # --- Operations ---
+     def visit_BinOp(self, node: ast.BinOp) -> Any:

@@ -1,20 +1,41 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { useParams, useLocation } from "react-router-dom";
-import { Loader2, WifiOff, KeyRound, FolderOpen, X, Users } from "lucide-react";
+import {
+  Loader2,
+  WifiOff,
+  KeyRound,
+  FolderOpen,
+  FileText,
+  X,
+  Users,
+  Gauge,
+  RefreshCw,
+} from "lucide-react";
 import type { GraphNode, NodeStatus } from "@/components/graph-types";
 import ChatPanel, { type ChatMessage, type ImageContent } from "@/components/ChatPanel";
 import CredentialsModal, {
   type Credential,
   clearCredentialCache,
 } from "@/components/CredentialsModal";
+import { llmApi, type LlmQueueSnapshot } from "@/api/llm";
+import { opsApi, type ReleaseMatrixSnapshot } from "@/api/ops";
+import {
+  autonomousApi,
+  type BacklogIntakeTemplateResponse,
+  type BacklogIntakeValidationErrorResponse,
+} from "@/api/autonomous";
 import { executionApi } from "@/api/execution";
 import { sessionsApi } from "@/api/sessions";
 import { useMultiSSE } from "@/hooks/use-sse";
+import { usePendingQueue } from "@/hooks/use-pending-queue";
 import type { LiveSession, AgentEvent } from "@/api/types";
 import {
-  sseEventToChatMessage,
+  findOptimisticUserMatchIndex,
   formatAgentDisplayName,
+  newReplayState,
+  replayEvent,
   replayEventsToMessages,
+  type ReplayState,
 } from "@/lib/chat-helpers";
 import {
   resolveInitialColonyPhase,
@@ -27,6 +48,7 @@ import { useHeaderActions } from "@/context/HeaderActionsContext";
 import { useColonyWorkers } from "@/context/ColonyWorkersContext";
 import { agentSlug, getQueenForAgent } from "@/lib/colony-registry";
 import BrowserStatusBadge from "@/components/BrowserStatusBadge";
+import DataExplorerModal from "@/components/DataExplorerModal";
 
 const makeId = () => Math.random().toString(36).slice(2, 9);
 
@@ -43,11 +65,54 @@ function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "..." : s;
 }
 
+function queueBadgeSummary(snapshot: LlmQueueSnapshot | null): {
+  label: string;
+  level: "idle" | "active" | "queued";
+  queued: number;
+} {
+  if (!snapshot) return { label: "--", level: "idle", queued: 0 };
+  const inFlight = snapshot.async.global.total_in_flight;
+  const limit = snapshot.limits.global_concurrency;
+  const queued = snapshot.async.global.total_queued;
+  const level: "idle" | "active" | "queued" =
+    queued > 0 ? "queued" : inFlight > 0 ? "active" : "idle";
+  const label = queued > 0 ? `${inFlight}/${limit} q${queued}` : `${inFlight}/${limit}`;
+  return { label, level, queued };
+}
+
+function releaseBadgeSummary(snapshot: ReleaseMatrixSnapshot | null): {
+  label: string;
+  status: "pass" | "fail" | "unknown";
+  mustPassed: number | null;
+  mustTotal: number | null;
+} {
+  if (!snapshot) {
+    return {
+      label: "--",
+      status: "unknown",
+      mustPassed: null,
+      mustTotal: null,
+    };
+  }
+  const mustPassed =
+    typeof snapshot.must_passed === "number" ? snapshot.must_passed : null;
+  const mustTotal =
+    typeof snapshot.must_total === "number" ? snapshot.must_total : null;
+  const matrix = mustPassed != null && mustTotal != null ? `${mustPassed}/${mustTotal}` : "--";
+  return {
+    label: `${snapshot.status} ${matrix}`,
+    status: snapshot.status,
+    mustPassed,
+    mustTotal,
+  };
+}
+
 // ── Session restore ──────────────────────────────────────────────────────────
 
 type SessionRestoreResult = {
   messages: ChatMessage[];
-  restoredPhase: "independent" | "working" | "reviewing" | null;
+  replayState: ReplayState;
+  restoredPhase: "independent" | "incubating" | "working" | "reviewing" | null;
   truncated: boolean;
   droppedCount: number;
 };
@@ -56,6 +121,7 @@ async function restoreSessionMessages(
   sessionId: string,
   thread: string,
   agentDisplayName: string,
+  queenDisplayName?: string,
 ): Promise<SessionRestoreResult> {
   try {
     const { events, truncated, total, returned } =
@@ -81,7 +147,14 @@ async function restoreSessionMessages(
         }
       }
 
-      const messages = replayEventsToMessages(events, thread, agentDisplayName);
+      const replayState = newReplayState();
+      const messages = replayEventsToMessages(
+        events,
+        thread,
+        agentDisplayName,
+        queenDisplayName,
+        replayState,
+      );
       // Stamp the latest phase on every queen message so the UI's
       // phase-badge rendering matches what the live path would have
       // displayed at the time of the refresh.
@@ -110,6 +183,7 @@ async function restoreSessionMessages(
       }
       return {
         messages,
+        replayState,
         restoredPhase: runningPhase ?? null,
         truncated,
         droppedCount,
@@ -118,7 +192,13 @@ async function restoreSessionMessages(
   } catch {
     // Event log not available
   }
-  return { messages: [], restoredPhase: null, truncated: false, droppedCount: 0 };
+  return {
+    messages: [],
+    replayState: newReplayState(),
+    restoredPhase: null,
+    truncated: false,
+    droppedCount: 0,
+  };
 }
 
 // ── Agent backend state ──────────────────────────────────────────────────────
@@ -139,7 +219,7 @@ interface AgentState {
   displayName: string | null;
   awaitingInput: boolean;
   workerInputMessageId: string | null;
-  queenPhase: "independent" | "working" | "reviewing";
+  queenPhase: "independent" | "incubating" | "working" | "reviewing";
   agentPath: string | null;
   currentRunId: string | null;
   nodeLogs: Record<string, string[]>;
@@ -155,9 +235,6 @@ interface AgentState {
   queenIsTyping: boolean;
   workerIsTyping: boolean;
   llmSnapshots: Record<string, string>;
-  activeToolCalls: Record<string, { name: string; done: boolean; streamId: string }>;
-  pendingQuestion: string | null;
-  pendingOptions: string[] | null;
   pendingQuestions: { id: string; prompt: string; options?: string[] }[] | null;
   pendingQuestionSource: "queen" | null;
   contextUsage: Record<
@@ -189,9 +266,6 @@ function defaultAgentState(): AgentState {
     queenIsTyping: false,
     workerIsTyping: false,
     llmSnapshots: {},
-    activeToolCalls: {},
-    pendingQuestion: null,
-    pendingOptions: null,
     pendingQuestions: null,
     pendingQuestionSource: null,
     contextUsage: {},
@@ -204,7 +278,7 @@ function defaultAgentState(): AgentState {
 export default function ColonyChat() {
   const { colonyId } = useParams<{ colonyId: string }>();
   const location = useLocation();
-  const { colonies, markVisited, refresh: refreshColonies } = useColony();
+  const { colonies, queenProfiles, markVisited, refresh: refreshColonies } = useColony();
   const { setActions } = useHeaderActions();
   const { toggleColonyWorkers } = useColonyWorkers();
 
@@ -219,7 +293,14 @@ export default function ColonyChat() {
   const colony = colonies.find((c) => c.id === colonyId);
   const agentPath = colony?.agentPath ?? routeState.agentPath ?? "";
   const slug = agentPath ? agentSlug(agentPath) : "";
-  const queenInfo = getQueenForAgent(slug);
+  const fallbackQueenInfo = getQueenForAgent(slug);
+  // Resolve queen name from the linked queen profile, falling back to registry
+  const linkedQueenProfile = colony?.queenProfileId
+    ? queenProfiles.find((q) => q.id === colony.queenProfileId)
+    : null;
+  const queenInfo = linkedQueenProfile
+    ? { name: linkedQueenProfile.name, role: linkedQueenProfile.title }
+    : fallbackQueenInfo;
   const colonyName = colony?.name ?? colonyId ?? "Colony";
 
   // Mark colony as visited when navigating to it
@@ -253,11 +334,204 @@ export default function ColonyChat() {
   const [credentialsOpen, setCredentialsOpen] = useState(false);
   const [credentialAgentPath, setCredentialAgentPath] = useState<string | null>(null);
   const [dismissedBanner, setDismissedBanner] = useState<string | null>(null);
+  const [llmQueueSnapshot, setLlmQueueSnapshot] = useState<LlmQueueSnapshot | null>(null);
+  const [llmQueueOpen, setLlmQueueOpen] = useState(false);
+  const [llmQueueLoading, setLlmQueueLoading] = useState(false);
+  const [llmQueueRefreshing, setLlmQueueRefreshing] = useState(false);
+  const [llmQueueError, setLlmQueueError] = useState<string | null>(null);
+  const [releaseMatrixSnapshot, setReleaseMatrixSnapshot] = useState<ReleaseMatrixSnapshot | null>(
+    null,
+  );
+  const [releaseMatrixOpen, setReleaseMatrixOpen] = useState(false);
+  const [releaseMatrixLoading, setReleaseMatrixLoading] = useState(false);
+  const [releaseMatrixRefreshing, setReleaseMatrixRefreshing] = useState(false);
+  const [intakeContractOpen, setIntakeContractOpen] = useState(false);
+  const [intakeTemplate, setIntakeTemplate] = useState<BacklogIntakeTemplateResponse | null>(null);
+  const [intakeTemplateLoading, setIntakeTemplateLoading] = useState(false);
+  const [intakeTemplateRefreshing, setIntakeTemplateRefreshing] = useState(false);
+  const [intakeTemplateError, setIntakeTemplateError] = useState<string | null>(null);
+  const [intakeDraft, setIntakeDraft] = useState("");
+  const [intakeValidationOk, setIntakeValidationOk] = useState<string | null>(null);
+  const [intakeValidationErrors, setIntakeValidationErrors] = useState<string[]>([]);
+  const [intakeValidationHints, setIntakeValidationHints] = useState<string[]>([]);
+  const [intakeValidating, setIntakeValidating] = useState(false);
+  const [dataExplorerOpen, setDataExplorerOpen] = useState(false);
+  const [dataExplorerSessionId, setDataExplorerSessionId] = useState<string | null>(null);
+  const [releaseMatrixError, setReleaseMatrixError] = useState<string | null>(null);
+  const llmQueueSnapshotRef = useRef<LlmQueueSnapshot | null>(null);
+  llmQueueSnapshotRef.current = llmQueueSnapshot;
+  const releaseMatrixSnapshotRef = useRef<ReleaseMatrixSnapshot | null>(null);
+  releaseMatrixSnapshotRef.current = releaseMatrixSnapshot;
+
+  const queueBadge = useMemo(() => queueBadgeSummary(llmQueueSnapshot), [llmQueueSnapshot]);
+  const releaseBadge = useMemo(
+    () => releaseBadgeSummary(releaseMatrixSnapshot),
+    [releaseMatrixSnapshot],
+  );
+
+  const refreshLlmQueueStatus = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      const silent = opts?.silent === true;
+      if (!silent && !llmQueueSnapshotRef.current) setLlmQueueLoading(true);
+      if (!silent) setLlmQueueRefreshing(true);
+      try {
+        const data = await llmApi.queueStatus();
+        setLlmQueueSnapshot(data.queue);
+        setLlmQueueError(null);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setLlmQueueError(message);
+      } finally {
+        if (!silent) setLlmQueueRefreshing(false);
+        if (!silent && !llmQueueSnapshotRef.current) setLlmQueueLoading(false);
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    refreshLlmQueueStatus({ silent: false }).catch(() => {});
+    const timer = window.setInterval(() => {
+      refreshLlmQueueStatus({ silent: true }).catch(() => {});
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [refreshLlmQueueStatus]);
+
+  const refreshReleaseMatrix = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      const silent = opts?.silent === true;
+      if (!silent && !releaseMatrixSnapshotRef.current) setReleaseMatrixLoading(true);
+      if (!silent) setReleaseMatrixRefreshing(true);
+      try {
+        const data = await opsApi.releaseMatrix();
+        setReleaseMatrixSnapshot(data);
+        setReleaseMatrixError(null);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setReleaseMatrixError(message);
+      } finally {
+        if (!silent) setReleaseMatrixRefreshing(false);
+        if (!silent && !releaseMatrixSnapshotRef.current) setReleaseMatrixLoading(false);
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    refreshReleaseMatrix({ silent: false }).catch(() => {});
+    const timer = window.setInterval(() => {
+      refreshReleaseMatrix({ silent: true }).catch(() => {});
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [refreshReleaseMatrix]);
+
+  const refreshIntakeTemplate = useCallback(
+    async (opts?: { forceResetDraft?: boolean }) => {
+      const forceResetDraft = opts?.forceResetDraft === true;
+      if (!intakeTemplate) setIntakeTemplateLoading(true);
+      setIntakeTemplateRefreshing(true);
+      try {
+        const payload = await autonomousApi.intakeTemplate();
+        setIntakeTemplate(payload);
+        setIntakeTemplateError(null);
+        const nextDraft = JSON.stringify(payload.example, null, 2);
+        setIntakeDraft((prev) =>
+          forceResetDraft || !prev.trim() ? nextDraft : prev,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setIntakeTemplateError(message);
+      } finally {
+        if (!intakeTemplate) setIntakeTemplateLoading(false);
+        setIntakeTemplateRefreshing(false);
+      }
+    },
+    [intakeTemplate],
+  );
+
+  const openIntakeContract = useCallback(() => {
+    setIntakeContractOpen(true);
+    setIntakeValidationOk(null);
+    setIntakeValidationErrors([]);
+    setIntakeValidationHints([]);
+    if (!intakeTemplate) {
+      refreshIntakeTemplate({ forceResetDraft: true }).catch(() => {});
+    }
+  }, [intakeTemplate, refreshIntakeTemplate]);
+
+  const validateIntakeDraft = useCallback(async () => {
+    setIntakeValidationOk(null);
+    setIntakeValidationErrors([]);
+    setIntakeValidationHints([]);
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(intakeDraft || "{}") as Record<string, unknown>;
+    } catch {
+      setIntakeValidationErrors(["Payload must be valid JSON."]);
+      setIntakeValidationHints([
+        "Paste JSON from template and edit required fields only.",
+      ]);
+      return;
+    }
+
+    setIntakeValidating(true);
+    try {
+      const result = await autonomousApi.validateIntake(parsed);
+      setIntakeValidationOk(
+        `Valid payload. delivery_mode=${result.normalized.delivery_mode}`,
+      );
+    } catch (err) {
+      const fallback = err instanceof Error ? err.message : String(err);
+      if (err instanceof ApiError) {
+        const body = err.body as BacklogIntakeValidationErrorResponse;
+        const errors = Array.isArray(body.errors)
+          ? body.errors.map((x) => String(x))
+          : [body.error || fallback];
+        const hints = Array.isArray(body.hints)
+          ? body.hints.map((x) => String(x))
+          : [];
+        setIntakeValidationErrors(errors);
+        setIntakeValidationHints(hints);
+      } else {
+        setIntakeValidationErrors([fallback]);
+      }
+    } finally {
+      setIntakeValidating(false);
+    }
+  }, [intakeDraft]);
 
   // ── Header actions (Credentials, Data, Browser) ─────────────────────────
   useEffect(() => {
     setActions(
       <>
+        <button
+          onClick={() => setLlmQueueOpen(true)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors flex-shrink-0 ${
+            queueBadge.level === "queued"
+              ? "text-amber-300 bg-amber-500/10 hover:bg-amber-500/15"
+              : queueBadge.level === "active"
+                ? "text-primary/90 bg-primary/10 hover:bg-primary/15"
+                : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+          }`}
+          title="Runtime LLM queue status"
+        >
+          <Gauge className="w-3.5 h-3.5" />
+          Queue {queueBadge.label}
+        </button>
+        <button
+          onClick={() => setReleaseMatrixOpen(true)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors flex-shrink-0 ${
+            releaseBadge.status === "fail"
+              ? "text-destructive bg-destructive/10 hover:bg-destructive/15"
+              : releaseBadge.status === "pass"
+                ? "text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/15"
+                : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+          }`}
+          title="Release readiness matrix status"
+        >
+          <Gauge className="w-3.5 h-3.5" />
+          Auto {releaseBadge.label}
+        </button>
         <button
           onClick={() => setCredentialsOpen(true)}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
@@ -265,11 +539,22 @@ export default function ColonyChat() {
           <KeyRound className="w-3.5 h-3.5" />
           Credentials
         </button>
+        <button
+          onClick={openIntakeContract}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
+          title="Open autonomous task intake template and validator"
+        >
+          <FileText className="w-3.5 h-3.5" />
+          Intake
+        </button>
         {agentState.sessionId && (
           <button
-            onClick={() => sessionsApi.revealFolder(agentState.sessionId!).catch(() => {})}
+            onClick={() => {
+              setDataExplorerSessionId(agentState.sessionId!);
+              setDataExplorerOpen(true);
+            }}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0"
-            title="Open session data folder"
+            title="Open session data explorer"
           >
             <FolderOpen className="w-3.5 h-3.5" />
             Data
@@ -289,7 +574,16 @@ export default function ColonyChat() {
       </>,
     );
     return () => setActions(null);
-  }, [agentState.sessionId, setActions, toggleColonyWorkers]);
+  }, [
+    agentState.sessionId,
+    openIntakeContract,
+    queueBadge.label,
+    queueBadge.level,
+    releaseBadge.label,
+    releaseBadge.status,
+    setActions,
+    toggleColonyWorkers,
+  ]);
 
   // Refs for SSE callback stability
   const messagesRef = useRef(messages);
@@ -297,15 +591,15 @@ export default function ColonyChat() {
   const agentStateRef = useRef(agentState);
   agentStateRef.current = agentState;
 
-  const turnCounterRef = useRef<Record<string, number>>({});
-  // Maps tool_use_id → the pill message ID and tool name that was created for it.
-  // Survives turn counter resets so deferred completions (e.g. ask_user) can
-  // find and update the correct pill even after the counter changes.
-  const toolUseToPillRef = useRef<
-    Record<string, { msgId: string; name: string }>
-  >({});
+  const replayStateRef = useRef(newReplayState());
+  // Timestamp of the latest restored message — SSE events older than this
+  // are duplicates from the ring-buffer replay and should be skipped.
+  const restoreCutoffRef = useRef<number>(0);
   const queenPhaseRef = useRef<string>("independent");
-  const queenIterTextRef = useRef<Record<string, Record<number, string>>>({});
+  // Flipped true by the auto-flush path; consumed by the next empty-prompt
+  // client_input_requested so we don't flicker the typing bubble off while
+  // the queen is about to resume on the flushed input.
+  const queenAboutToResumeRef = useRef(false);
   const suppressIntroRef = useRef(false);
   const loadingRef = useRef(false);
 
@@ -325,34 +619,15 @@ export default function ColonyChat() {
           );
         }
         if (options?.reconcileOptimisticUser && chatMsg.type === "user" && prev.length > 0) {
-          const incomingClientMessageId = chatMsg.clientMessageId?.trim();
-          if (incomingClientMessageId) {
-            const byClientIdIdx = prev.findIndex(
-              (m) =>
-                m.type === "user" &&
-                (m.clientMessageId?.trim() || "") === incomingClientMessageId,
-            );
-            if (byClientIdIdx !== -1) {
-              return prev.map((m, i) =>
-                i === byClientIdIdx ? { ...m, id: chatMsg.id, queued: undefined } : m,
-              );
-            }
-          }
-          // Match by content + timestamp across the whole list (not just
-          // the last slot) so a queued user message still reconciles
-          // even when the queen's previous reply slotted in between.
-          // Also drops the "queued" indicator since the backend has
-          // now confirmed receipt.
-          const incomingTs = chatMsg.createdAt ?? Date.now();
-          const matchIdx = prev.findIndex(
-            (m) =>
-              m.type === "user" &&
-              m.content === chatMsg.content &&
-              Math.abs(incomingTs - (m.createdAt ?? incomingTs)) <= 15000,
-          );
-          if (matchIdx !== -1) {
+          // Optimistic user bubbles have no executionId; server echoes do.
+          // Match the oldest unreconciled optimistic with the same content —
+          // that's the FIFO-correct pick for both auto-flush and Steer.
+          const idx = findOptimisticUserMatchIndex(prev, chatMsg);
+          if (idx !== -1) {
             return prev.map((m, i) =>
-              i === matchIdx ? { ...m, id: chatMsg.id, queued: undefined } : m,
+              i === idx
+                ? { ...m, id: chatMsg.id, executionId: chatMsg.executionId }
+                : m,
             );
           }
         }
@@ -469,7 +744,7 @@ export default function ColonyChat() {
         }
       }
 
-      let restoredPhase: "independent" | "working" | "reviewing" | null = null;
+      let restoredPhase: "independent" | "incubating" | "working" | "reviewing" | null = null;
 
       if (!liveSession) {
         if (coldRestoreId) {
@@ -478,6 +753,7 @@ export default function ColonyChat() {
             coldRestoreId,
             agentPath,
             displayName,
+            queenInfo.name,
           );
         }
 
@@ -492,6 +768,7 @@ export default function ColonyChat() {
       const session = liveSession!;
       const displayName = formatAgentDisplayName(session.colony_name || agentPath);
       let restoredMessages: ChatMessage[] = [];
+      let restoredReplayState: ReplayState | null = null;
       const reusePrefetchedRestore = shouldUsePrefetchedColonyRestore(
         coldRestoreId,
         session.session_id,
@@ -503,14 +780,17 @@ export default function ColonyChat() {
           session.session_id,
           agentPath,
           displayName,
+          queenInfo.name,
         );
         if (restored.messages.length > 0) {
           restoredMessages = restored.messages;
         }
+        restoredReplayState = restored.replayState;
         restoredPhase = restored.restoredPhase;
       } else if (prefetchedRestore) {
         if (reusePrefetchedRestore) {
           restoredMessages = prefetchedRestore.messages;
+          restoredReplayState = prefetchedRestore.replayState;
           restoredPhase = prefetchedRestore.restoredPhase;
         } else {
           // The backend corrected the resume target to the colony's forked
@@ -520,15 +800,24 @@ export default function ColonyChat() {
             session.session_id,
             agentPath,
             displayName,
+            queenInfo.name,
           );
           restoredMessages = restored.messages;
+          restoredReplayState = restored.replayState;
           restoredPhase = restored.restoredPhase;
         }
+      }
+
+      if (restoredReplayState) {
+        replayStateRef.current = restoredReplayState;
       }
 
       if (restoredMessages.length > 0) {
         restoredMessages.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
         setMessages(restoredMessages);
+        // Record the latest restored timestamp so SSE replay duplicates are skipped
+        const maxTs = Math.max(...restoredMessages.map((m) => m.createdAt ?? 0));
+        restoreCutoffRef.current = maxTs;
       }
 
       const initialPhase = resolveInitialColonyPhase({
@@ -576,11 +865,10 @@ export default function ColonyChat() {
       setMessages([]);
       setGraphNodes([]);
       setAgentState(defaultAgentState());
-      turnCounterRef.current = {};
-      toolUseToPillRef.current = {};
+      replayStateRef.current = newReplayState();
       queenPhaseRef.current = "independent";
-      queenIterTextRef.current = {};
       suppressIntroRef.current = false;
+      restoreCutoffRef.current = 0;
       loadingRef.current = false;
       loadSession();
     }
@@ -595,20 +883,32 @@ export default function ColonyChat() {
       const suppressQueenMessages = isQueen && suppressIntroRef.current;
       const state = agentStateRef.current;
       const agentDisplayName = state.displayName;
-      const displayName = isQueen ? queenInfo.name : agentDisplayName || undefined;
-      const role = isQueen ? ("queen" as const) : ("worker" as const);
       const ts = fmtLogTs(event.timestamp);
-      const turnKey = streamId;
-      const currentTurn = turnCounterRef.current[turnKey] ?? 0;
       const eventCreatedAt = event.timestamp
         ? new Date(event.timestamp).getTime()
         : Date.now();
+
+      // Skip SSE replay events that were already restored from history
+      if (
+        restoreCutoffRef.current > 0 &&
+        eventCreatedAt <= restoreCutoffRef.current &&
+        (event.type === "client_output_delta" || event.type === "llm_text_delta" || event.type === "client_input_received")
+      ) {
+        return;
+      }
+
       const shouldMarkQueenReady = isQueen && !state.queenReady;
+      const emittedMessages = replayEvent(
+        replayStateRef.current,
+        event,
+        agentPath,
+        agentDisplayName || undefined,
+        queenInfo.name,
+      );
 
       switch (event.type) {
         case "execution_started":
           if (isQueen) {
-            turnCounterRef.current[turnKey] = currentTurn + 1;
             updateState({
               isTyping: true,
               queenIsTyping: true,
@@ -630,7 +930,6 @@ export default function ColonyChat() {
                 createdAt: eventCreatedAt,
               });
             }
-            turnCounterRef.current[turnKey] = currentTurn + 1;
             updateState({
               isTyping: true,
               isStreaming: false,
@@ -640,9 +939,6 @@ export default function ColonyChat() {
               nodeLogs: {},
               subagentReports: [],
               llmSnapshots: {},
-              activeToolCalls: {},
-              pendingQuestion: null,
-              pendingOptions: null,
               pendingQuestions: null,
               pendingQuestionSource: null,
             });
@@ -662,12 +958,21 @@ export default function ColonyChat() {
               awaitingInput: false,
               workerInputMessageId: null,
               llmSnapshots: {},
-              pendingQuestion: null,
-              pendingOptions: null,
               pendingQuestions: null,
               pendingQuestionSource: null,
             });
             markAllNodesAs(["running", "looping"], "complete");
+          }
+          break;
+
+        case "llm_turn_complete":
+          // Flush one queued message per queen LLM-turn boundary. Workers'
+          // LLM turns don't drain the queen queue. execution_completed
+          // fires only at session shutdown (the queen's loop parks in
+          // _await_user_input between turns), so this is the real "turn
+          // ended" signal. Mid-tool-call boundaries count too.
+          if (isQueen) {
+            flushNextPendingRef.current();
           }
           break;
 
@@ -677,37 +982,15 @@ export default function ColonyChat() {
         case "client_input_received":
         case "client_input_requested":
         case "llm_text_delta": {
-          const chatMsg = sseEventToChatMessage(event, agentPath, displayName, currentTurn);
-          if (chatMsg && !suppressQueenMessages) {
-            // Merge queen inner_turns within same iteration
-            if (
-              isQueen &&
-              (event.type === "client_output_delta" || event.type === "llm_text_delta") &&
-              event.execution_id
-            ) {
-              const iter = event.data?.iteration ?? 0;
-              const inner = (event.data?.inner_turn as number) ?? 0;
-              const iterKey = `${event.execution_id}:${iter}`;
-              if (!queenIterTextRef.current[iterKey]) {
-                queenIterTextRef.current[iterKey] = {};
+          if (!suppressQueenMessages) {
+            for (const msg of emittedMessages) {
+              if (isQueen) {
+                msg.phase = queenPhaseRef.current as ChatMessage["phase"];
               }
-              const snapshot =
-                (event.data?.snapshot as string) || (event.data?.content as string) || "";
-              queenIterTextRef.current[iterKey][inner] = snapshot;
-              const parts = queenIterTextRef.current[iterKey];
-              const sorted = Object.keys(parts)
-                .map(Number)
-                .sort((a, b) => a - b);
-              chatMsg.content = sorted.map((k) => parts[k]).join("\n");
-              chatMsg.id = `queen-stream-${event.execution_id}-${iter}`;
+              upsertMessage(msg, {
+                reconcileOptimisticUser: event.type === "client_input_received",
+              });
             }
-            if (isQueen) {
-              chatMsg.role = role;
-              chatMsg.phase = queenPhaseRef.current as ChatMessage["phase"];
-            }
-            upsertMessage(chatMsg, {
-              reconcileOptimisticUser: event.type === "client_input_received",
-            });
           }
 
           if (event.type === "llm_text_delta" || event.type === "client_output_delta") {
@@ -728,24 +1011,27 @@ export default function ColonyChat() {
           }
 
           if (event.type === "client_input_requested") {
-            const rawOptions = event.data?.options;
-            const options = Array.isArray(rawOptions) ? (rawOptions as string[]) : null;
             const rawQuestions = event.data?.questions;
             const questions = Array.isArray(rawQuestions)
               ? (rawQuestions as { id: string; prompt: string; options?: string[] }[])
               : null;
             if (isQueen) {
-              const prompt = (event.data?.prompt as string) || "";
-              updateState({
-                awaitingInput: true,
-                isTyping: false,
-                isStreaming: false,
-                queenIsTyping: false,
-                pendingQuestion: prompt || null,
-                pendingOptions: options,
-                pendingQuestions: questions,
-                pendingQuestionSource: "queen",
-              });
+              // An empty-prompt client_input_requested means the queen parked
+              // in auto-wait. If we just auto-flushed a queued message, our
+              // inject will unblock her in a moment — skip flipping isTyping
+              // off so the thinking bubble doesn't flicker.
+              if (queenAboutToResumeRef.current && !questions) {
+                queenAboutToResumeRef.current = false;
+              } else {
+                updateState({
+                  awaitingInput: true,
+                  isTyping: false,
+                  isStreaming: false,
+                  queenIsTyping: false,
+                  pendingQuestions: questions,
+                  pendingQuestionSource: "queen",
+                });
+              }
             }
           }
 
@@ -756,8 +1042,6 @@ export default function ColonyChat() {
               queenIsTyping: false,
               workerIsTyping: false,
               awaitingInput: false,
-              pendingQuestion: null,
-              pendingOptions: null,
               pendingQuestions: null,
               pendingQuestionSource: null,
             });
@@ -773,8 +1057,6 @@ export default function ColonyChat() {
               queenIsTyping: false,
               workerIsTyping: false,
               awaitingInput: false,
-              pendingQuestion: null,
-              pendingOptions: null,
               pendingQuestions: null,
               pendingQuestionSource: null,
             });
@@ -791,8 +1073,7 @@ export default function ColonyChat() {
         }
 
         case "node_loop_started":
-          turnCounterRef.current[turnKey] = currentTurn + 1;
-          updateState({ isTyping: true, activeToolCalls: {} });
+          updateState({ isTyping: true });
           if (!isQueen && event.node_id) {
             const existing = graphNodes.find((n) => n.id === event.node_id);
             const isRevisit = existing?.status === "complete";
@@ -804,14 +1085,10 @@ export default function ColonyChat() {
           break;
 
         case "node_loop_iteration":
-          turnCounterRef.current[turnKey] = currentTurn + 1;
           if (isQueen) {
             updateState({
               isStreaming: false,
-              activeToolCalls: {},
               awaitingInput: false,
-              pendingQuestion: null,
-              pendingOptions: null,
               pendingQuestions: null,
               pendingQuestionSource: null,
             });
@@ -819,10 +1096,7 @@ export default function ColonyChat() {
             updateState({
               isStreaming: false,
               workerIsTyping: true,
-              activeToolCalls: {},
               awaitingInput: false,
-              pendingQuestion: null,
-              pendingOptions: null,
               pendingQuestions: null,
               pendingQuestionSource: null,
             });
@@ -888,41 +1162,13 @@ export default function ColonyChat() {
               );
             }
 
-            const toolName = (event.data?.tool_name as string) || "unknown";
-            const toolUseId = (event.data?.tool_use_id as string) || "";
-
-            const sid = event.stream_id;
-            // Track which pill message this tool belongs to so deferred
-            // completions (ask_user) can find it after the turn counter changes.
-            toolUseToPillRef.current[toolUseId] = {
-              msgId: `tool-pill-${sid}-${event.execution_id || "exec"}-${currentTurn}`,
-              name: toolName,
-            };
-            setAgentState((prev) => {
-              const newActive = {
-                ...prev.activeToolCalls,
-                [toolUseId]: { name: toolName, done: false, streamId: sid },
-              };
-              const tools = Object.values(newActive)
-                .filter((t) => t.streamId === sid)
-                .map((t) => ({ name: t.name, done: t.done }));
-              const allDone = tools.length > 0 && tools.every((t) => t.done);
-              upsertMessage({
-                id: `tool-pill-${sid}-${event.execution_id || "exec"}-${currentTurn}`,
-                agent: agentDisplayName || event.node_id || "Agent",
-                agentColor: "",
-                content: JSON.stringify({ tools, allDone }),
-                timestamp: "",
-                type: "tool_status",
-                role,
-                thread: agentPath,
-                createdAt: eventCreatedAt,
-                nodeId: event.node_id || undefined,
-                executionId: event.execution_id || undefined,
-                streamId: sid || undefined,
-              });
-              return { ...prev, isStreaming: false, activeToolCalls: newActive };
-            });
+            for (const msg of emittedMessages) {
+              if (msg.role === "queen") {
+                msg.phase = queenPhaseRef.current as ChatMessage["phase"];
+              }
+              upsertMessage(msg);
+            }
+            updateState({ isStreaming: false });
           }
           break;
         }
@@ -930,7 +1176,6 @@ export default function ColonyChat() {
         case "tool_call_completed": {
           if (event.node_id) {
             const toolName = (event.data?.tool_name as string) || "unknown";
-            const toolUseId = (event.data?.tool_use_id as string) || "";
             const isError = event.data?.is_error as boolean | undefined;
             const result = event.data?.result as string | undefined;
             if (isError) {
@@ -943,74 +1188,12 @@ export default function ColonyChat() {
               appendNodeLog(event.node_id, `${ts} INFO  ${toolName} done${resultStr}`);
             }
 
-            // Look up the original pill message this tool belongs to.
-            // For deferred completions (ask_user), the turn counter and
-            // activeToolCalls have already been reset, so we rely on the
-            // ref recorded during tool_call_started.
-            const tracked = toolUseToPillRef.current[toolUseId];
-            delete toolUseToPillRef.current[toolUseId];
-
-            const sid = event.stream_id;
-
-            // Mark done in activeToolCalls if still present (normal case)
-            setAgentState((prev) => {
-              if (!prev.activeToolCalls[toolUseId]) return prev;
-              return {
-                ...prev,
-                activeToolCalls: {
-                  ...prev.activeToolCalls,
-                  [toolUseId]: {
-                    ...prev.activeToolCalls[toolUseId],
-                    done: true,
-                  },
-                },
-              };
-            });
-
-            // Determine the correct pill message ID
-            const pillMsgId =
-              tracked?.msgId ??
-              `tool-pill-${sid}-${event.execution_id || "exec"}-${currentTurn}`;
-            const trackedName = tracked?.name;
-
-            // Update the pill message content directly
-            setMessages((prevMsgs) => {
-              const idx = prevMsgs.findIndex((m) => m.id === pillMsgId);
-              if (idx < 0) return prevMsgs;
-
-              try {
-                const parsed = JSON.parse(prevMsgs[idx].content);
-                const tools: { name: string; done: boolean }[] =
-                  parsed.tools || [];
-
-                if (trackedName) {
-                  let marked = false;
-                  for (let i = 0; i < tools.length; i++) {
-                    if (
-                      tools[i].name === trackedName &&
-                      !tools[i].done &&
-                      !marked
-                    ) {
-                      tools[i] = { ...tools[i], done: true };
-                      marked = true;
-                    }
-                  }
-                }
-
-                const allDone =
-                  tools.length > 0 && tools.every((t) => t.done);
-                return prevMsgs.map((m, i) =>
-                  i === idx
-                    ? {
-                        ...m,
-                        content: JSON.stringify({ tools, allDone }),
-                      }
-                    : m,
-                );
-              } catch {
-                return prevMsgs;
+            for (const msg of emittedMessages) {
+              if (msg.role === "queen") {
+                msg.phase = queenPhaseRef.current as ChatMessage["phase"];
               }
-            });
+              upsertMessage(msg);
+            }
           }
           break;
         }
@@ -1136,10 +1319,14 @@ export default function ColonyChat() {
             setGraphNodes((prev) =>
               prev.map((n) => {
                 if (n.id !== `__trigger_${triggerId}`) return n;
-                const { next_fire_in: _, ...restConfig } = (n.triggerConfig || {}) as Record<
-                  string,
-                  unknown
-                > & { next_fire_in?: unknown };
+                const {
+                  next_fire_in: _nfi,
+                  next_fire_at: _nfa,
+                  ...restConfig
+                } = (n.triggerConfig || {}) as Record<string, unknown> & {
+                  next_fire_in?: unknown;
+                  next_fire_at?: unknown;
+                };
                 return { ...n, status: "pending" as NodeStatus, triggerConfig: restConfig };
               }),
             );
@@ -1151,8 +1338,49 @@ export default function ColonyChat() {
           const triggerId = event.data?.trigger_id as string;
           if (triggerId) {
             const nodeId = `__trigger_${triggerId}`;
+            // Merge refreshed fire stats + next-fire anchor into the node's
+            // triggerConfig so the countdown re-anchors and the card shows
+            // an up-to-date "fired Nx · last 2m ago" badge.
+            const fireCount = event.data?.fire_count as number | undefined;
+            const lastFiredAt = event.data?.last_fired_at as number | undefined;
+            const nextFireAt = event.data?.next_fire_at as number | undefined;
+            const nextFireIn = event.data?.next_fire_in as number | undefined;
+            setGraphNodes((prev) =>
+              prev.map((n) => {
+                if (n.id !== nodeId) return n;
+                const config = { ...(n.triggerConfig || {}) };
+                if (fireCount != null) config.fire_count = fireCount;
+                if (lastFiredAt != null) config.last_fired_at = lastFiredAt;
+                if (nextFireAt != null) config.next_fire_at = nextFireAt;
+                if (nextFireIn != null) config.next_fire_in = nextFireIn;
+                return { ...n, triggerConfig: config };
+              }),
+            );
             updateGraphNodeStatus(nodeId, "complete");
             setTimeout(() => updateGraphNodeStatus(nodeId, "running"), 1500);
+
+            // Render a banner in the chat marking the start of the turn the
+            // queen is about to run in response. Matches the replay path in
+            // chat-helpers.ts (case "trigger_fired") so live + restore look
+            // identical.
+            const bannerPayload = {
+              trigger_id: triggerId,
+              trigger_type: event.data?.trigger_type as string | undefined,
+              name: event.data?.name as string | undefined,
+              task: event.data?.task as string | undefined,
+              fire_count: fireCount,
+              last_fired_at: lastFiredAt,
+            };
+            upsertMessage({
+              id: `trigger-${triggerId}-${lastFiredAt ?? event.timestamp}`,
+              agent: "Trigger",
+              agentColor: "",
+              content: JSON.stringify(bannerPayload),
+              timestamp: "",
+              type: "trigger",
+              thread: agentPath,
+              createdAt: lastFiredAt ?? Date.now(),
+            });
           }
           break;
         }
@@ -1186,30 +1414,86 @@ export default function ColonyChat() {
 
   // ── Action handlers ────────────────────────────────────────────────────
 
+  // Core backend send — bypasses queue logic. Used both for the normal path
+  // (agent idle) and for Steer / auto-flush paths.
+  const sendToBackend = useCallback(
+    (text: string, images?: ImageContent[]) => {
+      if (!agentState.sessionId || !agentState.ready) return;
+      executionApi.chat(agentState.sessionId, text, images).catch((err: unknown) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        upsertMessage({
+          id: makeId(),
+          agent: "System",
+          agentColor: "",
+          content: `Failed to send message: ${errMsg}`,
+          timestamp: "",
+          type: "system",
+          thread: agentPath,
+          createdAt: Date.now(),
+        });
+        updateState({ isTyping: false, isStreaming: false, queenIsTyping: false });
+      });
+    },
+    [agentPath, agentState.sessionId, agentState.ready, updateState, upsertMessage],
+  );
+
+  const {
+    enqueue: enqueuePending,
+    steer: handleSteer,
+    cancelQueued: handleCancelQueued,
+    flushNext: flushNextPending,
+    flushNextRef: flushNextPendingRef,
+    clear: clearPendingQueue,
+  } = usePendingQueue({
+    sendToBackend,
+    setMessages,
+    onFlushStart: useCallback(() => {
+      updateState({ isTyping: true, queenIsTyping: true });
+      queenAboutToResumeRef.current = true;
+    }, [updateState]),
+  });
+
+  // Reset the queue whenever we navigate to a different colony (or to
+  // new-chat). The hook outlives the route change, so without this, a
+  // message queued in colony A would auto-flush into colony B's next
+  // execution_completed.
+  useEffect(() => {
+    clearPendingQueue();
+  }, [agentPath, isNewChat, clearPendingQueue]);
+
   const handleCancelQueen = useCallback(async () => {
     if (!agentState.sessionId) return;
     try {
       await executionApi.cancelQueen(agentState.sessionId);
       updateState({ isTyping: false, isStreaming: false, queenIsTyping: false });
+      // After cancelling the current turn, immediately send the oldest
+      // queued message (if any). The remaining queued messages stay put
+      // so the user can review them or Steer/Cancel individually.
+      flushNextPending();
     } catch {
       // fire-and-forget
     }
-  }, [agentState.sessionId, updateState]);
+  }, [agentState.sessionId, updateState, flushNextPending]);
 
   const handleSend = useCallback(
     (text: string, _thread: string, images?: ImageContent[]) => {
-      if (agentState.pendingQuestionSource === "queen") {
+      const answeringQuestion = agentState.pendingQuestionSource === "queen";
+      if (answeringQuestion) {
         updateState({
-          pendingQuestion: null,
-          pendingOptions: null,
           pendingQuestions: null,
           pendingQuestionSource: null,
         });
       }
 
-      const clientMessageId = makeId();
+      // Queue when the queen is mid-turn — unless the user is answering an
+      // ask_user prompt, in which case we send immediately so the loop can
+      // resume. Queued messages are held locally (not sent to the backend)
+      // until the user clicks Steer or the queen goes idle.
+      const shouldQueue = !answeringQuestion && (agentState.queenIsTyping ?? false);
+
+      const msgId = makeId();
       const userMsg: ChatMessage = {
-        id: clientMessageId,
+        id: msgId,
         agent: "You",
         agentColor: "",
         content: text,
@@ -1218,75 +1502,57 @@ export default function ColonyChat() {
         thread: agentPath,
         createdAt: Date.now(),
         images,
-        clientMessageId,
+        queued: shouldQueue,
       };
       setMessages((prev) => [...prev, userMsg]);
       suppressIntroRef.current = false;
-      updateState({ isTyping: true, queenIsTyping: true });
 
-      if (agentState.sessionId && agentState.ready) {
-        executionApi
-          .chat(agentState.sessionId, text, images, undefined, clientMessageId)
-          .catch((err: unknown) => {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          upsertMessage({
-            id: makeId(),
-            agent: "System",
-            agentColor: "",
-            content: `Failed to send message: ${errMsg}`,
-            timestamp: "",
-            type: "system",
-            thread: agentPath,
-            createdAt: Date.now(),
-          });
-          updateState({ isTyping: false, isStreaming: false, queenIsTyping: false });
-          });
+      if (shouldQueue) {
+        enqueuePending(msgId, { text, images });
+        return;
       }
+
+      updateState({ isTyping: true, queenIsTyping: true });
+      sendToBackend(text, images);
     },
-    [agentPath, agentState.sessionId, agentState.ready, agentState.pendingQuestionSource, updateState, upsertMessage],
+    [
+      agentPath,
+      agentState.queenIsTyping,
+      agentState.pendingQuestionSource,
+      updateState,
+      sendToBackend,
+      enqueuePending,
+    ],
   );
 
   const handleQueenQuestionAnswer = useCallback(
-    (answer: string) => {
-      updateState({
-        pendingQuestion: null,
-        pendingOptions: null,
-        pendingQuestions: null,
-        pendingQuestionSource: null,
-      });
-      handleSend(answer, agentPath);
-    },
-    [agentPath, handleSend, updateState],
-  );
-
-  const handleMultiQuestionAnswer = useCallback(
     (answers: Record<string, string>) => {
       updateState({
-        pendingQuestion: null,
-        pendingOptions: null,
         pendingQuestions: null,
         pendingQuestionSource: null,
       });
-      const lines = Object.entries(answers).map(([id, answer]) => `[${id}]: ${answer}`);
-      handleSend(lines.join("\n"), agentPath);
+      const entries = Object.entries(answers);
+      const payload =
+        entries.length === 1
+          ? entries[0][1]
+          : entries.map(([id, answer]) => `[${id}]: ${answer}`).join("\n");
+      handleSend(payload, agentPath);
     },
     [agentPath, handleSend, updateState],
   );
 
   const handleQuestionDismiss = useCallback(() => {
     if (!agentState.sessionId) return;
-    const question = agentState.pendingQuestion || "";
+    const firstPrompt = agentState.pendingQuestions?.[0]?.prompt ?? "";
     updateState({
-      pendingQuestion: null,
-      pendingOptions: null,
       pendingQuestions: null,
       pendingQuestionSource: null,
       awaitingInput: false,
     });
     executionApi
-      .chat(agentState.sessionId, `[User dismissed the question: "${question}"]`)
+      .chat(agentState.sessionId, `[User dismissed the question: "${firstPrompt}"]`)
       .catch(() => {});
-  }, [agentState.sessionId, agentState.pendingQuestion, updateState]);
+  }, [agentState.sessionId, agentState.pendingQuestions, updateState]);
 
   const triggers = useMemo(
     () => graphNodes.filter((n) => n.nodeType === "trigger"),
@@ -1401,21 +1667,21 @@ export default function ColonyChat() {
             messages={messages}
             onSend={handleSend}
             onCancel={handleCancelQueen}
+            onSteer={handleSteer}
+            onCancelQueued={handleCancelQueued}
             activeThread={agentPath}
             isWaiting={(agentState.queenIsTyping && !agentState.isStreaming) ?? false}
             isWorkerWaiting={(agentState.workerIsTyping && !agentState.isStreaming) ?? false}
             isBusy={agentState.queenIsTyping ?? false}
             disabled={agentState.loading || !agentState.queenReady}
             queenPhase={agentState.queenPhase}
-            pendingQuestion={agentState.awaitingInput ? agentState.pendingQuestion : null}
-            pendingOptions={agentState.awaitingInput ? agentState.pendingOptions : null}
             pendingQuestions={agentState.awaitingInput ? agentState.pendingQuestions : null}
             onQuestionSubmit={handleQueenQuestionAnswer}
-            onMultiQuestionSubmit={handleMultiQuestionAnswer}
             onQuestionDismiss={handleQuestionDismiss}
             contextUsage={agentState.contextUsage}
             supportsImages={agentState.queenSupportsImages}
             queenProfileId={colony?.queenProfileId ?? null}
+            queenId={colony?.queenProfileId ?? undefined}
           />
         </div>
 
@@ -1443,6 +1709,296 @@ export default function ColonyChat() {
           }
         }}
       />
+
+      <DataExplorerModal
+        open={dataExplorerOpen}
+        sessionId={dataExplorerSessionId}
+        onClose={() => setDataExplorerOpen(false)}
+      />
+
+      {llmQueueOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[1px] flex items-center justify-center p-4"
+          onClick={() => setLlmQueueOpen(false)}
+        >
+          <div
+            className="w-full max-w-2xl rounded-xl border border-border/60 bg-card shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-3 border-b border-border/60 flex items-center gap-2">
+              <Gauge className="w-4 h-4 text-primary" />
+              <h3 className="text-sm font-semibold text-foreground">LLM Queue Status</h3>
+              <button
+                onClick={() => refreshLlmQueueStatus({ silent: false }).catch(() => {})}
+                className="ml-auto inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded hover:bg-muted/40"
+                disabled={llmQueueRefreshing}
+              >
+                <RefreshCw className={`w-3 h-3 ${llmQueueRefreshing ? "animate-spin" : ""}`} />
+                Refresh
+              </button>
+              <button
+                onClick={() => setLlmQueueOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/40"
+                title="Close"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="px-4 py-3 space-y-3 text-xs">
+              {llmQueueLoading && !llmQueueSnapshot ? (
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Loading queue status...
+                </div>
+              ) : llmQueueSnapshot ? (
+                <>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-lg border border-border/60 bg-background/40 px-3 py-2">
+                      <div className="text-muted-foreground">Global async</div>
+                      <div className="mt-1 text-foreground font-medium">
+                        in-flight {llmQueueSnapshot.async.global.total_in_flight}/
+                        {llmQueueSnapshot.limits.global_concurrency}, queued{" "}
+                        {llmQueueSnapshot.async.global.total_queued}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-border/60 bg-background/40 px-3 py-2">
+                      <div className="text-muted-foreground">Claude async</div>
+                      <div className="mt-1 text-foreground font-medium">
+                        in-flight {llmQueueSnapshot.async.claude.total_in_flight}/
+                        {llmQueueSnapshot.limits.claude_concurrency}, queued{" "}
+                        {llmQueueSnapshot.async.claude.total_queued}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-border/60 bg-background/40 px-3 py-2">
+                    <div className="text-muted-foreground">Backoff policy (seconds)</div>
+                    <div className="mt-1 text-foreground font-medium">
+                      default {llmQueueSnapshot.backoff.default_base_seconds} →
+                      {" "}
+                      {llmQueueSnapshot.backoff.default_max_seconds}, claude{" "}
+                      {llmQueueSnapshot.backoff.claude_base_seconds} →
+                      {" "}
+                      {llmQueueSnapshot.backoff.claude_max_seconds}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="text-muted-foreground">Queue status unavailable.</div>
+              )}
+              {llmQueueError && (
+                <div className="rounded-md border border-destructive/30 bg-destructive/10 text-destructive px-3 py-2">
+                  {llmQueueError}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {intakeContractOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[1px] flex items-center justify-center p-4"
+          onClick={() => setIntakeContractOpen(false)}
+        >
+          <div
+            className="w-full max-w-3xl rounded-xl border border-border/60 bg-card shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-3 border-b border-border/60 flex items-center gap-2">
+              <FileText className="w-4 h-4 text-primary" />
+              <h3 className="text-sm font-semibold text-foreground">Autonomous Intake Contract</h3>
+              <button
+                onClick={() => refreshIntakeTemplate({ forceResetDraft: true }).catch(() => {})}
+                className="ml-auto inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded hover:bg-muted/40"
+                disabled={intakeTemplateRefreshing}
+              >
+                <RefreshCw className={`w-3 h-3 ${intakeTemplateRefreshing ? "animate-spin" : ""}`} />
+                Refresh
+              </button>
+              <button
+                onClick={() => setIntakeContractOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/40"
+                title="Close"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="px-4 py-3 space-y-3 text-xs">
+              {intakeTemplateLoading && !intakeTemplate ? (
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Loading intake template...
+                </div>
+              ) : (
+                <>
+                  <div className="rounded-lg border border-border/60 bg-background/40 px-3 py-2 space-y-1">
+                    <p className="text-[11px] text-muted-foreground">
+                      Required fields:{" "}
+                      {intakeTemplate?.required_fields?.length
+                        ? intakeTemplate.required_fields.join(", ")
+                        : "title, goal, acceptance_criteria, constraints, delivery_mode"}
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      delivery_mode:{" "}
+                      {intakeTemplate?.delivery_mode_options?.length
+                        ? intakeTemplate.delivery_mode_options.join(", ")
+                        : "patch_only, pr_only, patch_and_pr"}
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      strict mode: set <code>strict_intake=true</code> in backlog create payload or enable{" "}
+                      <code>HIVE_AUTONOMOUS_INTAKE_STRICT=1</code>.
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[11px] font-medium text-muted-foreground">Payload JSON</label>
+                    <textarea
+                      value={intakeDraft}
+                      onChange={(e) => setIntakeDraft(e.target.value)}
+                      spellCheck={false}
+                      className="w-full min-h-[260px] rounded-md border border-border/60 bg-background px-3 py-2 text-xs text-foreground font-mono focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
+                  <div className="flex items-center justify-end gap-2">
+                    <button
+                      onClick={() => {
+                        if (intakeTemplate) {
+                          setIntakeDraft(JSON.stringify(intakeTemplate.example, null, 2));
+                        }
+                      }}
+                      className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                    >
+                      Reset to example
+                    </button>
+                    <button
+                      onClick={() => validateIntakeDraft().catch(() => {})}
+                      disabled={intakeValidating}
+                      className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+                    >
+                      {intakeValidating && <Loader2 className="w-3 h-3 animate-spin" />}
+                      Validate payload
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {intakeTemplateError && (
+                <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive">
+                  {intakeTemplateError}
+                </div>
+              )}
+
+              {intakeValidationOk && (
+                <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-emerald-300">
+                  {intakeValidationOk}
+                </div>
+              )}
+
+              {intakeValidationErrors.length > 0 && (
+                <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 space-y-1">
+                  <p className="text-destructive font-medium">Validation errors:</p>
+                  {intakeValidationErrors.map((err, idx) => (
+                    <p key={`intake-error-${idx}`} className="text-destructive">
+                      - {err}
+                    </p>
+                  ))}
+                  {intakeValidationHints.map((hint, idx) => (
+                    <p key={`intake-hint-${idx}`} className="text-muted-foreground">
+                      hint: {hint}
+                    </p>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {releaseMatrixOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/45 backdrop-blur-[1px] flex items-center justify-center p-4"
+          onClick={() => setReleaseMatrixOpen(false)}
+        >
+          <div
+            className="w-full max-w-xl rounded-xl border border-border/60 bg-card shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-3 border-b border-border/60 flex items-center gap-2">
+              <Gauge className="w-4 h-4 text-primary" />
+              <h3 className="text-sm font-semibold text-foreground">Release Matrix</h3>
+              <button
+                onClick={() => refreshReleaseMatrix({ silent: false }).catch(() => {})}
+                className="ml-auto inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded hover:bg-muted/40"
+                disabled={releaseMatrixRefreshing}
+              >
+                <RefreshCw className={`w-3 h-3 ${releaseMatrixRefreshing ? "animate-spin" : ""}`} />
+                Refresh
+              </button>
+              <button
+                onClick={() => setReleaseMatrixOpen(false)}
+                className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted/40"
+                title="Close"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="px-4 py-3 space-y-3 text-xs">
+              {releaseMatrixLoading && !releaseMatrixSnapshot ? (
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Loading release matrix...
+                </div>
+              ) : releaseMatrixSnapshot ? (
+                <>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-lg border border-border/60 bg-background/40 px-3 py-2">
+                      <p className="text-[11px] text-muted-foreground mb-1">Status</p>
+                      <p
+                        className={`text-sm font-semibold ${
+                          releaseMatrixSnapshot.status === "pass"
+                            ? "text-emerald-400"
+                            : releaseMatrixSnapshot.status === "fail"
+                              ? "text-destructive"
+                              : "text-muted-foreground"
+                        }`}
+                      >
+                        {releaseMatrixSnapshot.status}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-border/60 bg-background/40 px-3 py-2">
+                      <p className="text-[11px] text-muted-foreground mb-1">Must checks</p>
+                      <p className="text-sm font-semibold text-foreground">
+                        {releaseMatrixSnapshot.must_passed ?? "--"}/
+                        {releaseMatrixSnapshot.must_total ?? "--"}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-border/60 bg-background/40 px-3 py-2 space-y-1">
+                    <p className="text-[11px] text-muted-foreground">
+                      generated_at: {releaseMatrixSnapshot.generated_at ?? "--"}
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      artifact: {releaseMatrixSnapshot.path || "--"}
+                    </p>
+                    <p className="text-[11px] text-muted-foreground">
+                      must failed/missing: {releaseMatrixSnapshot.must_failed ?? "--"}/
+                      {releaseMatrixSnapshot.must_missing ?? "--"}
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Release matrix is not available yet.
+                </p>
+              )}
+              {releaseMatrixError && (
+                <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive">
+                  {releaseMatrixError}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

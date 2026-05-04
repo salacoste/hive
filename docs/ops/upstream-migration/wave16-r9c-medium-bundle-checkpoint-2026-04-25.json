@@ -1,0 +1,30 @@
+{
+  "generated_at_utc": "2026-04-25T11:08:52Z",
+  "wave": "Wave16-R9C",
+  "title": "Medium-bundle checkpoint after R9A/R9B",
+  "summary": {
+    "completed_medium_lanes": [
+      "R9A routes_queens",
+      "R9B routes_execution"
+    ],
+    "gate_baseline": "pass (latest upstream_sync_regression_gate: ok=7 failed=0)"
+  },
+  "next_candidate_selection": {
+    "id": "R9C-next",
+    "path": "core/framework/agent_loop/internals/cursor_persistence.py",
+    "numstat": {"add": 5, "del": 15, "total": 20},
+    "rationale": [
+      "smallest non-trivial remaining behavior-changing delta in medium shortlist",
+      "isolated to queue-drain formatting/stamping behavior",
+      "covered by event loop and conversation tests"
+    ],
+    "precheck_validation": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q",
+        "result": "pass",
+        "summary": "163 passed, 4 skipped"
+      }
+    ]
+  },
+  "status": "checkpoint_complete"
+}

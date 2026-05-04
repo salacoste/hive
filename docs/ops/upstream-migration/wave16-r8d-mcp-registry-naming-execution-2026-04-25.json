@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T10:13:07Z",
+  "wave": "Wave16-R8D",
+  "title": "MCP registry naming contract continuation",
+  "scope": [
+    "core/framework/loader/mcp_registry.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local loader registry is aligned with runner registry on canonical name hive-tools",
+      "local alias map correctly migrates stale hive_tools entries to canonical hive-tools",
+      "adopting upstream underscore canonical name would diverge from local runtime/docs/config contracts already standardized on hive-tools"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; local naming contract retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_mcp_registry.py -q",
+        "result": "pass",
+        "summary": "89 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"mcp or credentials\" -q",
+        "result": "pass",
+        "summary": "13 passed, 180 deselected"
+      },
+      {
+        "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+        "result": "pass",
+        "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0 (from latest post-R8C run)"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R8D lane completed with explicit naming-contract guard",
+      "next candidate lane: choose next smallest safe residual outside naming/logging compatibility guards"
+    ]
+  }
+}

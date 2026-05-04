@@ -1,0 +1,43 @@
+{
+  "generated_at_utc": "2026-04-26T13:25:45Z",
+  "wave": "Wave16-R10K",
+  "title": "Model catalog baseline drift lane execution",
+  "scope": [
+    "core/framework/llm/model_catalog.json",
+    "core/tests/test_model_catalog.py"
+  ],
+  "reconcile_decision": {
+    "mode": "reconcile",
+    "authoritative_source": "core/framework/llm/model_catalog.json",
+    "reason": [
+      "local catalog already encodes current curated provider/model matrix used by runtime",
+      "failing expectations were stale in tests (order/content/context limits) rather than runtime regressions",
+      "provider regression bundle remains green after baseline sync"
+    ]
+  },
+  "changes": [
+    "updated core/tests/test_model_catalog.py expected provider model lists and token/context limits to match current catalog baseline",
+    "no runtime catalog mutation applied in this lane"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_model_catalog.py -q",
+        "result": "pass",
+        "summary": "14 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_litellm_provider.py -q",
+        "result": "pass",
+        "summary": "100 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10K lane closed via bounded test-baseline reconcile",
+      "next lane should verify downstream consumer contracts against updated catalog baseline"
+    ]
+  }
+}

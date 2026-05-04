@@ -6,7 +6,7 @@ set -euo pipefail
 #   scripts/hive_model_profiles.sh <profile> <hive args...>
 #
 # Profiles:
-#   heavy         -> claude-opus-4-6, fallback gpt-5.4
+#   heavy         -> claude-opus-4-6, fallback gpt-5.4, then openai/glm-5.1
 #   implement     -> openai/gemini-3.1-pro-high, fallback openai/glm-5.1
 #   docs          -> openai/glm-5.1
 #   review        -> gpt-5.3-codex
@@ -28,7 +28,7 @@ run_model() {
 
 case "$profile" in
   heavy)
-    run_model "claude-opus-4-6" "$@" || run_model "gpt-5.4" "$@"
+    run_model "claude-opus-4-6" "$@" || run_model "gpt-5.4" "$@" || run_model "openai/glm-5.1" "$@"
     ;;
   implement)
     run_model "openai/gemini-3.1-pro-high" "$@" || run_model "openai/glm-5.1" "$@"

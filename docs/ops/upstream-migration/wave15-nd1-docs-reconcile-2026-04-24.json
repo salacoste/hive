@@ -1,0 +1,38 @@
+{
+  "date": "2026-04-24",
+  "generated_at_utc": "2026-04-24T13:53:47.332180+00:00",
+  "base_ref": "HEAD",
+  "upstream_ref": "upstream/main",
+  "batch_id": "ND-1-docs-lane",
+  "files": [
+    {
+      "path": "docs/skill-registry-prd.md",
+      "worktree_status": "M docs/skill-registry-prd.md",
+      "local_exists": true,
+      "upstream_exists": true,
+      "local_sha256": "d5fc82477cf2d3a9213bd6f6e05d86bf16237376291052755234c2bbb9fe6136",
+      "upstream_sha256": "d5fc82477cf2d3a9213bd6f6e05d86bf16237376291052755234c2bbb9fe6136",
+      "content_equal": true
+    },
+    {
+      "path": "docs/releases/v0.10.3.md",
+      "worktree_status": "?? docs/releases/v0.10.3.md",
+      "local_exists": true,
+      "upstream_exists": true,
+      "local_sha256": "484bc1e1c83ac0e3a570875483036f1045d82cb6640f3ebfea77debad7c8b8cf",
+      "upstream_sha256": "484bc1e1c83ac0e3a570875483036f1045d82cb6640f3ebfea77debad7c8b8cf",
+      "content_equal": true
+    },
+    {
+      "path": "docs/releases/v0.10.4.md",
+      "worktree_status": "?? docs/releases/v0.10.4.md",
+      "local_exists": true,
+      "upstream_exists": true,
+      "local_sha256": "2ce8c0340edf9265c031d1df6bf3b3c72a95eea3a42c50a768cfd67e73a54588",
+      "upstream_sha256": "2ce8c0340edf9265c031d1df6bf3b3c72a95eea3a42c50a768cfd67e73a54588",
+      "content_equal": true
+    }
+  ],
+  "all_files_content_equal_to_upstream": true,
+  "recommendation": "skip patch replay and carry via regular commit flow"
+}

@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-26T15:52:26Z",
+  "wave": "Wave16-R10V",
+  "title": "Autonomous loop-control input validation contract lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "loop-control input validation remains stable for invalid tick-all project_ids payloads",
+      "run-cycle endpoint contract accepts valid payloads and rejects invalid max_steps as expected",
+      "no input-validation regressions observed in targeted endpoint bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_all_rejects_non_array_project_ids or pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_rejects_invalid_max_steps' -q",
+        "result": "pass",
+        "summary": "3 passed, 190 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10V lane closed as keep-local with green loop-control input-validation contract tests",
+      "next lane targets autonomous backlog create/update contract continuity"
+    ]
+  }
+}

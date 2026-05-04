@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-24T16:35:00Z",
+  "lane": "ND-4C2",
+  "title": "Loader + host bounded replay execution",
+  "scope_files": [
+    "core/framework/host/agent_host.py",
+    "core/framework/host/colony_metadata.py",
+    "core/framework/host/colony_runtime.py",
+    "core/framework/host/colony_tools_config.py",
+    "core/framework/host/event_bus.py",
+    "core/framework/loader/agent_loader.py",
+    "core/framework/loader/mcp_client.py",
+    "core/framework/loader/tool_registry.py"
+  ],
+  "apply": {
+    "command": "git apply docs/ops/upstream-migration/wave15-nd4c2-loader-host.patch",
+    "result": "ok"
+  },
+  "reconcile_fixes": [
+    {
+      "path": "core/framework/llm/litellm.py",
+      "change": "restore _summarize_request_for_log helper for provider diagnostics/test compatibility"
+    },
+    {
+      "path": "core/framework/loader/mcp_client.py",
+      "change": "demote known anyio teardown quirk in session cleanup to debug"
+    },
+    {
+      "path": "core/framework/loader/tool_registry.py",
+      "change": "restore built-in save_data tool with execution-context-aware data_dir resolution"
+    },
+    {
+      "path": "core/framework/tools/queen_lifecycle_tools.py",
+      "change": "restore QueenPhaseState(prompt_building=...) backward compatibility alias"
+    }
+  ],
+  "validation": {
+    "targeted_tests": {
+      "command": "uv run pytest core/tests/test_mcp_client.py core/tests/test_tool_registry.py core/tests/test_event_bus.py core/tests/test_mcp_registry_loader.py core/tests/test_mcp_registry.py core/tests/test_mcp_registry_cli.py core/tests/test_mcp_connection_manager.py core/tests/test_mcp_server.py core/tests/test_mcp_errors.py core/tests/test_litellm_provider.py core/tests/test_litellm_streaming.py core/tests/test_queen_nodes_prompt.py core/tests/test_queen_memory.py core/tests/test_trigger_fires_into_queen.py -q",
+      "result": "415 passed, 9 skipped"
+    },
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  }
+}

@@ -13,6 +13,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -20,7 +21,12 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from framework.runtime.triggers import TriggerDefinition
 from framework.server import routes_sessions
-from framework.server.app import APP_KEY_CREDENTIAL_STORE, APP_KEY_MANAGER, create_app
+from framework.server.app import (
+    APP_KEY_CREDENTIAL_STORE,
+    APP_KEY_MANAGER,
+    APP_KEY_TELEGRAM_BRIDGE,
+    create_app,
+)
 from framework.server.routes_autonomous import APP_KEY_AUTONOMOUS_STORE
 from framework.server.session_manager import Session, SessionManager
 
@@ -379,6 +385,167 @@ class TestHealth:
             assert data["status"] in {"ok", "disabled"}
             assert isinstance(data.get("bridge"), dict)
 
+    @pytest.mark.asyncio
+    async def test_telegram_bridge_status_endpoint_includes_conflict_recovery_fields(self):
+        app = create_app()
+        app.on_startup.clear()
+
+        class _Bridge:
+            def status(self) -> dict[str, Any]:
+                return {
+                    "enabled": True,
+                    "mode": "polling",
+                    "single_consumer": True,
+                    "poll_lock_path": "/tmp/telegram-poll.lock",
+                    "poller_owner": True,
+                    "running": True,
+                    "startup_status": "running",
+                    "last_poll_error": None,
+                    "poll_conflict_409_count": 3,
+                    "last_poll_conflict_409_at": 1700000000.0,
+                    "last_poll_conflict_recover_at": 1700000001.0,
+                    "last_poll_conflict_recover_result": "delete_webhook_ok",
+                    "auto_clear_webhook_on_409": True,
+                    "conflict_recover_cooldown_seconds": 120,
+                    "conflict_warn_threshold": 3,
+                    "conflict_warn_window_seconds": 3600,
+                    "poll_conflict_warning_active": True,
+                    "last_poll_conflict_age_seconds": 12,
+                }
+
+        app[APP_KEY_TELEGRAM_BRIDGE] = _Bridge()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/telegram/bridge/status")
+            assert resp.status == 200
+            data = await resp.json()
+            bridge = data.get("bridge", {})
+            assert data["status"] == "ok"
+            assert bridge.get("poll_conflict_409_count") == 3
+            assert bridge.get("last_poll_conflict_recover_result") == "delete_webhook_ok"
+            assert bridge.get("auto_clear_webhook_on_409") is True
+            assert bridge.get("conflict_recover_cooldown_seconds") == 120
+            assert bridge.get("poll_conflict_warning_active") is True
+            assert bridge.get("conflict_warn_threshold") == 3
+
+    @pytest.mark.asyncio
+    async def test_telegram_bridge_bindings_endpoint_disabled(self):
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/telegram/bridge/bindings")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] in {"ok", "disabled"}
+            assert isinstance(data.get("bindings"), list)
+            assert isinstance(data.get("known_chats_total"), int)
+
+    @pytest.mark.asyncio
+    async def test_telegram_bridge_bindings_endpoint_returns_snapshot(self):
+        app = create_app()
+
+        class _Bridge:
+            def bindings_snapshot(self) -> dict[str, Any]:
+                return {
+                    "bindings": [
+                        {
+                            "chat_id": "42",
+                            "project_id": "default",
+                            "queen_id": "queen_growth",
+                            "session_id": "session-1",
+                            "session_live": True,
+                            "session_project_id": "default",
+                            "session_queen_id": "queen_growth",
+                        }
+                    ],
+                    "known_chats_total": 1,
+                    "bound_chats_total": 1,
+                    "sessions_with_bound_chats_total": 1,
+                }
+
+        app[APP_KEY_TELEGRAM_BRIDGE] = _Bridge()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/telegram/bridge/bindings")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ok"
+            assert data["bound_chats_total"] == 1
+            assert data["bindings"][0]["chat_id"] == "42"
+
+    @pytest.mark.asyncio
+    async def test_telegram_bridge_recover_endpoint_disabled(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        app = create_app()
+        app.on_startup.clear()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/telegram/bridge/recover", json={})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "disabled"
+            assert data["ok"] is False
+            assert data["error"] == "bridge_not_initialized"
+
+    @pytest.mark.asyncio
+    async def test_telegram_bridge_recover_endpoint_operator_payload(self):
+        app = create_app()
+        app.on_startup.clear()
+
+        class _Bridge:
+            async def operator_recover(
+                self,
+                *,
+                force_delete_webhook: bool,
+                drop_pending_updates: bool,
+                reset_conflict_telemetry: bool,
+                clear_last_error: bool,
+            ) -> dict[str, Any]:
+                return {
+                    "ok": True,
+                    "echo": {
+                        "force_delete_webhook": force_delete_webhook,
+                        "drop_pending_updates": drop_pending_updates,
+                        "reset_conflict_telemetry": reset_conflict_telemetry,
+                        "clear_last_error": clear_last_error,
+                    },
+                    "actions": ["delete_webhook_ok", "reset_conflict_telemetry"],
+                }
+
+        app[APP_KEY_TELEGRAM_BRIDGE] = _Bridge()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/telegram/bridge/recover",
+                json={
+                    "force_delete_webhook": True,
+                    "drop_pending_updates": True,
+                    "reset_conflict_telemetry": True,
+                    "clear_last_error": False,
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ok"
+            assert data["ok"] is True
+            assert data["echo"]["force_delete_webhook"] is True
+            assert data["echo"]["drop_pending_updates"] is True
+            assert data["echo"]["reset_conflict_telemetry"] is True
+            assert data["echo"]["clear_last_error"] is False
+
+    @pytest.mark.asyncio
+    async def test_llm_queue_status_endpoint(self):
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/llm/queue/status")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["status"] == "ok"
+            queue = data["queue"]
+            assert isinstance(queue.get("limits"), dict)
+            assert isinstance(queue.get("backoff"), dict)
+            assert isinstance(queue.get("sync"), dict)
+            assert isinstance(queue.get("async"), dict)
+            fallback = data["fallback"]
+            assert isinstance(fallback.get("policy"), dict)
+            assert isinstance(fallback.get("history_limit"), int)
+            assert isinstance(fallback.get("recent_attempt_chains"), list)
+
 
 class TestSessionCRUD:
     @pytest.mark.asyncio
@@ -550,6 +717,75 @@ class TestSessionCRUD:
         assert only["project_id"] == "project-live"
         assert only["live"] is True
         assert only["cold"] is False
+
+    @pytest.mark.asyncio
+    async def test_session_events_history_returns_tail_with_contract_fields(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        session_id = "session_history_tail"
+        events_dir = tmp_path / ".hive" / "queen" / "session" / session_id
+        events_dir.mkdir(parents=True)
+        events_path = events_dir / "events.jsonl"
+        with open(events_path, "w", encoding="utf-8") as f:
+            for idx in range(5):
+                f.write(
+                    json.dumps(
+                        {
+                            "type": "test_event",
+                            "idx": idx,
+                            "timestamp": f"2026-04-23T00:00:0{idx}Z",
+                        }
+                    )
+                    + "\n"
+                )
+
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(f"/api/sessions/{session_id}/events/history?limit=2")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["session_id"] == session_id
+        assert data["total"] == 5
+        assert data["returned"] == 2
+        assert data["truncated"] is True
+        assert data["limit"] == 2
+        assert [evt["idx"] for evt in data["events"]] == [3, 4]
+
+    @pytest.mark.asyncio
+    async def test_session_events_history_missing_file_returns_empty_contract_payload(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        session_id = "session_history_missing"
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(f"/api/sessions/{session_id}/events/history?limit=7")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data == {
+            "events": [],
+            "session_id": session_id,
+            "total": 0,
+            "returned": 0,
+            "truncated": False,
+            "limit": 7,
+        }
+
+    @pytest.mark.asyncio
+    async def test_session_events_history_rejects_non_integer_limit(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/sessions/session_bad_limit/events/history?limit=abc")
+            assert resp.status == 400
+            data = await resp.json()
+
+        assert data["error"] == "limit must be an integer"
 
     @pytest.mark.asyncio
     async def test_get_session_found(self):
@@ -727,6 +963,90 @@ class TestSessionCRUD:
             data = await resp.json()
 
         assert "Session folder not found" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_list_session_files_returns_entries(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        session = _make_session(agent_id="session_files_list")
+        app = _make_app_with_session(session)
+
+        session_root = tmp_path / ".hive" / "queen" / "session" / session.id
+        (session_root / "data").mkdir(parents=True)
+        (session_root / "data" / "note.txt").write_text("hello", encoding="utf-8")
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(f"/api/sessions/{session.id}/files")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["session_id"] == session.id
+        assert data["returned"] >= 2
+        paths = {entry["path"] for entry in data["entries"]}
+        assert "data" in paths
+        assert "data/note.txt" in paths
+
+    @pytest.mark.asyncio
+    async def test_preview_session_file_returns_content(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        session = _make_session(agent_id="session_file_preview")
+        app = _make_app_with_session(session)
+
+        session_root = tmp_path / ".hive" / "queen" / "session" / session.id
+        (session_root / "notes").mkdir(parents=True)
+        (session_root / "notes" / "todo.md").write_text("# todo\n- item", encoding="utf-8")
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                f"/api/sessions/{session.id}/files/preview",
+                params={"path": "notes/todo.md"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["binary"] is False
+        assert data["path"] == "notes/todo.md"
+        assert "# todo" in (data.get("content") or "")
+
+    @pytest.mark.asyncio
+    async def test_preview_session_file_rejects_path_escape(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        session = _make_session(agent_id="session_file_escape")
+        app = _make_app_with_session(session)
+
+        session_root = tmp_path / ".hive" / "queen" / "session" / session.id
+        session_root.mkdir(parents=True)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                f"/api/sessions/{session.id}/files/preview",
+                params={"path": "../secret.txt"},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+
+        assert "escapes the session folder" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_download_session_file_returns_payload(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        session = _make_session(agent_id="session_file_download")
+        app = _make_app_with_session(session)
+
+        session_root = tmp_path / ".hive" / "queen" / "session" / session.id
+        (session_root / "logs").mkdir(parents=True)
+        payload = b"hello-download"
+        (session_root / "logs" / "run.log").write_bytes(payload)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                f"/api/sessions/{session.id}/files/download",
+                params={"path": "logs/run.log"},
+            )
+            assert resp.status == 200
+            assert resp.headers.get("Content-Disposition") == 'attachment; filename="run.log"'
+            body = await resp.read()
+
+        assert body == payload
 
     @pytest.mark.asyncio
     async def test_session_stats(self):
@@ -1168,6 +1488,39 @@ class TestExecution:
             assert resp.status == 200
             data = await resp.json()
             assert data["progress"] == 0.5
+
+
+class TestQueenRoutes:
+    @pytest.mark.asyncio
+    async def test_new_queen_session_endpoint_creates_session(self):
+        app = create_app()
+        manager = app[APP_KEY_MANAGER]
+        manager.create_session = AsyncMock(
+            return_value=SimpleNamespace(id="session_queen_new", phase_state=None)
+        )
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/queen/queen_technology/session/new", json={})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["session_id"] == "session_queen_new"
+            assert data["queen_id"] == "queen_technology"
+            assert data["status"] == "created"
+
+        manager.create_session.assert_awaited_once_with(initial_prompt=None)
+
+    @pytest.mark.asyncio
+    async def test_new_queen_session_invalid_json_returns_400(self):
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/queen/queen_technology/session/new",
+                data="{bad json",
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"] == "Invalid JSON body"
 
 
 class TestResume:
@@ -1744,6 +2097,7 @@ class TestProjectsAPI:
             default_data = await get_default.json()
             assert default_data["effective"]["execution_template"]["default_flow"][0]["stage"] == "design"
             assert default_data["effective"]["execution_template"]["retry_policy"]["max_retries_per_stage"] == 1
+            assert default_data["effective"]["execution_template"]["run_guardrails"]["max_run_seconds"] == 1800
             assert default_data["effective"]["policy"]["risk_tier"] == "low"
 
             patch_resp = await client.patch(
@@ -1757,6 +2111,14 @@ class TestProjectsAPI:
                             {"stage": "validate", "mode": "worker_validate", "model_profile": "gpt-5.3-codex"},
                         ],
                         "retry_policy": {"max_retries_per_stage": 2, "escalate_on": ["review"]},
+                        "run_guardrails": {
+                            "max_run_seconds": 900,
+                            "max_tool_calls_execution_stage": 80,
+                            "max_loop_ticks_per_run": 12,
+                            "stop_action": "escalated",
+                            "fail_on_unknown_action": True,
+                            "container_only": True,
+                        },
                         "github": {
                             "default_ref": "main",
                             "no_checks_policy": "manual_pending",
@@ -1773,6 +2135,8 @@ class TestProjectsAPI:
             patched = await patch_resp.json()
             assert patched["effective"]["execution_template"]["default_flow"][0]["model_profile"] == "gpt-5.4-thinking"
             assert patched["effective"]["execution_template"]["retry_policy"]["max_retries_per_stage"] == 2
+            assert patched["effective"]["execution_template"]["run_guardrails"]["max_run_seconds"] == 900
+            assert patched["effective"]["execution_template"]["run_guardrails"]["stop_action"] == "escalated"
             assert patched["effective"]["execution_template"]["github"]["default_ref"] == "main"
             assert patched["effective"]["execution_template"]["github"]["no_checks_policy"] == "manual_pending"
             assert patched["effective"]["policy"]["risk_tier"] == "high"
@@ -1807,6 +2171,14 @@ class TestProjectsAPI:
             assert bad_policy.status == 400
             bad_policy_data = await bad_policy.json()
             assert "github.no_checks_policy must be one of" in bad_policy_data.get("error", "")
+
+            bad_guardrail = await client.patch(
+                f"/api/projects/{pid}/execution-template",
+                json={"execution_template": {"run_guardrails": {"max_run_seconds": 10}}},
+            )
+            assert bad_guardrail.status == 400
+            bad_guardrail_data = await bad_guardrail.json()
+            assert "run_guardrails.max_run_seconds must be >= 60" in bad_guardrail_data.get("error", "")
 
     @pytest.mark.asyncio
     async def test_project_retention_inheritance_and_overrides(self):
@@ -2900,6 +3272,77 @@ class TestCredentials:
                 for row in data.get("providers", [])
             )
 
+    @pytest.mark.asyncio
+    async def test_credentials_specs_endpoint_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        app = self._make_app({"github": {"token": "ghp_test"}})
+        monkeypatch.setattr("framework.credentials.validation.ensure_credential_key_env", lambda: None)
+        monkeypatch.setattr("framework.credentials.key_storage.load_aden_api_key", lambda: None)
+        monkeypatch.delenv("ADEN_API_KEY", raising=False)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/credentials/specs")
+            assert resp.status == 200
+            data = await resp.json()
+            assert isinstance(data.get("specs"), list)
+            assert isinstance(data.get("has_aden_key"), bool)
+            assert len(data["specs"]) > 0
+            row = data["specs"][0]
+            assert "credential_id" in row
+            assert "env_var" in row
+            assert "available" in row
+            assert "accounts" in row
+
+    @pytest.mark.asyncio
+    async def test_credentials_resync_without_aden_key(self, monkeypatch: pytest.MonkeyPatch):
+        app = self._make_app()
+        monkeypatch.setattr("framework.credentials.validation.ensure_credential_key_env", lambda: None)
+        monkeypatch.setattr("framework.credentials.key_storage.load_aden_api_key", lambda: None)
+        monkeypatch.delenv("ADEN_API_KEY", raising=False)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/credentials/resync", json={})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {"synced": False, "accounts_by_provider": {}}
+
+    @pytest.mark.asyncio
+    async def test_credentials_validate_key_unknown_provider(self):
+        app = self._make_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/credentials/validate-key",
+                json={"provider_id": "unknown_provider", "api_key": "test-key"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["valid"] is None
+            assert "Unknown provider" in data["message"]
+
+
+class TestMessagesRoutes:
+    @pytest.mark.asyncio
+    async def test_messages_classify_route_available_and_returns_queen_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        app = create_app()
+
+        monkeypatch.setattr("framework.server.routes_messages.ensure_default_queens", lambda: None)
+
+        async def _fake_select_queen(message: str, llm):
+            assert message == "find me a role"
+            return "queen_bee"
+
+        monkeypatch.setattr("framework.server.routes_messages.select_queen", _fake_select_queen)
+        monkeypatch.setattr(app[APP_KEY_MANAGER], "build_llm", lambda: object())
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/messages/classify", json={"message": "find me a role"})
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {"queen_id": "queen_bee"}
+
 
 class TestSSEFormat:
     """Tests for SSE event wire format -- events must be unnamed (data-only)
@@ -2960,6 +3403,75 @@ class TestErrorMiddleware:
 
 
 class TestAutonomousPipeline:
+    @pytest.mark.asyncio
+    async def test_backlog_intake_template_endpoint(self):
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/autonomous/backlog/intake/template")
+            assert resp.status == 200
+            payload = await resp.json()
+            assert "required_fields" in payload
+            assert "delivery_mode_options" in payload
+            assert "constraints" in payload.get("required_fields", [])
+
+    @pytest.mark.asyncio
+    async def test_backlog_intake_validate_rejects_underspecified_payload(self):
+        app = create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/autonomous/backlog/intake/validate",
+                json={
+                    "title": "short",
+                    "goal": "too short",
+                    "acceptance_criteria": [],
+                    "constraints": [],
+                    "delivery_mode": "invalid",
+                },
+            )
+            assert resp.status == 400
+            payload = await resp.json()
+            assert payload.get("valid") is False
+            assert any("delivery_mode" in str(x) for x in payload.get("errors", []))
+            assert any("constraints" in str(x) for x in payload.get("errors", []))
+
+    @pytest.mark.asyncio
+    async def test_backlog_create_strict_intake_contract(self):
+        app = create_app()
+        manager = app[APP_KEY_MANAGER]
+        created = manager.create_project(name="Autonomous Intake Strict")
+        pid = created["id"]
+
+        async with TestClient(TestServer(app)) as client:
+            bad = await client.post(
+                f"/api/projects/{pid}/autonomous/backlog",
+                json={
+                    "title": "Implement fix for redirects",
+                    "goal": "Implement redirect safety in request flow",
+                    "acceptance_criteria": ["regression test added"],
+                    "delivery_mode": "patch_and_pr",
+                    "strict_intake": True,
+                },
+            )
+            assert bad.status == 400
+            bad_payload = await bad.json()
+            assert "intake contract validation failed" in str(bad_payload.get("error") or "")
+            assert any("constraints" in str(x) for x in bad_payload.get("details", []))
+
+            ok = await client.post(
+                f"/api/projects/{pid}/autonomous/backlog",
+                json={
+                    "title": "Implement fix for redirects",
+                    "goal": "Implement redirect safety in request flow and validate with tests",
+                    "acceptance_criteria": ["regression test added"],
+                    "constraints": ["container-first", "no dependency updates"],
+                    "delivery_mode": "patch_and_pr",
+                    "strict_intake": True,
+                },
+            )
+            assert ok.status == 201
+            row = await ok.json()
+            assert row.get("title") == "Implement fix for redirects"
+
     @pytest.mark.asyncio
     async def test_backlog_create_ci_first_contract_with_service_matrix(self):
         app = create_app()
@@ -3393,6 +3905,7 @@ class TestAutonomousPipeline:
         pid = created["id"]
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_resolve_execution_outcome(_manager, _run):
             return {
@@ -3416,10 +3929,12 @@ class TestAutonomousPipeline:
             task = await task_resp.json()
             run_resp = await client.post(
                 f"/api/projects/{pid}/autonomous/runs",
-                json={"task_id": task["id"], "auto_start": True},
+                json={"task_id": task["id"], "auto_start": False},
             )
             assert run_resp.status == 201
             run = await run_resp.json()
+            store = app[APP_KEY_AUTONOMOUS_STORE]
+            store.update_run(run["id"], {"status": "in_progress"})
 
             tick = await client.post(
                 f"/api/projects/{pid}/autonomous/loop/tick",
@@ -3544,6 +4059,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_resolve(*, token, repository, ref, pr_url):
             assert token == "test-token"
@@ -4048,6 +4564,91 @@ class TestAutonomousPipeline:
             assert report["report"]["final_status"] == "completed"
 
     @pytest.mark.asyncio
+    async def test_pipeline_report_endpoint_includes_timeline_and_failure_taxonomy(self):
+        app = create_app()
+        manager = app[APP_KEY_MANAGER]
+        created = manager.create_project(name="Autonomous Report Timeline")
+        pid = created["id"]
+
+        async with TestClient(TestServer(app)) as client:
+            task_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/backlog",
+                json={
+                    "title": "Report timeline task",
+                    "goal": "Expose machine-readable diagnostics in report",
+                    "acceptance_criteria": ["timeline and taxonomy present"],
+                },
+            )
+            assert task_resp.status == 201
+            task = await task_resp.json()
+
+            run_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/runs",
+                json={"task_id": task["id"], "auto_start": False},
+            )
+            assert run_resp.status == 201
+            run = await run_resp.json()
+            run_id = run["id"]
+
+            store = app[APP_KEY_AUTONOMOUS_STORE]
+            store.update_run(
+                run_id,
+                {
+                    "status": "failed",
+                    "current_stage": "execution",
+                    "artifacts": {
+                        "report": {
+                            "summary": "missing_github_token unauthorized credential for repository access",
+                        },
+                        "stages": {
+                            "execution": {
+                                "timestamp": 1_700_100_001.0,
+                                "result": "failed",
+                                "attempt": 1,
+                                "source": "runtime",
+                                "checks_summary": {"failed": 0},
+                            }
+                        },
+                        "events": [
+                            {
+                                "type": "auto_next_deferred",
+                                "timestamp": 1_700_100_002.0,
+                                "data": {
+                                    "stage": "execution",
+                                    "status": "failed",
+                                    "reason": "missing_github_token",
+                                    "source": "auto",
+                                },
+                            }
+                        ],
+                    },
+                    "finished_at": 1_700_100_003.0,
+                },
+            )
+
+            report_resp = await client.get(f"/api/projects/{pid}/autonomous/runs/{run_id}/report")
+            assert report_resp.status == 200
+            payload = await report_resp.json()
+
+            failure = payload.get("failure_taxonomy", {})
+            assert failure.get("category") == "credential"
+            assert "missing_github_token" in str(failure.get("reason") or "")
+
+            timeline = payload.get("timeline", [])
+            assert timeline
+            assert any(item.get("type") == "run_started" for item in timeline)
+            assert any(
+                item.get("type") == "stage_result"
+                and item.get("stage") == "execution"
+                and item.get("result") == "failed"
+                for item in timeline
+            )
+            assert any(
+                item.get("type") == "run_event" and item.get("event_type") == "auto_next_deferred"
+                for item in timeline
+            )
+
+    @pytest.mark.asyncio
     async def test_pipeline_evaluate_endpoint_uses_checks_and_updates_report(self):
         app = create_app()
         manager = app[APP_KEY_MANAGER]
@@ -4175,13 +4776,153 @@ class TestAutonomousPipeline:
             )
             assert run_resp.status == 201
 
-            status_resp = await client.get("/api/autonomous/ops/status")
+            status_resp = await client.get(f"/api/autonomous/ops/status?project_id={pid}")
             assert status_resp.status == 200
             status_data = await status_resp.json()
             assert status_data["status"] == "ok"
             assert status_data["summary"]["tasks_total"] >= 1
             assert status_data["summary"]["runs_total"] >= 1
+            assert "guardrail_stops_total" in status_data["summary"]
+            assert "guardrail_stops_by_reason" in status_data["summary"]
             assert pid in status_data["projects"]
+
+    @pytest.mark.asyncio
+    async def test_autonomous_ops_status_aggregates_failure_taxonomy(self):
+        app = create_app()
+        manager = app[APP_KEY_MANAGER]
+        created = manager.create_project(name="Autonomous Ops Taxonomy")
+        pid = created["id"]
+
+        async with TestClient(TestServer(app)) as client:
+            provider_task_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/backlog",
+                json={
+                    "title": "Provider failure task",
+                    "goal": "Classify provider outage",
+                    "acceptance_criteria": ["provider taxonomy counted"],
+                },
+            )
+            assert provider_task_resp.status == 201
+            provider_task = await provider_task_resp.json()
+            provider_run_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/runs",
+                json={"task_id": provider_task["id"], "auto_start": False},
+            )
+            assert provider_run_resp.status == 201
+            provider_run = await provider_run_resp.json()
+
+            policy_task_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/backlog",
+                json={
+                    "title": "Policy failure task",
+                    "goal": "Classify guardrail stop",
+                    "acceptance_criteria": ["policy taxonomy counted"],
+                },
+            )
+            assert policy_task_resp.status == 201
+            policy_task = await policy_task_resp.json()
+            policy_run_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/runs",
+                json={"task_id": policy_task["id"], "auto_start": False},
+            )
+            assert policy_run_resp.status == 201
+            policy_run = await policy_run_resp.json()
+
+            store = app[APP_KEY_AUTONOMOUS_STORE]
+            store.update_run(
+                provider_run["id"],
+                {
+                    "status": "failed",
+                    "artifacts": {
+                        "report": {"summary": "provider rate limit 429 from anthropic"},
+                        "stages": {},
+                    },
+                    "finished_at": time.time(),
+                },
+            )
+            store.update_run(
+                policy_run["id"],
+                {
+                    "status": "failed",
+                    "artifacts": {
+                        "report": {"guardrail_stop": {"reason": "max_run_seconds_exceeded"}},
+                        "stages": {},
+                    },
+                    "finished_at": time.time(),
+                },
+            )
+
+            status_resp = await client.get(f"/api/autonomous/ops/status?project_id={pid}")
+            assert status_resp.status == 200
+            payload = await status_resp.json()
+            summary = payload.get("summary", {})
+            taxonomy = summary.get("failure_taxonomy", {})
+
+            assert summary.get("terminal_failures_total", 0) >= 2
+            assert int(taxonomy.get("provider", 0)) >= 1
+            assert int(taxonomy.get("policy", 0)) >= 1
+            project_taxonomy = payload["projects"][pid].get("failure_taxonomy", {})
+            assert int(project_taxonomy.get("provider", 0)) >= 1
+            assert int(project_taxonomy.get("policy", 0)) >= 1
+
+    @pytest.mark.asyncio
+    async def test_autonomous_ops_status_includes_release_matrix_snapshot(self, tmp_path, monkeypatch):
+        app = create_app()
+        gate_path = tmp_path / "gate-latest.json"
+        gate_path.write_text(
+            json.dumps(
+                {
+                    "generated_at": "2026-04-23T21:00:00Z",
+                    "release_matrix": {
+                        "status": "pass",
+                        "must_passed": 6,
+                        "must_total": 6,
+                        "must_failed": 0,
+                        "must_missing": 0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH", str(gate_path))
+
+        async with TestClient(TestServer(app)) as client:
+            status_resp = await client.get("/api/autonomous/ops/status")
+            assert status_resp.status == 200
+            payload = await status_resp.json()
+            summary = payload["summary"]
+            matrix = payload["release_matrix"]
+
+            assert summary["release_matrix_status"] == "pass"
+            assert summary["release_matrix_must_passed"] == 6
+            assert summary["release_matrix_must_total"] == 6
+            assert summary["release_matrix_must_failed"] == 0
+            assert summary["release_matrix_must_missing"] == 0
+            assert summary["release_matrix_generated_at"] == "2026-04-23T21:00:00Z"
+            assert matrix["status"] == "pass"
+            assert matrix["path"] == str(gate_path)
+
+    @pytest.mark.asyncio
+    async def test_autonomous_ops_status_release_matrix_defaults_unknown_when_missing(
+        self, tmp_path, monkeypatch
+    ):
+        app = create_app()
+        gate_path = tmp_path / "missing-gate-latest.json"
+        monkeypatch.setenv("HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH", str(gate_path))
+
+        async with TestClient(TestServer(app)) as client:
+            status_resp = await client.get("/api/autonomous/ops/status")
+            assert status_resp.status == 200
+            payload = await status_resp.json()
+            summary = payload["summary"]
+            matrix = payload["release_matrix"]
+
+            assert summary["release_matrix_status"] == "unknown"
+            assert summary["release_matrix_must_passed"] is None
+            assert summary["release_matrix_must_total"] is None
+            assert summary["release_matrix_generated_at"] is None
+            assert matrix["status"] == "unknown"
+            assert matrix["path"] == str(gate_path)
 
     @pytest.mark.asyncio
     async def test_autonomous_ops_status_reports_docker_lane_disabled(self, monkeypatch):
@@ -4206,6 +4947,7 @@ class TestAutonomousPipeline:
         app = create_app()
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         monkeypatch.setattr(
             routes_autonomous.shutil,
@@ -4243,6 +4985,7 @@ class TestAutonomousPipeline:
         app = create_app()
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         monkeypatch.setattr(
             routes_autonomous.shutil,
@@ -4283,6 +5026,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("HIVE_AUTONOMOUS_NO_PROGRESS_SECONDS", "120")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         base_ts = 1_700_000_000.0
         monkeypatch.setattr(routes_autonomous.time, "time", lambda: base_ts)
@@ -4301,14 +5045,16 @@ class TestAutonomousPipeline:
 
             run_resp = await client.post(
                 f"/api/projects/{pid}/autonomous/runs",
-                json={"task_id": task["id"], "auto_start": True},
+                json={"task_id": task["id"], "auto_start": False},
             )
             assert run_resp.status == 201
             run = await run_resp.json()
+            store = app[APP_KEY_AUTONOMOUS_STORE]
+            store.update_run(run["id"], {"status": "in_progress"})
 
             monkeypatch.setattr(routes_autonomous.time, "time", lambda: base_ts + 600.0)
 
-            status_resp = await client.get("/api/autonomous/ops/status")
+            status_resp = await client.get(f"/api/autonomous/ops/status?project_id={pid}")
             assert status_resp.status == 200
             status_data = await status_resp.json()
             assert status_data["status"] == "ok"
@@ -4422,12 +5168,15 @@ class TestAutonomousPipeline:
             task = await task_resp.json()
             run_resp = await client.post(
                 f"/api/projects/{pid}/autonomous/runs",
-                json={"task_id": task["id"], "auto_start": True},
+                json={"task_id": task["id"], "auto_start": False},
             )
             assert run_resp.status == 201
+            run = await run_resp.json()
+            store = app[APP_KEY_AUTONOMOUS_STORE]
+            store.update_run(run["id"], {"status": "in_progress"})
 
             monkeypatch.setattr(routes_autonomous.time, "time", lambda: base_ts + 240.0)
-            status_resp = await client.get("/api/autonomous/ops/status")
+            status_resp = await client.get(f"/api/autonomous/ops/status?project_id={pid}")
             assert status_resp.status == 200
             payload = await status_resp.json()
             alerts = payload["alerts"]
@@ -4822,6 +5571,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_resolve_execution_outcome(_manager, _run):
             return {"status": "completed", "reason": "test_completed"}
@@ -4929,6 +5679,114 @@ class TestAutonomousPipeline:
             assert payload["requested_run_id"] == run1["id"]
 
     @pytest.mark.asyncio
+    async def test_pipeline_run_until_terminal_guardrail_max_run_seconds(self):
+        app = create_app()
+        manager = app[APP_KEY_MANAGER]
+        created = manager.create_project(
+            name="Autonomous Guardrail Duration",
+            execution_template={"run_guardrails": {"max_run_seconds": 60, "stop_action": "failed"}},
+        )
+        pid = created["id"]
+        store = app[APP_KEY_AUTONOMOUS_STORE]
+
+        async with TestClient(TestServer(app)) as client:
+            task_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/backlog",
+                json={
+                    "title": "Guardrail duration",
+                    "goal": "Ensure long-running run is stopped",
+                    "acceptance_criteria": ["guardrail stop emitted"],
+                },
+            )
+            assert task_resp.status == 201
+            task = await task_resp.json()
+
+            run_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/runs",
+                json={"task_id": task["id"], "auto_start": False},
+            )
+            assert run_resp.status == 201
+            run = await run_resp.json()
+            run_id = run["id"]
+
+            store.update_run(
+                run_id,
+                {
+                    "status": "in_progress",
+                    "started_at": time.time() - 600.0,
+                },
+            )
+
+            until_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/runs/{run_id}/run-until-terminal",
+                json={"max_steps": 8},
+            )
+            assert until_resp.status == 200
+            payload = await until_resp.json()
+            assert payload["terminal"] is True
+            assert payload["terminal_status"] == "failed"
+            assert payload["action"] == "guardrail_stopped"
+            assert payload["run"]["artifacts"]["report"]["guardrail_stop"]["reason"] == "max_run_seconds_exceeded"
+
+    @pytest.mark.asyncio
+    async def test_pipeline_loop_tick_execution_guardrail_max_tool_calls(self, monkeypatch):
+        app = create_app()
+        manager = app[APP_KEY_MANAGER]
+        created = manager.create_project(
+            name="Autonomous Guardrail Tool Calls",
+            execution_template={
+                "run_guardrails": {"max_tool_calls_execution_stage": 2, "stop_action": "failed"}
+            },
+        )
+        pid = created["id"]
+
+        from framework.server import routes_autonomous
+        monkeypatch.setattr(
+            routes_autonomous,
+            "_resolve_execution_outcome",
+            lambda _manager, _run: {
+                "status": "running",
+                "session_id": "session_guardrail",
+                "execution_id": "exec_guardrail",
+                "worker_graph_id": "",
+            },
+        )
+        monkeypatch.setattr(routes_autonomous, "_count_execution_tool_calls", lambda *_args, **_kwargs: 7)
+
+        async with TestClient(TestServer(app)) as client:
+            task_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/backlog",
+                json={
+                    "title": "Guardrail tool calls",
+                    "goal": "Fail fast on excessive tool call count",
+                    "acceptance_criteria": ["run stopped by guardrail"],
+                },
+            )
+            assert task_resp.status == 201
+            task = await task_resp.json()
+
+            run_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/runs",
+                json={"task_id": task["id"], "auto_start": True},
+            )
+            assert run_resp.status == 201
+
+            tick_resp = await client.post(f"/api/projects/{pid}/autonomous/loop/tick", json={})
+            assert tick_resp.status == 200
+            payload = await tick_resp.json()
+            assert payload["action"] == "guardrail_stopped"
+            assert payload["reason"] == "max_tool_calls_exceeded"
+            assert payload["run"]["status"] == "failed"
+
+            ops_resp = await client.get(f"/api/autonomous/ops/status?project_id={pid}")
+            assert ops_resp.status == 200
+            ops_payload = await ops_resp.json()
+            summary = ops_payload["summary"]
+            assert summary["guardrail_stops_total"] >= 1
+            reasons = summary.get("guardrail_stops_by_reason") or {}
+            assert reasons.get("max_tool_calls_exceeded", 0) >= 1
+
+    @pytest.mark.asyncio
     async def test_pipeline_execute_next_endpoint(self, monkeypatch):
         app = create_app()
         manager = app[APP_KEY_MANAGER]
@@ -4937,6 +5795,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_resolve_execution_outcome(_manager, _run):
             return {"status": "completed", "reason": "test_completed"}
@@ -5011,6 +5870,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_fetch(*, repository, ref, token, required_checks=None):
             assert repository == "acme/repo"
@@ -5075,6 +5935,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_fetch(*, repository, ref, token, required_checks=None):
             return {
@@ -5155,6 +6016,89 @@ class TestAutonomousPipeline:
             report_payload = await report_resp.json()
             report = report_payload.get("report", {})
             assert report.get("review_feedback", {}).get("reviews_summary", {}).get("changes_requested") == 1
+            feedback_summary = report.get("review_feedback_summary", {})
+            assert feedback_summary.get("ingested") is True
+            assert feedback_summary.get("reviews_total") == 2
+            assert feedback_summary.get("review_comments_total") == 3
+            assert feedback_summary.get("issue_comments_total") == 1
+
+    @pytest.mark.asyncio
+    async def test_pipeline_evaluate_github_surfaces_actionable_credential_error(self, monkeypatch):
+        app = create_app()
+        manager = app[APP_KEY_MANAGER]
+        created = manager.create_project(name="Autonomous GitHub Credential Validation")
+        pid = created["id"]
+        monkeypatch.setenv("GITHUB_TOKEN", "bad-token")
+
+        from framework.server import routes_autonomous
+
+        async with TestClient(TestServer(app)) as client:
+            task_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/backlog",
+                json={
+                    "title": "GitHub eval credential validation",
+                    "goal": "Credential validation should fail early",
+                    "acceptance_criteria": ["actionable credential error is returned"],
+                },
+            )
+            task = await task_resp.json()
+
+            run_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/runs",
+                json={"task_id": task["id"], "auto_start": True},
+            )
+            run = await run_resp.json()
+            run_id = run["id"]
+
+            await client.post(
+                f"/api/projects/{pid}/autonomous/runs/{run_id}/advance",
+                json={"stage": "execution", "result": "success"},
+            )
+
+            monkeypatch.setattr(
+                routes_autonomous,
+                "_github_fetch_json",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    routes_autonomous.GitHubApiError("GitHub API error (401): bad credentials", status_code=401)
+                ),
+            )
+
+            eval_resp = await client.post(
+                f"/api/projects/{pid}/autonomous/runs/{run_id}/evaluate/github",
+                json={
+                    "stage": "review",
+                    "repository": "acme/repo",
+                    "ref": "main",
+                },
+            )
+            assert eval_resp.status == 400
+            payload = await eval_resp.json()
+            assert "invalid, expired, or lacks required access" in str(payload.get("error") or "")
+
+    def test_fetch_github_paginated_list_json_collects_multiple_pages(self, monkeypatch):
+        from framework.server import routes_autonomous
+
+        calls: list[str] = []
+
+        def _fake_fetch(url: str, token: str):
+            calls.append(url)
+            if "page=1" in url:
+                return [{"id": 1}, {"id": 2}]
+            if "page=2" in url:
+                return [{"id": 3}]
+            return []
+
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_list_json", _fake_fetch)
+
+        rows = routes_autonomous._github_fetch_paginated_list_json(
+            url="https://api.github.com/repos/acme/repo/pulls/15/comments",
+            token="test-token",
+            per_page=2,
+            max_pages=5,
+        )
+        assert [row.get("id") for row in rows] == [1, 2, 3]
+        assert any("page=1" in x for x in calls)
+        assert any("page=2" in x for x in calls)
 
     @pytest.mark.asyncio
     async def test_pipeline_evaluate_github_can_post_review_summary_comment(self, monkeypatch):
@@ -5165,6 +6109,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         posted: list[dict[str, object]] = []
 
@@ -5269,6 +6214,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_fetch(*, repository, ref, token, required_checks=None):
             return {
@@ -5324,6 +6270,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_resolve(*, token, repository, ref, pr_url):
             assert token == "test-token"
@@ -5395,6 +6342,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_resolve(*, token, repository, ref, pr_url):
             assert token == "test-token"
@@ -5461,6 +6409,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("GITHUB_TOKEN", "test-token")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_resolve(*, token, repository, ref, pr_url):
             assert token == "test-token"
@@ -5525,6 +6474,7 @@ class TestAutonomousPipeline:
         monkeypatch.setenv("HIVE_AUTONOMOUS_AUTO_NEXT_FALLBACK", "error")
 
         from framework.server import routes_autonomous
+        monkeypatch.setattr(routes_autonomous, "_github_fetch_json", lambda *_args, **_kwargs: {"login": "bot"})
 
         def _fake_fetch(*, repository, ref, token, required_checks=None):
             return {

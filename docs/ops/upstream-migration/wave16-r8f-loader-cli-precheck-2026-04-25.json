@@ -1,0 +1,44 @@
+{
+  "generated_at_utc": "2026-04-25T10:29:44Z",
+  "wave": "Wave16-R8F",
+  "title": "Loader CLI AppKey lane precheck",
+  "scope": [
+    "core/framework/loader/cli.py"
+  ],
+  "observed_delta": {
+    "numstat": {"add": 2, "del": 2},
+    "summary": [
+      "import adds APP_KEY_MANAGER from framework.server.app",
+      "app['manager'] access replaced with app[APP_KEY_MANAGER] in run_server()"
+    ]
+  },
+  "candidate_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "keeps typed AppKey access consistent with server-side AppKey migration",
+      "avoids reintroducing raw-string key access in CLI bootstrap/shutdown path"
+    ]
+  },
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"config or credentials or health\" -q",
+        "result": "pass",
+        "summary": "17 passed, 176 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_colony_fork_flow.py -q",
+        "result": "known_failure",
+        "summary": "ImportError during collection: cannot import name _queen_session_dir from framework.server.session_manager"
+      }
+    ]
+  },
+  "known_debt": [
+    {
+      "area": "legacy colony fork test module",
+      "detail": "test_colony_fork_flow.py currently not importable in local branch due to removed/private symbol _queen_session_dir",
+      "impact": "not introduced by this lane; pre-existing suite debt"
+    }
+  ],
+  "status": "precheck_complete"
+}

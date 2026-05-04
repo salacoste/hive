@@ -126,6 +126,12 @@ echo "[info] runtime parity base_url=${BASE_URL}"
 
 check_json_endpoint "autonomous ops status" \
   "$BASE_URL/api/autonomous/ops/status?project_id=${PROJECT_ID}&include_runs=true"
+check_json_endpoint "llm queue status" \
+  "$BASE_URL/api/llm/queue/status"
+check_json_endpoint "telegram bridge status" \
+  "$BASE_URL/api/telegram/bridge/status"
+check_json_endpoint "telegram bridge bindings" \
+  "$BASE_URL/api/telegram/bridge/bindings"
 check_json_post_endpoint "run-cycle compact report" \
   "$BASE_URL/api/autonomous/loop/run-cycle/report" \
   "{\"project_ids\":[\"${PROJECT_ID}\"],\"auto_start\":false,\"max_steps_per_project\":1}"
@@ -142,6 +148,22 @@ if echo "$ops_resp" | jq -e '.summary.include_runs != null and .summary.project_
   echo "[ok] autonomous ops summary includes include_runs and project_filter"
 else
   echo "[fail] autonomous ops summary missing include_runs/project_filter" >&2
+  fail=$((fail + 1))
+fi
+
+llm_resp=$(http_get "$BASE_URL/api/llm/queue/status" || true)
+if echo "$llm_resp" | jq -e '.status == "ok" and (.queue|type=="object") and (.queue.limits|type=="object") and (.queue.backoff|type=="object") and (.queue.sync|type=="object") and (.queue.async|type=="object") and (.fallback|type=="object") and (.fallback.policy|type=="object") and (.fallback.history_limit|type=="number") and (.fallback.recent_attempt_chains|type=="array")' >/dev/null 2>&1; then
+  echo "[ok] llm queue status contract includes queue + fallback snapshots"
+else
+  echo "[fail] llm queue status contract drift: missing queue/fallback fields" >&2
+  fail=$((fail + 1))
+fi
+
+bridge_bindings_resp=$(http_get "$BASE_URL/api/telegram/bridge/bindings" || true)
+if echo "$bridge_bindings_resp" | jq -e '(.status=="ok" or .status=="disabled") and (.bindings|type=="array") and (.known_chats_total|type=="number") and (.bound_chats_total|type=="number") and (.sessions_with_bound_chats_total|type=="number")' >/dev/null 2>&1; then
+  echo "[ok] telegram bridge bindings contract includes binding counters"
+else
+  echo "[fail] telegram bridge bindings contract drift: missing binding snapshot fields" >&2
   fail=$((fail + 1))
 fi
 

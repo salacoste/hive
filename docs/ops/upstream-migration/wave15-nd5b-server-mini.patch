@@ -1,0 +1,25 @@
+diff --git a/core/framework/server/README.md b/core/framework/server/README.md
+index fdce7875..7f73e5d9 100644
+--- a/core/framework/server/README.md
++++ b/core/framework/server/README.md
+@@ -304,7 +304,7 @@ When `verify: true`, runs health checks (lightweight HTTP calls) against each av
+ ## Key Patterns
+ 
+ - **Session-primary** — sessions are the lookup key for all routes, workers are optional children
+-- **Per-request manager access** — routes get `SessionManager` via `request.app["manager"]`
++- **Per-request manager access** — routes get `SessionManager` via `request.app[APP_KEY_MANAGER]`
+ - **Path validation** — user-provided path segments validated with `safe_path_segment()` to prevent directory traversal
+ - **Event-driven streaming** — per-client buffer queues (max 1000 events) with 15s keepalive pings
+ - **Shared EventBus** — session owns the bus, queen and worker both publish to it, SSE always connects to `session.event_bus`
+diff --git a/core/framework/server/routes_events.py b/core/framework/server/routes_events.py
+index be72c929..30e68dc9 100644
+--- a/core/framework/server/routes_events.py
++++ b/core/framework/server/routes_events.py
+@@ -209,7 +209,6 @@ async def on_event(event) -> None:
+         EventType.TRIGGER_AVAILABLE.value,
+         EventType.TRIGGER_ACTIVATED.value,
+         EventType.TRIGGER_DEACTIVATED.value,
+-        EventType.TRIGGER_FIRED.value,
+         EventType.TRIGGER_REMOVED.value,
+         EventType.TRIGGER_UPDATED.value,
+     }

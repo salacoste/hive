@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-25T02:05:00Z",
+  "wave": "Wave16-R7",
+  "title": "Autonomous ops-status flake stabilization",
+  "scope": [
+    "core/framework/server/tests/test_api.py"
+  ],
+  "changes": [
+    "stabilized autonomous ops-status stale-run tests to avoid suite-order dependency",
+    "converted stale-run setup to deterministic in_progress state without runtime auto-start side effects",
+    "used project_id-filtered ops-status endpoint in stale/no-progress assertions to avoid top-N truncation interference from unrelated projects"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"autonomous_ops_status_includes_release_matrix_snapshot or autonomous_ops_status_reports_stuck_runs or autonomous_ops_status_reports_no_progress_projects\" -q",
+        "result": "pass",
+        "summary": "3 passed, 190 deselected"
+      },
+      {
+        "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+        "result": "pass",
+        "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "removed nondeterminism caused by active-session auto-start and no_progress top-50 slicing during full-suite runs"
+    ]
+  }
+}

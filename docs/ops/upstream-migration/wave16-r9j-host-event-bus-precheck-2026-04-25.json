@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-25T12:57:00Z",
+  "wave": "Wave16-R9J",
+  "title": "Host event bus behavior lane precheck",
+  "scope": [
+    "core/framework/host/event_bus.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/host/event_bus.py",
+      "add": 9,
+      "del": 0,
+      "total": 9
+    }
+  },
+  "delta_summary": [
+    "emit_client_input_requested now accepts prompt/options in addition to questions",
+    "payload build remains backward-compatible: optional fields only"
+  ],
+  "risk_signals": [
+    {
+      "type": "interaction-contract",
+      "evidence": "older ask_user callers rely on prompt/options path while ask_user_multiple uses questions array",
+      "impact": "without compatibility fields, client_input_requested payload may omit single-question UI hints"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_event_type_extension.py -q",
+    "uv run --package framework pytest core/tests/test_event_loop_node.py -k \"ask_user or client_input_requested\" -q",
+    "uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k \"input_requested or ask_user or question\" -q"
+  ],
+  "decision_gate": "prefer keep_local if compatibility envelope is preserved and event/bridge tests are green"
+}

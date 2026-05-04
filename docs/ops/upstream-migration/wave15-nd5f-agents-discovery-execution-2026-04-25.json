@@ -1,0 +1,41 @@
+{
+  "generated_at_utc": "2026-04-25T00:42:47Z",
+  "item": 290,
+  "lane": "ND-5F",
+  "title": "Agents discovery micro-lane execution",
+  "scope": [
+    "core/framework/agents/discovery.py"
+  ],
+  "inputs": {
+    "patch": "docs/ops/upstream-migration/wave15-nd5f-agents-discovery.patch",
+    "probe": "docs/ops/upstream-migration/wave15-nd5f-agents-discovery-probe-2026-04-25.json",
+    "replay_plan": "docs/ops/upstream-migration/wave15-nd5f-agents-discovery-replay-plan-2026-04-25.md"
+  },
+  "execution": {
+    "patch_apply": {
+      "command": "git apply docs/ops/upstream-migration/wave15-nd5f-agents-discovery.patch",
+      "result": "pass"
+    },
+    "change_summary": [
+      "Added AgentEntry metadata fields created_at and icon",
+      "Added metadata-based and filesystem fallback created_at resolution in discover_agents()"
+    ],
+    "targeted_validation": {
+      "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"org or colony or queen\" -q",
+      "result": "pass",
+      "summary": "9 passed, 184 deselected"
+    },
+    "full_gate_validation": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "execution and validation complete",
+      "lane closed; backlog handoff completed"
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-25T10:36:19Z",
+  "wave": "Wave16-R8H",
+  "title": "Queen mcp_registry include naming lane precheck",
+  "scope": [
+    "core/framework/agents/queen/mcp_registry.json"
+  ],
+  "observed_delta": {
+    "numstat": {"add": 1, "del": 1},
+    "summary": [
+      "include list uses hive-tools instead of legacy hive_tools"
+    ]
+  },
+  "candidate_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local include naming is aligned with canonical hive-tools contract preserved in loader/runner defaults",
+      "avoids drift between queen include list and seeded MCP server names"
+    ]
+  },
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      }
+    ],
+    "gate_reference": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "latest run ok=7 failed=0"
+    }
+  },
+  "status": "precheck_complete"
+}

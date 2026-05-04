@@ -1,0 +1,18 @@
+{
+  "generated_at_utc": "2026-04-26T15:56:48Z",
+  "wave": "Wave16-R10X",
+  "title": "Autonomous execution dispatch lifecycle continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "delta_summary": [
+    "R10W closed backlog create/update continuity checks",
+    "next bounded step verifies execution dispatch lifecycle continuity (run create + execute-next + empty backlog + priority dispatch)",
+    "lane remains non-destructive and dispatch-contract focused"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_run_create_with_session_triggers_execution or pipeline_execute_next_endpoint or pipeline_execute_next_empty_backlog or pipeline_dispatch_next_picks_highest_priority_todo' -q"
+  ],
+  "decision_gate": "close lane only after execution dispatch lifecycle tests remain green across trigger, priority, and empty-backlog paths"
+}

@@ -1,0 +1,28 @@
+{
+  "generated_at_utc": "2026-04-24T18:27:06Z",
+  "item": 286,
+  "lane": "ND-5B",
+  "status": "in_progress",
+  "scope": [
+    "core/framework/server/README.md",
+    "core/framework/server/routes_events.py"
+  ],
+  "artifacts": {
+    "patch": "docs/ops/upstream-migration/wave15-nd5b-server-mini.patch",
+    "probe": "docs/ops/upstream-migration/wave15-nd5b-server-mini-probe-2026-04-24.json",
+    "replay_plan": "docs/ops/upstream-migration/wave15-nd5b-server-mini-replay-plan-2026-04-24.md",
+    "reconcile_analysis": "docs/ops/upstream-migration/wave15-nd5b-server-mini-reconcile-analysis-2026-04-24.md"
+  },
+  "validation": {
+    "targeted_server_baseline": {
+      "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"events or health\" -q",
+      "result": "pass",
+      "summary": "8 passed, 185 deselected"
+    },
+    "full_regression_gate": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+    }
+  }
+}

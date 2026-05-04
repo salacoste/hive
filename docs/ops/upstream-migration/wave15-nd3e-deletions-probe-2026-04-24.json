@@ -1,0 +1,13 @@
+{
+  "generated_at_utc": "2026-04-24T15:16:13Z",
+  "lane": "ND-3E-deletions-policy",
+  "candidates": [
+    "tools/src/aden_tools/tools/google_auth.py",
+    "tools/tests/tools/test_google_auth.py"
+  ],
+  "grep_pattern": "google_auth|get_google_access_token_from_env_or_file",
+  "total_hits": 10,
+  "external_hits_total": 0,
+  "external_hits": [],
+  "recommendation": "safe_to_delete"
+}

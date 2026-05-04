@@ -135,7 +135,16 @@ services:
       start_period: 20s
 
   hive-ops:
-    image: ${HIVE_CORE_IMAGE:-hive-hive-core}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HIVE_DOCKER_INSTALL_PLAYWRIGHT: ${HIVE_DOCKER_INSTALL_PLAYWRIGHT_OPS:-0}
+        HIVE_DOCKER_INSTALL_NODE: ${HIVE_DOCKER_INSTALL_NODE_OPS:-1}
+        HIVE_DOCKER_INSTALL_GO: ${HIVE_DOCKER_INSTALL_GO_OPS:-0}
+        HIVE_DOCKER_INSTALL_RUST: ${HIVE_DOCKER_INSTALL_RUST_OPS:-0}
+        HIVE_DOCKER_INSTALL_JAVA: ${HIVE_DOCKER_INSTALL_JAVA_OPS:-0}
+    image: ${HIVE_OPS_IMAGE:-hive-hive-ops}
     container_name: hive-ops
     profiles: ["ops"]
     env_file:
@@ -150,6 +159,7 @@ services:
       - ./:/workspace
       - hive-storage:/data/storage
       - hive-home:/home/hiveuser/.hive
+      - hive-frontend-node-modules:/workspace/core/frontend/node_modules
       - ./.cache/uv:/home/hiveuser/.cache/uv
       - ./.cache/uvproj:/data/uvproj
 
@@ -188,6 +198,7 @@ volumes:
   hive-storage:
   hive-home:
   hive-workspaces:
+  hive-frontend-node-modules:
   hive-redis-data:
   hive-postgres-data:
 

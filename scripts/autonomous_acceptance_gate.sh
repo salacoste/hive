@@ -21,9 +21,38 @@ RUN_SELF_CHECK="${HIVE_ACCEPTANCE_RUN_SELF_CHECK:-false}"
 RUN_DOCS_NAV_CHECK="${HIVE_ACCEPTANCE_RUN_DOCS_NAV_CHECK:-false}"
 RUN_PRESET_SMOKE="${HIVE_ACCEPTANCE_RUN_PRESET_SMOKE:-false}"
 RUN_DELIVERY_E2E_SMOKE="${HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE:-false}"
+RUN_MIN_REGRESSION_SET="${HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET:-true}"
+MCP_HEALTH_SINCE_MINUTES="${HIVE_ACCEPTANCE_MCP_HEALTH_SINCE_MINUTES:-30}"
+GATE_RESULTS_JSON_PATH="${HIVE_ACCEPTANCE_GATE_RESULTS_JSON_PATH:-docs/ops/acceptance-reports/gate-latest.json}"
+GATE_RESULTS_SHARED_JSON_PATH="${HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH:-${HOME}/.hive/server/acceptance/gate-latest.json}"
+CORE_PORT="${HIVE_CORE_PORT:-8787}"
+
+resolve_base_url() {
+  if [[ -n "${HIVE_BASE_URL:-}" ]]; then
+    echo "${HIVE_BASE_URL%/}"
+    return 0
+  fi
+
+  local candidates=(
+    "http://localhost:${CORE_PORT}"
+    "http://hive-core:${CORE_PORT}"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if curl -fsS --max-time 5 "${candidate}/api/health" >/dev/null 2>&1; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  echo "http://localhost:${CORE_PORT}"
+}
+
+BASE_URL="$(resolve_base_url)"
 
 ok=0
 failed=0
+declare -a STEP_RESULTS=()
 
 run_step() {
   local name="$1"
@@ -31,9 +60,41 @@ run_step() {
   if "$@"; then
     echo "[ok] $name"
     ok=$((ok + 1))
+    STEP_RESULTS+=("${name}"$'\t'"ok")
   else
     echo "[fail] $name" >&2
     failed=$((failed + 1))
+    STEP_RESULTS+=("${name}"$'\t'"fail")
+  fi
+}
+
+run_ops_command() {
+  if command -v docker >/dev/null 2>&1; then
+    ./scripts/hive_ops_run.sh "$@"
+  else
+    "$@"
+  fi
+}
+
+write_gate_matrix_artifact() {
+  local output_path="$1"
+  local rows=""
+  local row
+  for row in "${STEP_RESULTS[@]}"; do
+    rows+="${row}"$'\n'
+  done
+  printf "%s" "$rows" | uv run --no-project python scripts/acceptance_gate_result_artifact.py \
+    --output "$output_path" \
+    --project-id "$PROJECT_ID" \
+    --ok "$ok" \
+    --failed "$failed"
+  if [[ -n "$GATE_RESULTS_SHARED_JSON_PATH" ]]; then
+    mkdir -p "$(dirname "$GATE_RESULTS_SHARED_JSON_PATH")" >/dev/null 2>&1 || true
+    if cp "$output_path" "$GATE_RESULTS_SHARED_JSON_PATH" >/dev/null 2>&1; then
+      echo "[ok] shared gate artifact: $GATE_RESULTS_SHARED_JSON_PATH"
+    else
+      echo "[warn] could not write shared gate artifact: $GATE_RESULTS_SHARED_JSON_PATH" >&2
+    fi
   fi
 }
 
@@ -47,11 +108,30 @@ echo "run_self_check=$RUN_SELF_CHECK"
 echo "run_docs_nav_check=$RUN_DOCS_NAV_CHECK"
 echo "run_preset_smoke=$RUN_PRESET_SMOKE"
 echo "run_delivery_e2e_smoke=$RUN_DELIVERY_E2E_SMOKE"
+echo "run_min_regression_set=$RUN_MIN_REGRESSION_SET"
+echo "mcp_health_since_minutes=$MCP_HEALTH_SINCE_MINUTES"
+echo "gate_results_json_path=$GATE_RESULTS_JSON_PATH"
+echo "gate_results_shared_json_path=$GATE_RESULTS_SHARED_JSON_PATH"
+echo "base_url=$BASE_URL"
+
+minimal_self_check_ran="false"
+if [[ "$RUN_MIN_REGRESSION_SET" == "true" ]]; then
+  run_step "acceptance toolchain self-check (minimal regression)" ./scripts/acceptance_toolchain_self_check.sh
+  run_step "mcp health summary" \
+    run_ops_command uv run --no-project python scripts/mcp_health_summary.py --since-minutes "$MCP_HEALTH_SINCE_MINUTES" --json
+  minimal_self_check_ran="true"
+else
+  echo "[skip] minimal regression set"
+fi
 
 if [[ "$RUN_SELF_CHECK" == "true" ]]; then
-  run_step "acceptance toolchain self-check" ./scripts/acceptance_toolchain_self_check.sh
+  if [[ "$minimal_self_check_ran" == "true" ]]; then
+    echo "[info] acceptance toolchain self-check already executed via minimal regression set"
+  else
+    run_step "acceptance toolchain self-check" ./scripts/acceptance_toolchain_self_check.sh
+  fi
 else
-  echo "[skip] acceptance toolchain self-check"
+  echo "[skip] acceptance toolchain self-check (optional)"
 fi
 if [[ "$RUN_DOCS_NAV_CHECK" == "true" ]]; then
   run_step "acceptance docs navigation check" uv run python scripts/check_acceptance_docs_navigation.py
@@ -65,7 +145,7 @@ else
 fi
 if [[ "$RUN_DELIVERY_E2E_SMOKE" == "true" ]]; then
   run_step "autonomous delivery e2e smoke" \
-    ./scripts/hive_ops_run.sh \
+    run_ops_command \
       env HIVE_DELIVERY_E2E_BASE_URL="${HIVE_DELIVERY_E2E_BASE_URL:-http://hive-core:${HIVE_CORE_PORT:-8787}}" \
       uv run --no-project python scripts/autonomous_delivery_e2e_smoke.py
 else
@@ -75,14 +155,21 @@ fi
 run_step "backlog validator" uv run python scripts/validate_backlog_markdown.py
 run_step "backlog status summary" uv run python scripts/backlog_status.py
 run_step "runbook sync check" uv run python scripts/check_runbook_sync.py
-run_step "runtime parity" ./scripts/check_runtime_parity.sh
+run_step "runtime parity" env HIVE_BASE_URL="$BASE_URL" ./scripts/check_runtime_parity.sh
 run_step "ops status health (project)" \
-  env HIVE_AUTONOMOUS_HEALTH_PROJECT_ID="$PROJECT_ID" HIVE_AUTONOMOUS_HEALTH_PROFILE=prod ./scripts/autonomous_ops_health_check.sh
+  env HIVE_BASE_URL="$BASE_URL" HIVE_AUTONOMOUS_HEALTH_PROJECT_ID="$PROJECT_ID" HIVE_AUTONOMOUS_HEALTH_PROFILE=prod ./scripts/autonomous_ops_health_check.sh
+run_step "api health contract" \
+  uv run --no-project python scripts/check_operational_api_contracts.py --base-url "$BASE_URL" --check health
+run_step "api ops status contract" \
+  uv run --no-project python scripts/check_operational_api_contracts.py --base-url "$BASE_URL" --check ops
+run_step "api telegram bridge status contract" \
+  uv run --no-project python scripts/check_operational_api_contracts.py --base-url "$BASE_URL" --check telegram
 run_step "stale remediation dry-run (project)" \
-  env HIVE_AUTONOMOUS_REMEDIATE_PROJECT_ID="$PROJECT_ID" HIVE_AUTONOMOUS_REMEDIATE_DRY_RUN=true ./scripts/autonomous_remediate_stale_runs.sh
+  env HIVE_BASE_URL="$BASE_URL" HIVE_AUTONOMOUS_REMEDIATE_PROJECT_ID="$PROJECT_ID" HIVE_AUTONOMOUS_REMEDIATE_DRY_RUN=true ./scripts/autonomous_remediate_stale_runs.sh
 run_step "run-cycle compact report" \
-  bash -lc 'PORT="${HIVE_CORE_PORT:-8787}"; curl -fsS -X POST "http://localhost:${PORT}/api/autonomous/loop/run-cycle/report" -H "Content-Type: application/json" -d "{\"project_ids\":[\"'"$PROJECT_ID"'\"],\"auto_start\":false,\"max_steps_per_project\":1}" >/dev/null'
-run_step "acceptance report artifact" uv run python scripts/acceptance_report_artifact.py
+  env HIVE_BASE_URL="$BASE_URL" HIVE_ACCEPTANCE_PROJECT_ID="$PROJECT_ID" \
+  bash -lc 'curl -fsS -X POST "$HIVE_BASE_URL/api/autonomous/loop/run-cycle/report" -H "Content-Type: application/json" -d "{\"project_ids\":[\"$HIVE_ACCEPTANCE_PROJECT_ID\"],\"auto_start\":false,\"max_steps_per_project\":1}" >/dev/null'
+run_step "acceptance report artifact" env HIVE_BASE_URL="$BASE_URL" uv run python scripts/acceptance_report_artifact.py
 if [[ "$REPORT_PRUNE_APPLY" == "true" ]]; then
   run_step "acceptance report hygiene (apply)" \
     uv run python scripts/acceptance_report_hygiene.py --keep "$REPORT_KEEP" --yes
@@ -105,15 +192,9 @@ if [[ "$ENFORCE_HISTORY" == "true" ]]; then
 else
   echo "[skip] acceptance history regression guard"
 fi
-if [[ "$SUMMARY_JSON" == "true" ]]; then
-  run_step "acceptance ops summary (json)" uv run python scripts/acceptance_ops_summary.py --json
-else
-  run_step "acceptance ops summary" uv run python scripts/acceptance_ops_summary.py
-fi
-
 if [[ "$SKIP_TELEGRAM" != "true" ]]; then
   run_step "telegram bridge status" \
-    bash -lc 'PORT="${HIVE_CORE_PORT:-8787}"; curl -fsS "http://localhost:${PORT}/api/telegram/bridge/status" >/dev/null'
+    env HIVE_BASE_URL="$BASE_URL" bash -lc 'curl -fsS "$HIVE_BASE_URL/api/telegram/bridge/status" >/dev/null'
 else
   echo "[skip] telegram bridge status"
 fi
@@ -122,6 +203,13 @@ if [[ "$SKIP_CHECKLIST" != "true" ]]; then
   run_step "local prod checklist" ./scripts/local_prod_checklist.sh
 else
   echo "[skip] local prod checklist"
+fi
+
+run_step "acceptance gate matrix artifact" write_gate_matrix_artifact "$GATE_RESULTS_JSON_PATH"
+if [[ "$SUMMARY_JSON" == "true" ]]; then
+  run_step "acceptance ops summary (json)" uv run python scripts/acceptance_ops_summary.py --json
+else
+  run_step "acceptance ops summary" uv run python scripts/acceptance_ops_summary.py
 fi
 
 echo "== Acceptance summary: ok=$ok failed=$failed =="

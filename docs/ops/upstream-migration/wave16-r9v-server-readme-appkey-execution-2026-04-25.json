@@ -1,0 +1,31 @@
+{
+  "generated_at_utc": "2026-04-25T20:03:20Z",
+  "wave": "Wave16-R9V",
+  "title": "Server README AppKey docs alignment lane execution",
+  "scope": [
+    "core/framework/server/README.md"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "documentation now matches active server AppKey access pattern (`request.app[APP_KEY_MANAGER]`)",
+      "this is a docs-only delta and prevents drift back to raw-string manager lookup"
+    ]
+  },
+  "changes": [
+    "no code patch in R9V lane (docs alignment retained)"
+  ],
+  "validation": {
+    "notes": [
+      "documentation-only lane; no runtime behavior change",
+      "server API bundles were already green in adjacent AppKey lanes (R9S)"
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9V lane closed with explicit keep-local decision",
+      "next lane: queen MCP registry canonical include list"
+    ]
+  }
+}

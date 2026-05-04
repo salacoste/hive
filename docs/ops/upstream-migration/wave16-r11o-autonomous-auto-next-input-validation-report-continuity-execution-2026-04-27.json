@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T00:44:30Z",
+  "wave": "Wave16-R11O",
+  "title": "Autonomous auto-next input-validation + report continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "auto-next input-validation and branch selection semantics remain stable across success/manual_pending/deferred/reject paths",
+      "report/read-model continuity remains stable after auto-next decisions and mixed status payload handling",
+      "no regressions observed in targeted auto-next input-validation/report continuity bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_rejects_execution_stage or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_evaluate_endpoint_accepts_status_field or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11O lane closed as keep-local with green auto-next input-validation/report continuity bundle",
+      "next lane continues GitHub evaluate + auto-next + report cross-edge continuity"
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-26T14:06:04Z",
+  "wave": "Wave16-R10P",
+  "title": "Autonomous run-until-terminal + execute-next contract lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "run-until-terminal endpoint lifecycle (terminal detection/conflicts) remains stable",
+      "execute-next endpoint contract (dispatch + empty backlog) remains stable",
+      "no runtime behavior regressions observed in targeted endpoint bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_run_until_terminal or pipeline_execute_next' -q",
+        "result": "pass",
+        "summary": "4 passed, 189 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10P lane closed as keep-local with green run-until-terminal + execute-next contract tests",
+      "next lane targets loop-cycle/tick-all control-surface continuity"
+    ]
+  }
+}

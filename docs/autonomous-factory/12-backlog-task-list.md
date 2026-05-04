@@ -178,30 +178,22 @@
 - Done when:
   - оператор получает retention alerts и может проверять backlog из Telegram без Web UI.
 
-## Current Focus (Wave 12 upstream migration)
+## Current Focus (Wave 19 telegram-bridge resilience)
 
-Master plans (fixed scope):
+Execution snapshot (as of May 3, 2026):
 
-- `docs/autonomous-factory/13-master-implementation-plan.md`
-- `docs/autonomous-factory/21-upstream-migration-wave3-plan.md`
-
-Execution snapshot (as of April 19, 2026):
-
-- items `12..240` are completed (`done=240`);
-- upstream migration wave queued as `232..240`;
+- backlog baseline `1..580`: completed (`done=580`);
+- opened next wave `581..584` for telegram-bridge resilience hardening;
 - active execution:
   - `in_progress=[]`;
   - `blocked=[]`;
-  - `todo=[]`;
-- baseline migration references:
-  - `docs/ops/upstream-migration/baseline-2026-04-17.md`;
-  - `docs/ops/upstream-migration/latest.md`.
+  - `todo=[]`.
 
 Current Focus items:
 
-1. Wave 12 cutover/sign-off is closed (`all wave items = done`).
-2. Current focus cleared (no active `in_progress` items).
-3. Use this section as baseline for next explicitly approved execution wave.
+1. Wave 19 closure is complete (`581..584` all done).
+2. Auto-recovery + incident-digest baselines are active in runtime and operator artifacts.
+3. Next execution wave should be opened from explicit operator priority.
 
 ## Execution Wave: Autonomous Factory Hardening (operator requested)
 
@@ -6004,3 +5996,8680 @@ Current Focus items:
   - Web не дублирует optimistic user rows при echo из backend;
   - Web->Telegram mirror стабилен сразу после bind/new session;
   - профильные backend/frontend tests green.
+
+## Execution Wave: Autonomous E2E + Cross-Channel Consistency (2 -> 3)
+
+242. `P0` Autonomous Cycle Contract Lock (Single Repo E2E)
+- Status: `done`
+- Scope:
+  - зафиксировать единый функциональный контракт pipeline:
+    `project onboarding -> backlog task -> execute-next -> run-until-terminal -> report`;
+  - привести naming/semantics стадий к одному operator-facing словарю
+    (`design/implement/review/validate` vs `execution/review/validation`);
+  - закрепить fallback policy matrix (onboarding deferred, no checks policy, GitHub evaluate fallback).
+- Progress:
+  - добавлен каноничный контракт-док:
+    - `docs/ops/autonomous-single-repo-contract.md`;
+  - зафиксирован endpoint-level E2E путь:
+    - onboarding -> backlog -> execute-next -> run-until-terminal -> report;
+  - формализовано соответствие стадий:
+    - operator flow (`design/implement/review/validate`) -> runtime (`execution/review/validation`);
+  - зафиксирована fallback matrix:
+    - onboarding deferred (`ready=false` / strict mode),
+    - no checks policy (`error|success|manual_pending`),
+    - GitHub evaluate/missing token fallback (`manual_evaluate_required`).
+- Validation (April 23, 2026):
+  - контракт сверен с реализацией в:
+    - `core/framework/server/routes_projects.py`,
+    - `core/framework/server/routes_autonomous.py`,
+    - `core/framework/server/autonomous_pipeline.py`,
+    - `scripts/autonomous_delivery_e2e_smoke.py`;
+  - runbook cross-link добавлен:
+    - `docs/LOCAL_PROD_RUNBOOK.md` -> `docs/ops/autonomous-single-repo-contract.md`.
+- Done when:
+  - operator/spec документ однозначно описывает e2e path без расхождений;
+  - acceptance критерии по run lifecycle и fallback зафиксированы и проверяемы.
+
+243. `P0` Web↔Telegram History Contract Parity (`events/history`)
+- Status: `done`
+- Scope:
+  - устранить разрыв контракта между frontend и backend для
+    `/api/sessions/{id}/events/history`;
+  - синхронизировать response fields (`events`, `total`, `returned`, `limit`, `truncated`)
+    и поведение tail replay.
+- Progress:
+  - backend route `GET /api/sessions/{session_id}/events/history` расширен:
+    - tail semantics по `?limit=` (default `2000`, clamp `1..10000`);
+    - контрактные поля `total/returned/truncated/limit`;
+    - одинаковый payload для missing-file/OSError сценариев;
+    - валидация `limit` (non-integer -> `400`).
+  - frontend API parity hardening:
+    - добавлен `normalizeSessionEventsHistoryResponse(...)` для
+      backward-compatible нормализации payload;
+    - `sessionsApi.eventsHistory(...)` теперь всегда возвращает полный
+      contract shape даже при частичном ответе backend.
+  - tests:
+    - backend: `test_session_events_history_*` (tail contract, empty payload, invalid limit);
+    - frontend: `src/api/sessions.test.ts`
+      (normalization + endpoint call with `limit`).
+- Validation (April 23, 2026):
+  - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_api.py -k "events_history" -q`
+    -> `3 passed`;
+  - `npm --prefix core/frontend run test -- src/api/sessions.test.ts`
+    -> `3 passed`.
+- Done when:
+  - backend endpoint возвращает поля, ожидаемые frontend API;
+  - добавлены и проходят backend/frontend tests на contract parity.
+
+244. `P0` Telegram Session Continuity After Restart
+- Status: `done`
+- Scope:
+  - закрыть race/continuity gap: при stale chat binding bridge должен пытаться
+    `queen_resume_from` cold session, а не всегда создавать новую timeline;
+  - сохранить консистентность истории между Web и Telegram после рестарта.
+- Progress:
+  - `TelegramBridge._ensure_bound_session(...)` обновлён:
+    - при stale binding сначала выполняется resume попытка через
+      `create_session(queen_resume_from=<stale_session_id>)`;
+    - новая session создаётся только как fallback при неуспешном resume.
+  - добавлен helper:
+    - `_resume_bridge_session(...)` с явным логированием resume/fallback.
+  - tests (unit integration around bridge flow):
+    - `test_ensure_bound_session_resumes_stale_binding_before_creating_new`;
+    - `test_ensure_bound_session_falls_back_to_new_when_resume_fails`.
+- Validation (April 23, 2026):
+  - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k "ensure_bound_session" -q`
+    -> `4 passed`.
+  - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k "restart_recovers_bound_chat_by_resuming_same_session_id or ensure_bound_session" -q`
+    -> `5 passed`.
+- Result:
+  - restart recover path теперь фиксирован end-to-end:
+    - persisted binding -> bridge restore -> `queen_resume_from` old session id -> continuity timeline.
+- Done when:
+  - restart scenario сохраняет единую timeline для chat/session;
+  - интеграционный test покрывает recover path end-to-end.
+
+245. `P1` Cross-Channel Integration Regression Suite
+- Status: `done`
+- Scope:
+  - добавить интеграционные тесты на:
+    - Web->Telegram mirror;
+    - Telegram->Web mirror;
+    - ask_user inline callbacks (dedupe/stale/no-worker);
+    - restart/reconnect continuity.
+- Progress:
+  - закрыто покрытие cross-channel и callback edge cases в `core/framework/server/tests/test_telegram_bridge.py`:
+    - `test_client_input_received_mirrors_web_message_to_bound_chat`,
+    - `test_inject_user_input_publishes_client_input_received_for_web_mirror`,
+    - `test_send_choice_callback_handles_no_worker_gracefully`,
+    - `test_duplicate_callback_id_is_ignored_without_double_side_effects`,
+    - `test_stale_callback_does_not_send_chat_spam`,
+    - `test_restart_recovers_bound_chat_by_resuming_same_session_id`.
+  - в suite закреплены также sibling-callback invalidation и immediate subscribe для Web->Telegram mirror после bind.
+- Validation (April 23, 2026):
+  - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -q`
+    -> `44 passed`.
+  - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k "client_input_received or send_choice_callback or question_answer_callback or ensure_bound_session or restart_recovers_bound_chat_by_resuming_same_session_id" -q`
+    -> `12 passed`.
+- Done when:
+  - suite стабильно зелёный в container-first;
+  - ключевые edge cases закреплены автотестами.
+
+246. `P1` Operational Acceptance Matrix (Container-First)
+- Status: `done`
+- Scope:
+  - зафиксировать MUST/SHOULD/NICE checks для пунктов 2 и 3;
+  - включить в релизный gate минимальный regression набор
+    (`self-check`, `mcp_health_summary`, `autonomous_ops_health_check`,
+    API health/ops/telegram status contracts).
+- Progress:
+  - добавлен API contract checker:
+    - `scripts/check_operational_api_contracts.py` (`health|ops|telegram`);
+    - интеграция в gate отдельными шагами:
+      - `api health contract`,
+      - `api ops status contract`,
+      - `api telegram bridge status contract`.
+  - `scripts/autonomous_acceptance_gate.sh` расширен release-minimum блоком:
+    - `HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET` (default `true`);
+    - включает `acceptance_toolchain_self_check (minimal regression)` и `mcp health summary`.
+  - добавлен machine-readable gate artifact:
+    - `scripts/acceptance_gate_result_artifact.py`,
+    - output: `docs/ops/acceptance-reports/gate-latest.json`,
+    - содержит `release_matrix` (`must/should/nice`, `status`, counters).
+  - `scripts/acceptance_ops_summary.py` расширен полями release matrix из `gate-latest.json`.
+  - runbook синхронизирован под новые gate matrix env/артефакты:
+    - `docs/LOCAL_PROD_RUNBOOK.md`.
+  - container-first routing hardening для acceptance gate:
+    - `scripts/autonomous_acceptance_gate.sh` теперь резолвит единый `BASE_URL`
+      (`HIVE_BASE_URL` -> `localhost` -> `hive-core`) и передаёт его во все API-контракт/ops/artifact шаги;
+    - устранён nested `hive_ops_run.sh` fail внутри `hive-ops` контейнера:
+      добавлен `run_ops_command` (использует wrapper только когда `docker` доступен).
+  - `scripts/acceptance_report_artifact.py` переведён на `HIVE_BASE_URL` (с fallback на `localhost`).
+- Validation (April 23, 2026):
+  - script tests:
+    - `./scripts/hive_ops_run.sh uv run pytest scripts/tests/test_check_operational_api_contracts.py scripts/tests/test_acceptance_gate_result_artifact.py scripts/tests/test_acceptance_ops_summary.py scripts/tests/test_acceptance_gate_presets.py scripts/tests/test_acceptance_gate_presets_smoke_behavior.py scripts/tests/test_acceptance_toolchain_self_check_script.py scripts/tests/test_check_acceptance_self_check_test_bundle_sync.py -q`
+    -> `24 passed`.
+  - release-like gate run:
+    - `./scripts/hive_ops_run.sh bash -lc 'HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET=true HIVE_ACCEPTANCE_SKIP_CHECKLIST=true HIVE_ACCEPTANCE_SKIP_TELEGRAM=true ./scripts/autonomous_acceptance_gate.sh'`
+    -> `ok=17 failed=0`;
+    - `acceptance_ops_summary` snapshot:
+      - `release_matrix_status=pass`,
+      - `release_matrix_must_passed=6/6`,
+      - `latest_generated_at=2026-04-23T11:03:09`.
+- Done when:
+  - runbook и automation проверяют одинаковый набор acceptance условий;
+  - `acceptance_ops_summary` отражает зелёный snapshot без ручных трактовок.
+
+## Execution Wave: Continuous Operations Automation
+
+247. `P1` One-Command Deep Acceptance Profile Runner (Container-First)
+- Status: `done`
+- Scope:
+  - добавить единый оркестратор deep acceptance запуска:
+    - full-deep acceptance preset,
+    - refresh backlog status artifact,
+    - final ops summary json;
+  - гарантировать container-first выполнение из host и из `hive-ops` контейнера.
+- Progress:
+  - добавлен новый wrapper:
+    - `scripts/acceptance_deep_profile.sh`;
+  - добавлены флаги:
+    - `--project <id>`,
+    - `--print-plan`,
+    - `--no-backlog-refresh`;
+  - добавлен `run_ops_command` fallback:
+    - при наличии `docker` используется `./scripts/hive_ops_run.sh`,
+    - иначе команды выполняются локально (для запуска внутри `hive-ops`);
+  - в runbook/automation-map добавлены команды deep profile wrapper.
+- Validation:
+  - plan mode:
+    - `./scripts/acceptance_deep_profile.sh --project default --print-plan`;
+  - container-first live run:
+    - `./scripts/hive_ops_run.sh ./scripts/acceptance_deep_profile.sh --project default`
+    -> `ok=3 failed=0` (wrapper summary),
+    -> inner gate `ok=22 failed=0`,
+    -> `release_matrix_status=pass`, `must=6/6`.
+- Done when:
+  - wrapper стабильно отрабатывает end-to-end в container-first;
+  - после запуска фиксируется актуальный `acceptance_ops_summary --json`.
+
+248. `P1` Scheduler Hook for Weekly Deep Profile
+- Status: `done`
+- Scope:
+  - добавить безопасный scheduled hook для weekly/deep acceptance profile
+    с явным проектным scope и non-destructive defaults;
+  - синхронизировать с существующими scheduler wrappers/runbook.
+- Progress:
+  - `scripts/acceptance_weekly_maintenance.sh` расширен deep-profile hook:
+    - env `HIVE_ACCEPTANCE_WEEKLY_DEEP_PROFILE=true|false`,
+    - env `HIVE_ACCEPTANCE_WEEKLY_DEEP_PROJECT_ID=<project-id>`;
+  - hook выполняет `scripts/acceptance_deep_profile.sh` через container-aware
+    `run_ops_command` (docker wrapper only when available);
+  - runbook + acceptance automation map дополнены weekly deep profile usage;
+  - добавлено тестовое покрытие на script contract:
+    - `scripts/tests/test_acceptance_weekly_maintenance_script.py`.
+- Done when:
+  - есть воспроизводимый weekly deep profile запуск без ручной склейки команд.
+- Validation (April 23, 2026):
+  - script/tests:
+    - `uv run pytest scripts/tests/test_acceptance_weekly_maintenance_script.py scripts/tests/test_acceptance_toolchain_self_check_script.py scripts/tests/test_check_acceptance_self_check_test_bundle_sync.py -q`
+      -> `5 passed`;
+  - container-first weekly execution:
+    - `./scripts/hive_ops_run.sh bash -lc 'HIVE_ACCEPTANCE_WEEKLY_DEEP_PROFILE=true HIVE_ACCEPTANCE_WEEKLY_DEEP_PROJECT_ID=default ./scripts/acceptance_weekly_maintenance.sh'`
+      -> `ok=4 failed=0` (weekly wrapper summary),
+      -> deep profile `ok=3 failed=0`,
+      -> acceptance gate `ok=22 failed=0`.
+
+249. `P1` Telegram Ops Digest: Release Matrix Snapshot
+- Status: `done`
+- Scope:
+  - добавить в `/autodigest` и proactive digest краткий блок release matrix
+    (`must_passed/total`, `status`) из `gate-latest.json`;
+  - сохранить anti-noise gating для операторского чата.
+- Progress:
+  - добавлен matrix snapshot в `TelegramBridge._send_autonomous_digest(...)`:
+    - читает shared gate artifact (`HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH`,
+      default `~/.hive/server/acceptance/gate-latest.json`);
+    - выводит в digest:
+      - `release_matrix: <status> (must X/Y)`,
+      - `release_matrix_at: <generated_at>`;
+  - proactive anti-noise расширен:
+    - digest теперь отправляется не только при risky `outcomes`,
+      но и при `release_matrix_status != pass`.
+  - `scripts/autonomous_acceptance_gate.sh` теперь публикует shared copy
+    gate-matrix artifact по `HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH`
+    для runtime-consumers (включая Telegram bridge).
+- Validation (April 23, 2026):
+  - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k "autodigest" -q`
+    -> `6 passed`.
+- Done when:
+  - Telegram digest отражает актуальный acceptance matrix статус.
+
+250. `P1` Web UI Ops Panel: Acceptance Matrix Badge
+- Status: `done`
+- Scope:
+  - вывести в `Auto/Ops` UI компактный статус acceptance matrix
+    (`pass|fail`, `must 6/6`, `generated_at`);
+  - привязать к текущему `acceptance_ops_summary` API контракту.
+- Progress:
+  - `/api/autonomous/ops/status` расширен release-matrix snapshot payload:
+    - top-level `release_matrix` (`status`, `must_*`, `generated_at`, `path`);
+    - summary fields:
+      - `release_matrix_status`,
+      - `release_matrix_must_passed/total/failed/missing`,
+      - `release_matrix_generated_at`;
+  - в Web UI (`colony-chat` header actions) добавлен компактный badge:
+    - `Auto <status> <must_passed>/<must_total>`;
+    - цветовая индикация `pass/fail/unknown`;
+    - detail modal c `generated_at`, `artifact path`, `must failed/missing`;
+    - ручной refresh + auto-refresh polling;
+  - добавлен frontend API adapter:
+    - `core/frontend/src/api/ops.ts` (`opsApi.releaseMatrix()`), с fallback на summary поля.
+- Validation (April 23, 2026):
+  - backend:
+    - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_api.py -k \"release_matrix\" -q`;
+  - frontend:
+    - `cd core/frontend && uv run npm run test -- src/api/ops.test.ts`.
+- Done when:
+  - оператор видит release readiness без чтения JSON/логов.
+
+251. `P1` Container-First Frontend Ops Toolchain Parity (`hive-ops`)
+- Status: `done`
+- Scope:
+  - устранить gap, когда frontend команды (`npm run test/build`) не запускались в `hive-ops` контейнере;
+  - обеспечить изоляцию `node_modules` от host platform optional deps (darwin/linux rollup mismatch);
+  - сохранить non-root execution в `hive-ops`.
+- Progress:
+  - `docker-compose.yml`:
+    - `hive-ops` переведен на отдельный build/image (`HIVE_OPS_IMAGE`, default `hive-hive-ops`);
+    - добавлены ops-specific build args:
+      - `HIVE_DOCKER_INSTALL_NODE_OPS` (default `1`),
+      - `HIVE_DOCKER_INSTALL_GO_OPS`,
+      - `HIVE_DOCKER_INSTALL_RUST_OPS`,
+      - `HIVE_DOCKER_INSTALL_JAVA_OPS`,
+      - `HIVE_DOCKER_INSTALL_PLAYWRIGHT_OPS` (default `0`);
+    - добавлен isolated volume:
+      - `hive-frontend-node-modules:/workspace/core/frontend/node_modules`.
+  - `scripts/hive_ops_run.sh`:
+    - теперь резолвит `HIVE_OPS_IMAGE` отдельно от `HIVE_CORE_IMAGE`;
+    - корректно билдит ops image при отсутствии/`--build`;
+    - добавлен ownership init step (`root -> chown 1001:1001`) для mounted cache/volume dirs,
+      чтобы `npm`/`uv` не падали с `EACCES` под `hiveuser`.
+  - docs:
+    - `docs/LOCAL_PROD_RUNBOOK.md` обновлен под ops image + `*_OPS` env + frontend container-first commands;
+    - `docs/ops/acceptance-automation-map.md` обновлен под dedicated `hive-ops` image behavior.
+- Validation (April 23, 2026):
+  - compose contract:
+    - `docker compose --profile ops config` -> `OK` (includes `hive-hive-ops`, `hive-frontend-node-modules`);
+  - ops runtime:
+    - `./scripts/hive_ops_run.sh bash -lc 'node --version && npm --version'` -> `v20.19.2`, `9.2.0`;
+    - `./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm ci --no-audit --no-fund && npm run test -- src/api/ops.test.ts'` -> `2 passed`;
+    - `./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm run build'` -> success.
+- Done when:
+  - frontend validation reliably runs in container-first mode through `hive-ops`,
+    без зависимости от host node_modules/platform.
+
+252. `P1` Full Local Rebuild + Runtime Smoke Baseline (Container-First)
+- Status: `done`
+- Scope:
+  - выполнить полный локальный `docker compose up -d --build` прогон и зафиксировать baseline времени;
+  - проверить post-rebuild runtime health (`health`, `telegram bridge`, `autonomous ops`);
+  - подтвердить container-first frontend validation через `hive-ops`.
+- Progress:
+  - выполнен full rebuild/restart базового стека:
+    - `/usr/bin/time -p docker compose up -d --build`
+      -> `real 26.81`, `user 0.20`, `sys 0.27`;
+  - post-rebuild smoke:
+    - `docker compose ps` -> `hive-core`, `hive-scheduler`, `google-token-refresher`, `redis`, `postgres` в `Up/healthy`;
+    - `GET /api/health` -> `status=ok`, `telegram_bridge.running=true`;
+    - `GET /api/telegram/bridge/status` -> `status=ok`, `poller_owner=true`;
+    - `GET /api/autonomous/ops/status` ->
+      `release_matrix_status=pass`, `must=6/6`, `loop_stale=false`;
+  - full compose logs smoke (`hive-core`, `hive-scheduler`) без `ERROR/Traceback/Invalid API key` после restart окна;
+  - container-first frontend validation подтверждена:
+    - `./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm run test -- src/api/ops.test.ts'` -> `2 passed`;
+    - `./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm run build'` -> success.
+  - ops image rebuild baseline:
+    - `/usr/bin/time -p docker compose --profile ops build hive-ops`
+      -> `real 2.96`, `user 0.17`, `sys 0.26` (cache-hot path).
+- Done when:
+  - full local rebuild подтвержден с измеримым baseline;
+  - runtime + telegram bridge + autonomous ops проходят smoke после rebuild;
+  - frontend checks стабильно выполняются container-first через `hive-ops`.
+
+253. `P0` Runtime Regression Closure: Logs Routes + AppKey Migration
+- Status: `done`
+- Scope:
+  - устранить runtime regression в `/api/sessions/{session_id}/logs` и node logs после merge wave;
+  - вернуть backward-compatible route для graph-scoped node logs;
+  - убрать `aiohttp NotAppKeyWarning` (`app["manager"]`/`app["credential_store"]`) и перейти на `web.AppKey`.
+- Progress:
+  - `core/framework/server/routes_logs.py`:
+    - восстановлена корректная инициализация `log_store` (исправлен broken indentation);
+    - runtime lookup сделан совместимым: `colony_runtime` fallback на `graph_runtime`;
+    - добавлен backward-compatible route:
+      - `/api/sessions/{session_id}/graphs/{graph_id}/nodes/{node_id}/logs`;
+    - сохранён colony route:
+      - `/api/sessions/{session_id}/colonies/{colony_id}/nodes/{node_id}/logs`.
+  - `core/framework/server/app.py`:
+    - удалены string aliases `app["manager"]` и `app["credential_store"]`.
+  - оставшиеся string-callers переведены на `APP_KEY_*`:
+    - `core/framework/server/routes_queens.py`,
+    - `core/framework/server/routes_config.py`,
+    - `core/framework/server/routes_messages.py`,
+    - `core/framework/loader/cli.py`,
+    - `core/framework/server/tests/test_api.py`.
+- Validation (April 24, 2026):
+  - targeted regression:
+    - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_api.py -k "TestLogs or TestNodeLogs" -q` -> `8 passed`;
+  - full server + bridge regression:
+    - `./scripts/hive_ops_run.sh uv run --package framework pytest core/framework/server/tests/test_api.py core/framework/server/tests/test_telegram_bridge.py -q` -> `235 passed`;
+  - frontend contract:
+    - `./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm run test -- src/api/sessions.test.ts src/api/ops.test.ts && npm run build'`
+      -> `5 passed`, build success;
+  - runtime smoke after rebuild:
+    - `docker compose up -d --build` -> stack healthy;
+    - `GET /api/health` -> `status=ok`;
+    - `GET /api/credentials/specs` -> `200`, `specs_count=111`;
+    - `GET /api/llm/queue/status` -> `status=ok`;
+    - `GET /api/telegram/bridge/status` -> `status=ok`.
+- Done when:
+  - logs endpoints работают без 500;
+  - backward compatibility по node-logs route восстановлена;
+  - warning-free AppKey usage подтверждена тестами.
+
+254. `P1` Container-First Data Action UX Fallback (Web UI)
+- Status: `done`
+- Scope:
+  - устранить silent-fail/непонятное поведение кнопки `Data` в Docker/container-first runtime;
+  - сделать UX предсказуемым, когда launcher (`xdg-open`) недоступен:
+    - не терять действие пользователя;
+    - выдавать понятный fallback path.
+- Progress:
+  - frontend API contract расширен:
+    - `core/frontend/src/api/sessions.ts`:
+      `RevealSessionFolderResponse` (`opened`, `path`, `launcher`, `error`, `hint`);
+  - `colony-chat` header action `Data`:
+    - если `reveal` вернул `opened=false` (или network error) —
+      добавляется `System` run-divider notice с причиной/path;
+    - автоматически открывается fallback download:
+      `/api/sessions/{session_id}/export`;
+  - `ColonyHeader` action `Data`:
+    - синхронизирован на тот же fallback flow (`reveal -> export on unavailable launcher/error`).
+- Validation (April 24, 2026):
+  - frontend tests:
+    - `./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm run test -- src/api/sessions.test.ts src/api/ops.test.ts'`
+      -> `5 passed`;
+  - frontend build:
+    - `./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm run build'`
+      -> success.
+- Done when:
+  - `Data` кнопка не “молчит” и не ломает поток в контейнере;
+  - при недоступном launcher оператор всё равно получает артефакт (export zip) и понятный контекст.
+
+255. `P1` Data Action Parity: Queen DM Header
+- Status: `done`
+- Scope:
+  - добавить `Data` action в `queen-dm` (`/queen/{id}`), чтобы поведение было
+    консистентным с `colony-chat`;
+  - использовать тот же container-first fallback:
+    `reveal` -> при `opened=false/error` -> `export` zip.
+- Progress:
+  - `core/frontend/src/pages/queen-dm.tsx`:
+    - добавлен `Data` button в header actions рядом с `Clone Colony`;
+    - добавлен handler `handleRevealSessionFolder(...)`;
+    - при fallback добавляется системный notice в чат и автоматически открывается
+      `/api/sessions/{session_id}/export`.
+- Validation (April 24, 2026):
+  - `./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm run test -- src/api/sessions.test.ts src/api/ops.test.ts'`
+    -> `5 passed`;
+  - `./scripts/hive_ops_run.sh bash -lc 'cd core/frontend && npm run build'`
+    -> success;
+  - `docker compose up -d --build` -> updated UI baked into image.
+- Done when:
+ - на `queen-dm` есть кнопка `Data`;
+ - fallback поведение идентично `colony-chat`.
+
+## Execution Wave: Upstream Refresh (Wave 13, 53 commits behind)
+
+256. `P0` Upstream Delta Inventory Refresh (`HEAD..upstream/main`)
+- Status: `done`
+- Scope:
+  - зафиксировать актуальный срез upstream на момент April 24, 2026;
+  - подтвердить `merge-base`, `ahead/behind`, overlap hotspots;
+  - сформировать bounded execution queue для safe replay.
+- Progress:
+  - `git fetch upstream --prune` выполнен;
+  - drift:
+    - `ahead=8`, `behind=53` относительно `upstream/main`;
+    - `merge-base=a3433f2c9e20dc897132813563c9940a4b27112b`;
+  - пересечение изменений (`BASE..HEAD` vs `BASE..upstream/main`):
+    - `20` hotspot files;
+    - key overlap: `session_manager`, `routes_sessions`, `routes_execution`, `telegram_bridge`, `litellm`, `queen_orchestrator`, `colony-chat`, `queen-dm`.
+- Done when:
+  - актуальный baseline сохранён в `docs/ops/upstream-migration/baseline-2026-04-24.md`;
+  - execution queue `257..260` подтверждена.
+
+257. `P0` Bounded Overlap Replay (20 hotspot files)
+- Status: `done`
+- Scope:
+  - безопасно интегрировать upstream-дельту только по overlap-файлам;
+  - для каждого hotspot файла использовать file-slice merge + targeted tests;
+  - не трогать unclassified wave до прохождения regression gate.
+- Done when:
+  - overlap-файлы синхронизированы или явно deferred с reason;
+  - `test_api` + `test_telegram_bridge` + frontend build/test зелёные.
+- Progress:
+  - стартован Batch A (low-risk overlap replay):
+    - `tools/src/aden_tools/credentials/__init__.py` synced with upstream additions
+      (`PROMETHEUS_CREDENTIALS`, dedupe cleanup for `WANDB_CREDENTIALS`);
+    - `tools/src/aden_tools/tools/__init__.py` synced with upstream manifest pattern:
+      added `__aden_verified_manifest`, verified-tool tracking, unverified `prometheus` registration;
+    - added upstream modules:
+      - `tools/src/aden_tools/credentials/prometheus.py`;
+      - `tools/src/aden_tools/tools/prometheus_tool/{__init__.py,prometheus_tool.py}`;
+    - `core/frontend/src/api/execution.ts` synced with upstream colony-session APIs:
+      `markColonySpawned(...)` and `compactAndFork(...)`, while preserving local `client_message_id` support.
+  - выполнен Batch B (frontend replay hardening):
+    - `core/frontend/src/lib/chat-helpers.ts`:
+      - устранены коллизии `tool_use_id` между разными execution через ключ
+        `stream_id + execution_id + tool_use_id`;
+      - tool-status replay переведён на row-based storage (`toolRows`) для корректного upsert.
+    - `core/frontend/src/lib/chat-helpers.test.ts`:
+      - добавлен regression test на сценарий одинакового `tool_use_id`
+        в разных execution (`exec-a`/`exec-b`) с независимым completion.
+  - сформирована матрица остатка overlap с bounded next slices:
+    - `docs/ops/upstream-migration/overlap-remaining-2026-04-24.md`;
+    - Slice C execution results:
+      - applied: `core/framework/agents/queen/nodes/__init__.py`;
+      - deferred with reason:
+        - `core/tests/test_session_manager_worker_handoff.py` (missing local symbol
+          `install_worker_escalation_routing` in current `queen_orchestrator`);
+        - `core/frontend/src/components/ChatPanel.tsx` (TypeScript contract mismatch
+          against local `clientMessageId`/question widget flow).
+    - Slice D execution results (high-churn clean files):
+      - applied:
+        - `core/framework/server/routes_execution.py`;
+        - `core/framework/tools/queen_lifecycle_tools.py`;
+      - validation:
+        - `test_api -k "execution_template or autonomous"` -> `63 passed`;
+        - `test_telegram_bridge` -> `46 passed`.
+    - remaining deferred compatibility slice:
+      - `core/tests/test_session_manager_worker_handoff.py`;
+      - `core/frontend/src/components/ChatPanel.tsx`.
+
+258. `P1` Unclassified Delta Triage v2 (507 paths)
+- Status: `done`
+- Scope:
+  - переклассифицировать `other_unclassified` на buckets A/B/C по текущему код-бейзу;
+  - выделить destructive upstream moves (graph/runtime/runner reshapes) в отдельный deferred lane;
+  - оформить bounded merge-batches с явными dependency edges.
+- Done when:
+  - есть v2 triage map с приоритетами и безопасным merge order;
+  - high-risk destructive paths не попадают в mixed batch.
+- Progress:
+  - создана и обновляется матрица остатка overlap/compatibility:
+    - `docs/ops/upstream-migration/overlap-remaining-2026-04-24.md`;
+  - сформирован unclassified triage v2 с lane/batch моделью:
+    - `docs/ops/upstream-migration/unclassified-triage-v2-2026-04-24.md`;
+  - для входа в full unclassified triage зафиксированы результаты bounded replay:
+    - applied slices A/B/C(partial)/D;
+    - compatibility-deferred paths выделены отдельно.
+
+259. `P1` Safe Upstream Adoption Batch (Low/Medium)
+- Status: `done`
+- Scope:
+  - применить только low/medium upstream изменения, не ломающие local autonomous factory contract;
+  - подтвердить container-first parity (`hive-core` + `hive-ops`);
+  - зафиксировать evidence команд и результатов.
+- Done when:
+  - bounded batch слит без regressions;
+  - runtime/API/telegram/container gates pass.
+- Progress:
+  - подготовлен batch framework из triage v2:
+    - `259-A`: `docs/**` + `ai-proxy-docs/**` (safe docs lane);
+    - `259-B`: bounded `scripts/**` chunks + script tests;
+    - `259-C`: repo meta/workflows + container smoke;
+    - `259-D`: `tools/**` medium lane + tool integration tests.
+  - выполнен `259-A` (safe docs, non-destructive):
+    - applied:
+      - `docs/releases/v0.10.3.md`
+      - `docs/releases/v0.10.4.md`
+      - `docs/skill-registry-prd.md`
+    - deferred in same batch:
+      - destructive upstream docs deletions (`docs/autonomous-factory/**`,
+        `docs/ops/**`, `ai-proxy-docs/**`) to preserve local operational knowledge base.
+    - evidence:
+      - `docs/ops/upstream-migration/safe-adoption-batch-259a-2026-04-24.md`.
+  - выполнен `259-D` (tools medium lane, additive-only):
+    - applied:
+      - `tools/src/aden_tools/credentials/health_check.py` (added `PrometheusHealthChecker`, registry wiring);
+      - `tools/tests/test_health_checks.py` (expected checker set includes `prometheus`).
+    - validation:
+      - `uv run --package tools pytest tools/tests/test_health_checks.py -q` -> `40 passed`;
+      - `uv run --package tools pytest tools/tests/integrations/test_registration.py -q` -> `302 passed, 1 skipped`;
+      - `uv run --package tools pytest tools/tests/integrations/test_spec_conformance.py -q` -> `1394 passed, 2 skipped`;
+      - `uv run --package tools pytest tools/tests/tools/test_github_tool.py -q` -> `51 passed` (GitHub PR/comment flows preserved).
+  - `259-B/259-C` closed as explicit no-adopt lanes for this wave:
+    - upstream mostly deletes local `scripts/**` and `.github/**` operational assets;
+    - destructive patches were intentionally deferred to protect active local autonomous-factory contract.
+
+260. `P0` Full Regression Gate + Sign-off (Wave 13)
+- Status: `done`
+- Scope:
+  - выполнить полный post-merge gate после `257..259`:
+    - server tests (api/telegram/autonomous),
+    - frontend test/build container-first,
+    - acceptance/runtime parity.
+- Done when:
+  - wave `256..260` закрыта без `blocked` и с evidence;
+  - `Current Focus` обновлён на следующую bounded wave.
+- Progress:
+  - server regression gate:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py core/framework/server/tests/test_telegram_bridge.py -q`
+      -> `239 passed`;
+  - frontend regression gate:
+    - `npm run test -- src/lib/chat-helpers.test.ts src/api/sessions.test.ts src/api/ops.test.ts`
+      -> `44 passed`;
+    - `npm run build` -> success;
+  - runtime/container parity:
+    - `docker compose ps` -> `hive-core`, `hive-scheduler`, `postgres`, `redis` healthy/up;
+    - `curl http://localhost:8787/api/health` -> `status=ok`;
+    - `curl http://localhost:8787/api/llm/queue/status` -> `status=ok`.
+
+## Execution Wave: Deferred Destructive Lanes (Wave 14)
+
+261. `P0` Upstream Destructive Lane Guardrail Script
+- Status: `done`
+- Scope:
+  - добавить автоматический gate, который блокирует массовые destructive upstream deletes
+    по защищённым путям до явного allowlist-решения;
+  - покрыть unit tests для parser/main-path.
+- Done when:
+  - есть рабочий script + tests;
+  - script детектирует текущую deferred destructive delta на `HEAD..upstream/main`.
+- Progress:
+  - added:
+    - `scripts/check_upstream_destructive_lanes.py`;
+    - `scripts/tests/test_check_upstream_destructive_lanes.py`;
+  - validation:
+    - `uv run pytest scripts/tests/test_check_upstream_destructive_lanes.py -q` -> `5 passed`;
+    - `uv run python scripts/check_upstream_destructive_lanes.py --base-ref HEAD --upstream-ref upstream/main`
+      -> expected `fail` with protected destructive deletes (`flagged_total=263`).
+
+262. `P1` Deferred Delta Decision Matrix (`scripts/.github` + modified files)
+- Status: `done`
+- Scope:
+  - зафиксировать явные no-adopt решения по deferred destructive lanes;
+  - отдельно оценить 2 non-delete upstream modifications (`browser_remote_ui`, `check_llm_key`).
+- Done when:
+  - decision record оформлен с причинами и ссылкой на evidence.
+- Progress:
+  - record added:
+    - `docs/ops/upstream-migration/wave14-deferred-destructive-lanes-2026-04-24.md`;
+  - decisions:
+    - no-adopt `browser_remote_ui` upstream change (`browser_activate_tab`) due local tool mismatch (`browser_focus` still canonical);
+    - no-adopt `check_llm_key.py` upstream change due removal of local proxy checks (`gemini/anthropic/clove` custom path);
+    - keep `.github/workflows/**` and `scripts/**` destructive deletes deferred.
+
+263. `P1` Runbook Guardrail Wiring (Wave 14)
+- Status: `done`
+- Scope:
+  - встроить новый destructive-lane gate в операционный порядок перед upstream apply.
+- Done when:
+  - runbook содержит явный pre-apply command для guardrail.
+- Progress:
+  - added guardrail command to `docs/LOCAL_PROD_RUNBOOK.md` (Upstream Sync Guardrail section).
+  - wired guardrail into preflight automation:
+    - `scripts/upstream_sync_preflight.sh` now runs
+      `check_upstream_destructive_lanes.py` before bucket/decision checks.
+
+264. `P0` Selective Deferred-Lane Adoption Plan (allowlist + gates)
+- Status: `done`
+- Scope:
+  - подготовить bounded apply-plan для частичной миграции deferred lanes через explicit allowlist;
+  - не выполнять destructive apply без dry-run evidence и полного regression gate.
+- Done when:
+  - есть allowlist design + dry-run protocol + обязательный post-apply gate matrix.
+- Progress:
+  - стартован на базе:
+    - `docs/ops/upstream-migration/wave14-deferred-destructive-lanes-2026-04-24.md`;
+    - `scripts/check_upstream_destructive_lanes.py`.
+  - added bounded apply protocol + lane sequence:
+    - `docs/ops/upstream-migration/wave14-selective-adoption-plan-2026-04-24.md`;
+    - `docs/ops/upstream-migration/wave14-allowlist-probe-2026-04-24.json`;
+  - guardrail baseline captured:
+    - protected flagged deletes on `HEAD..upstream/main`: `263`
+      (`scripts=164`, `.github/workflows=3`, `docs/autonomous-factory=34`,
+      `docs/ops=57`, `ai-proxy-docs=5`).
+  - dry-run allowlist matrix captured:
+    - `strict` -> `flagged_total=263`;
+    - `archives_migration_only` -> `223`;
+    - `generated_ops_artifacts` -> `218`;
+    - destructive apply remains blocked (guardrail still failing).
+  - codified post-apply regression gate matrix:
+    - `scripts/upstream_sync_regression_gate.sh` now supports:
+      - `smoke` profile (acceptance self-check + runtime parity + backlog consistency);
+      - `full` profile (smoke + server API tests + Telegram bridge tests + frontend test/build).
+  - gate matrix contract test added:
+    - `scripts/tests/test_upstream_sync_regression_gate_script.py`.
+  - runbook wiring updated with explicit smoke/full commands:
+    - `docs/LOCAL_PROD_RUNBOOK.md`.
+
+265. `P1` Granular Deferred-Lane Review Table (`scripts/**` + `.github/workflows/**`)
+- Status: `done`
+- Scope:
+  - подготовить file-level decision table для remaining destructive lanes;
+  - выделить первый bounded sub-lane, который можно безопасно allowlist-apply;
+  - исключить автоматическое удаление без явного owner-decision по каждому file group.
+- Done when:
+  - есть таблица `path -> decision -> rationale -> replacement/migration`;
+  - выбран и зафиксирован первый bounded sub-lane для dry-run;
+  - backlog и migration docs синхронизированы с доказательствами.
+- Progress:
+  - baseline blocker distribution зафиксирован:
+    - `scripts/**=164`, `.github/workflows/**=3`, `docs/autonomous-factory/**=31`,
+      `docs/ops/**=15`, `ai-proxy-docs/**=5` (widest tested allowlist scenario).
+  - added granular lane review table:
+    - `docs/ops/upstream-migration/wave14-granular-lane-review-2026-04-24.md`;
+    - includes file-level decisions for `.github/workflows/**` and grouped decisions for `scripts/**`.
+  - completed round-1 per-file table for `scripts/(root misc)` (`16` files):
+    - `keep-local=16`;
+    - all previously pending rows resolved after source review
+      (`bootstrap_autonomous_factory.sh`, `setup_local_pro.sh`, `validate_factory_config.sh` -> `keep-local`).
+  - completed round-2 per-file provisional table for `scripts/upstream_*` (`32` files):
+    - `keep-local-provisional=32`;
+    - rationale and replacement/migration path recorded per file.
+  - completed round-3 per-file provisional table for `scripts/check_*` (`17` files):
+    - `keep-local-provisional=17`;
+    - guardrail/contract rationale recorded per file.
+  - completed round-4 per-file provisional table for `scripts/acceptance_*` (`11` files):
+    - `keep-local-provisional=11`;
+    - acceptance/reporting/weekly-ops rationale recorded per file.
+  - completed round-5 per-file provisional table for `scripts/autonomous_*` (`8` files):
+    - `keep-local-provisional=8`;
+    - autonomous loop/health/remediation rationale recorded per file.
+  - completed round-6 per-file provisional table for `scripts/backlog_*` (`5` files):
+    - `keep-local-provisional=5`;
+    - backlog status/artifact/archive rationale recorded per file.
+  - completed round-7 per-file provisional table for `scripts/google_*` (`5` files):
+    - `keep-local-provisional=5`;
+    - Google OAuth refresh/canary/smoke rationale recorded per file.
+  - completed round-8 per-file provisional table for `scripts/hive_*` (`4` files):
+    - `keep-local-provisional=4`;
+    - container-first wrapper rationale recorded per file.
+  - completed round-9 per-file provisional table for `scripts/verify_*` (`1` file):
+    - `keep-local-provisional=1`;
+    - access-stack validation rationale recorded.
+  - completed round-10 per-file provisional table for scheduler lane
+    `scripts/install_*|status_*|uninstall_*` (`27` files):
+    - `keep-local-provisional=27`;
+    - decisions split by subsystem (`acceptance`, `weekly`, `autonomous`,
+      `google-canary`, `google-refresh`).
+  - completed round-11 lane policy note for `scripts/tests/**`:
+    - lane-level `keep-local` decision with explicit replay-exclusion rule.
+  - исходная база и протокол готовы:
+    - `docs/ops/upstream-migration/wave14-selective-adoption-plan-2026-04-24.md`;
+    - `docs/ops/upstream-migration/wave14-allowlist-probe-2026-04-24.json`.
+
+266. `P1` Guarded Allowlist Probe Rerun + Wave Closure Artifact
+- Status: `done`
+- Scope:
+  - перезапустить allowlist probe с финализированными lane decisions для wave 14;
+  - обновить matrix artifact и зафиксировать closure-ready вывод;
+  - сохранить правило: destructive apply остаётся blocked без explicit owner allowlist.
+- Done when:
+  - новый probe artifact сохранён и привязан к wave14 docs;
+  - backlog + docs показывают единый closure-ready статус;
+  - `Current Focus` переведён на следующий bounded wave item.
+- Progress:
+  - prepared inputs:
+    - finalized decision tables for workflows + all `scripts/**` lanes;
+    - codified pre-apply guardrail (`check_upstream_destructive_lanes.py`);
+    - codified post-apply gate matrix (`upstream_sync_regression_gate.sh` smoke/full).
+  - rerun artifact generated:
+    - `docs/ops/upstream-migration/wave14-allowlist-probe-r2-2026-04-24.json`.
+  - rerun result (unchanged, expected):
+    - `strict=263`, `archives_migration_only=223`,
+      `generated_ops_artifacts=218` (`destructive apply remains blocked`).
+  - wave14 selective plan updated with rerun evidence and blocker distribution.
+
+267. `P1` Wave15 Non-Destructive Handoff Plan (`M/A/R`)
+- Status: `done`
+- Scope:
+  - зафиксировать старт wave15 для non-destructive delta (`M/A/R`);
+  - сформировать bounded sequence и первый изолированный batch-кандидат;
+  - сохранить наследованные guardrails из wave14.
+- Done when:
+  - есть inventory artifact + wave15 plan doc;
+  - выбран первый bounded batch-кандидат для следующего шага;
+  - `Current Focus` и backlog status согласованы.
+- Progress:
+  - generated inventory artifact:
+    - `docs/ops/upstream-migration/wave15-non-destructive-inventory-2026-04-24.json`
+      (`M=124`, `A=39`, `R100=3`, total `166`).
+  - added wave15 handoff plan:
+    - `docs/ops/upstream-migration/wave15-non-destructive-plan-2026-04-24.md`;
+  - first bounded candidate selected:
+    - `ND-1 docs lane`
+      (`docs/skill-registry-prd.md`, `docs/releases/v0.10.3.md`, `docs/releases/v0.10.4.md`).
+  - ND-1 probe artifacts generated:
+    - `docs/ops/upstream-migration/wave15-nd1-docs-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd1-docs.patch`.
+  - ND-1 compatibility probe:
+    - `git apply --check` failed with existing local file overlap
+      (`docs/releases/v0.10.3.md already exists`);
+    - next step: per-file reconcile flow (`ours vs upstream`) for ND-1.
+  - ND-1 reconcile artifact generated:
+    - `docs/ops/upstream-migration/wave15-nd1-docs-reconcile-2026-04-24.json`;
+  - ND-1 reconcile decision:
+    - all 3 ND-1 files already byte-equal to `upstream/main`;
+    - replay skipped, handoff moved to ND-2 examples/templates lane.
+
+268. `P1` ND-2 Examples/Templates Lane Triage
+- Status: `done`
+- Scope:
+  - разобрать `examples/templates/**` non-destructive upstream delta;
+  - отделить low-risk config updates (`mcp_servers.json` / `mcp_registry.json`)
+    от code-bearing template changes;
+  - выбрать следующий bounded replay candidate после ND-1 skip.
+- Done when:
+  - есть ND-2 inventory + grouping by risk/class;
+  - выбран первый bounded replay candidate внутри ND-2;
+  - backlog/docs синхронизированы и `Current Focus` указывает на следующий шаг.
+- Progress:
+  - ND-2 lane selected as immediate follow-up after ND-1 reconcile skip.
+  - generated ND-2 inventory artifact:
+    - `docs/ops/upstream-migration/wave15-nd2-examples-inventory-2026-04-24.json`
+      (`total=15`, `config=12`, `code-bearing=3`).
+  - added triage doc:
+    - `docs/ops/upstream-migration/wave15-nd2-examples-triage-2026-04-24.md`;
+  - selected first bounded replay candidate:
+    - `ND-2A-config-only` (`12` config files).
+  - ND-2A technical probe artifacts:
+    - `docs/ops/upstream-migration/wave15-nd2a-config-only.patch`;
+    - `docs/ops/upstream-migration/wave15-nd2a-config-probe-2026-04-24.json`.
+  - ND-2A readiness:
+    - `git apply --check` passed (`exit_code=0`);
+    - lane marked ready-for-replay (pending operator approval + full gate).
+
+269. `P1` ND-2A Config-Only Bounded Replay Plan
+- Status: `done`
+- Scope:
+  - зафиксировать пошаговый execution-plan для `ND-2A-config-only`;
+  - задать чёткий apply + regression gate + rollback protocol;
+  - подготовить run commands для операторского запуска.
+- Done when:
+  - есть execution plan doc для ND-2A;
+  - есть checklist apply/gate/rollback;
+  - `Current Focus` и backlog status синхронизированы.
+- Progress:
+  - ND-2A lane already technically validated by probe (`git apply --check` pass);
+  - added execution plan doc:
+    - `docs/ops/upstream-migration/wave15-nd2a-config-replay-plan-2026-04-24.md`;
+  - apply/gate/rollback checklist captured for operator execution.
+  - executed ND-2A patch replay:
+    - `git apply docs/ops/upstream-migration/wave15-nd2a-config-only.patch`;
+    - changed files in scope: `12/12` (`examples/templates/**` config files).
+  - full regression gate executed and passed:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+    - result: `ok=7 failed=0`.
+  - gate script fix applied for container-first pytest execution:
+    - `scripts/upstream_sync_regression_gate.sh` switched full-profile test steps to
+      `uv run --package framework pytest ...`;
+    - contract test updated:
+      `scripts/tests/test_upstream_sync_regression_gate_script.py`.
+  - execution evidence artifact:
+    - `docs/ops/upstream-migration/wave15-nd2a-execution-2026-04-24.json`.
+
+270. `P1` ND-2B Code-Bearing Templates Replay Plan
+- Status: `done`
+- Scope:
+  - обработать оставшиеся ND-2 code-bearing template files:
+    - `examples/templates/deep_research_agent/agent.py`;
+    - `examples/templates/deep_research_agent/nodes/__init__.py`;
+    - `examples/templates/meeting_scheduler/nodes/__init__.py`;
+  - подготовить bounded replay plan с compatibility/rollback протоколом;
+  - сохранить разделение ND-2A (config-only) и ND-2B (code-bearing) в evidence docs.
+- Done when:
+  - есть ND-2B probe artifact + replay plan doc;
+  - выбран безопасный execution path (apply/merge) для 3 файлов;
+  - backlog/docs синхронизированы и `Current Focus` обновлён.
+- Progress:
+  - ND-2B выделен как следующий активный sub-lane после успешного ND-2A replay.
+  - ND-2B probe and replay plan prepared:
+    - `docs/ops/upstream-migration/wave15-nd2b-code-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd2b-code-replay-plan-2026-04-24.md`.
+  - ND-2B patch replay executed:
+    - `git apply docs/ops/upstream-migration/wave15-nd2b-code-bearing.patch`.
+  - full regression gate executed and passed:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+    - result: `ok=7 failed=0`.
+  - execution evidence artifact:
+    - `docs/ops/upstream-migration/wave15-nd2b-execution-2026-04-24.json`.
+  - `Current Focus` moved to ND-3 tools lane triage.
+
+271. `P1` ND-3 Tools Lane Triage + ND-3A Replay Plan
+- Status: `done`
+- Scope:
+  - зафиксировать inventory/reconcile картину для `tools` non-destructive delta (`HEAD..upstream/main`);
+  - выделить bounded ND-3A sub-lane (prometheus observability) и подтвердить safe execution path;
+  - подготовить probe/evidence и execution/rollback protocol для ND-3A.
+- Done when:
+  - есть ND-3 inventory artifact + triage doc;
+  - есть ND-3A probe artifact + replay plan doc;
+  - `Current Focus` и backlog status синхронизированы.
+- Progress:
+  - добавлен ND-3 inventory artifact:
+    - `docs/ops/upstream-migration/wave15-nd3-tools-inventory-2026-04-24.json`;
+  - подтверждён ND-3 snapshot:
+    - `29` files (`M=22`, `A=5`, `D=2`);
+    - parity: `3` equal, `22` divergent, `2` upstream-added missing locally;
+  - добавлен lane triage doc:
+    - `docs/ops/upstream-migration/wave15-nd3-tools-triage-2026-04-24.md`;
+  - подготовлен ND-3A prometheus bounded patch + probe:
+    - `docs/ops/upstream-migration/wave15-nd3a-prometheus.patch`;
+    - `docs/ops/upstream-migration/wave15-nd3a-prometheus-probe-2026-04-24.json`;
+  - probe результат: `git apply --check` fail (`exit_code=1`), выбран reconcile-mode;
+  - добавлен reconcile execution plan:
+    - `docs/ops/upstream-migration/wave15-nd3a-prometheus-replay-plan-2026-04-24.md`.
+  - добавлен per-file reconcile artifact:
+    - `docs/ops/upstream-migration/wave15-nd3a-prometheus-reconcile-2026-04-24.json`.
+  - `Current Focus` moved from triage phase to execution phase (item `272`).
+
+272. `P1` ND-3A Prometheus Reconcile Execution
+- Status: `done`
+- Scope:
+  - выполнить reconcile-mode интеграцию ND-3A (`8` files) по plan doc;
+  - добавить upstream-missing файлы (`README`, `test_prometheus_tool.py`);
+  - сохранить локальные кастомизации в divergent файлах и добиться gate-green.
+- Done when:
+  - ND-3A reconcile применён в рабочем дереве без blind patch apply;
+  - проходят targeted tests по ND-3A scope;
+  - полный regression gate проходит (`ok=7 failed=0`);
+  - добавлен execution evidence artifact и backlog/docs синхронизированы.
+- Progress:
+  - execution plan + reconcile table готовы:
+    - `docs/ops/upstream-migration/wave15-nd3a-prometheus-replay-plan-2026-04-24.md`;
+    - `docs/ops/upstream-migration/wave15-nd3a-prometheus-reconcile-2026-04-24.json`.
+  - upstream-missing files added:
+    - `tools/src/aden_tools/tools/prometheus_tool/README.md`;
+    - `tools/tests/tools/test_prometheus_tool.py`.
+  - `prometheus.py` и `prometheus_tool.py` выровнены с upstream содержимым.
+  - targeted tests passed:
+    - `uv run --package tools pytest tools/tests/test_health_checks.py tools/tests/tools/test_prometheus_tool.py -q`
+    - result: `48 passed`.
+  - full regression gate passed:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+    - result: `ok=7 failed=0`.
+  - execution evidence artifact:
+    - `docs/ops/upstream-migration/wave15-nd3a-execution-2026-04-24.json`.
+  - `Current Focus` moved to ND-3B replay.
+
+273. `P1` ND-3B GCU/Browser Bounded Replay
+- Status: `done`
+- Scope:
+  - выполнить bounded replay под-лейна `ND-3B` (`tools/src/gcu/**` + browser comprehensive test);
+  - применить patch, прогнать targeted test и full gate;
+  - зафиксировать execution evidence и обновить wave15 docs.
+- Done when:
+  - ND-3B patch replay применён;
+  - проходит `tools/tests/test_browser_tools_comprehensive.py`;
+  - full regression gate green (`ok=7 failed=0`);
+  - добавлен ND-3B execution artifact и backlog/docs синхронизированы.
+- Progress:
+  - ND-3B probe artifact + replay plan готовы:
+    - `docs/ops/upstream-migration/wave15-nd3b-gcu.patch`;
+    - `docs/ops/upstream-migration/wave15-nd3b-gcu-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd3b-gcu-replay-plan-2026-04-24.md`.
+  - probe result: `git apply --check` pass (`exit_code=0`).
+  - ND-3B patch replay executed:
+    - `git apply docs/ops/upstream-migration/wave15-nd3b-gcu.patch`.
+  - targeted test passed:
+    - `uv run --package tools pytest tools/tests/test_browser_tools_comprehensive.py -q`
+    - result: `28 passed`.
+  - full regression gate passed:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+    - result: `ok=7 failed=0`.
+  - execution evidence artifact:
+    - `docs/ops/upstream-migration/wave15-nd3b-execution-2026-04-24.json`.
+  - `Current Focus` moved to ND-3C replay.
+
+274. `P1` ND-3C Productivity Providers Bounded Replay
+- Status: `done`
+- Scope:
+  - выполнить bounded replay ND-3C для provider-heavy tools (`calendar/github/gmail/google docs/sheets` + github tests);
+  - прогнать targeted provider tests и полный regression gate;
+  - зафиксировать execution evidence и обновить wave15 docs/backlog.
+- Done when:
+  - ND-3C patch replay применён;
+  - targeted provider test(s) green;
+  - full regression gate green (`ok=7 failed=0`);
+  - добавлен ND-3C execution artifact и backlog/docs синхронизированы.
+- Progress:
+  - ND-3C probe artifact + replay plan готовы:
+    - `docs/ops/upstream-migration/wave15-nd3c-productivity.patch`;
+    - `docs/ops/upstream-migration/wave15-nd3c-productivity-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd3c-productivity-replay-plan-2026-04-24.md`.
+  - probe result: `git apply --check` pass (`exit_code=0`).
+  - ND-3C patch replay executed:
+    - `git apply docs/ops/upstream-migration/wave15-nd3c-productivity.patch`.
+  - targeted provider test passed:
+    - `uv run --package tools pytest tools/tests/tools/test_github_tool.py -q`
+    - result: `38 passed`.
+  - full regression gate passed:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+    - result: `ok=7 failed=0`.
+  - execution evidence artifact:
+    - `docs/ops/upstream-migration/wave15-nd3c-execution-2026-04-24.json`.
+  - `Current Focus` moved to ND-3D runtime reconcile.
+
+275. `P1` ND-3D Runtime Packaging Reconcile
+- Status: `done`
+- Scope:
+  - выполнить reconcile-mode интеграцию runtime packaging под-лейна:
+    - `tools/Dockerfile`
+    - `tools/coder_tools_server.py`
+    - `tools/mcp_servers.json`
+    - `tools/tests/test_coder_tools_server.py`
+  - устранить patch mismatch в `coder_tools_server.py`;
+  - пройти targeted runtime tests и полный regression gate.
+- Done when:
+  - ND-3D reconcile применён без blind patch apply;
+  - `tools/tests/test_coder_tools_server.py` green;
+  - full regression gate green (`ok=7 failed=0`);
+  - добавлен ND-3D execution artifact и backlog/docs синхронизированы.
+- Progress:
+  - ND-3D patch + probe + replay plan подготовлены:
+    - `docs/ops/upstream-migration/wave15-nd3d-runtime.patch`;
+    - `docs/ops/upstream-migration/wave15-nd3d-runtime-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd3d-runtime-replay-plan-2026-04-24.md`.
+  - probe result: `git apply --check` fail (`exit_code=1`) из-за `coder_tools_server.py` hunk mismatch.
+  - добавлен ND-3D reconcile artifact:
+    - `docs/ops/upstream-migration/wave15-nd3d-runtime-reconcile-2026-04-24.json`
+    - текущая классификация: `divergent_hunk=4` (all scoped files).
+  - `coder_tools_server.py` reconciled with loader/runner MCP import compatibility and write-root safe path resolver.
+  - targeted runtime test passed:
+    - `uv run --package tools pytest tools/tests/test_coder_tools_server.py -q`
+    - result: `7 passed`.
+  - full regression gate passed:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+    - result: `ok=7 failed=0`.
+  - execution evidence artifact:
+    - `docs/ops/upstream-migration/wave15-nd3d-execution-2026-04-24.json`.
+  - ND-3E deletions lane executed:
+    - removed `tools/src/aden_tools/tools/google_auth.py`;
+    - removed `tools/tests/tools/test_google_auth.py`;
+    - reference check clean (`rg ...` no matches),
+    - full regression gate re-validated (`ok=7 failed=0`).
+  - ND-3E execution evidence artifact:
+    - `docs/ops/upstream-migration/wave15-nd3e-execution-2026-04-24.json`.
+  - `Current Focus` moved to ND-4 triage item `276`.
+
+276. `P1` ND-4 Core/Frontend+Framework Bounded Triage
+- Status: `done`
+- Scope:
+  - построить bounded triage для следующего non-destructive лейна в `core/frontend` и `core/framework`;
+  - выделить безопасный первый replay candidate с минимальным blast radius;
+  - зафиксировать replay plan + probe artifacts для execution wave.
+- Done when:
+  - создан ND-4 triage документ с lane split и приоритетом;
+  - создан bounded replay plan для первого ND-4 sub-lane;
+  - `git apply --check` probe проведен и классифицирован (replay vs reconcile);
+  - readiness подтверждена для следующего execution item.
+- Progress:
+  - ND-3 tools lane завершен до ND-3E с повторной полной gate-валидацией (`ok=7 failed=0`);
+  - baseline для перехода к ND-4 зафиксирован в wave15 docs;
+  - ND-4 inventory artifact:
+    - `docs/ops/upstream-migration/wave15-nd4-core-inventory-2026-04-24.json`;
+  - ND-4 triage doc:
+    - `docs/ops/upstream-migration/wave15-nd4-core-triage-2026-04-24.md`;
+  - first bounded candidate (`ND-4A`) prepared:
+    - `docs/ops/upstream-migration/wave15-nd4a-frontend-tools.patch`;
+    - `docs/ops/upstream-migration/wave15-nd4a-frontend-tools-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd4a-frontend-tools-replay-plan-2026-04-24.md`.
+  - ND-4A probe status: `git apply --check` pass (`exit_code=0`).
+  - `Current Focus` moved to ND-4A execution item `277`.
+
+277. `P1` ND-4A Frontend Tools Surface Bounded Replay
+- Status: `done`
+- Scope:
+  - выполнить bounded replay ND-4A по frontend tools surface patch;
+  - прогнать targeted frontend test/build и полный regression gate;
+  - зафиксировать execution artifact и синхронизировать wave15 docs/backlog.
+- Done when:
+  - ND-4A patch replay применён;
+  - `core/frontend` test/build green;
+  - full regression gate green (`ok=7 failed=0`);
+  - добавлен ND-4A execution artifact и `Current Focus` переведён на следующий lane item.
+- Progress:
+  - ND-4A patch replay applied.
+  - dependency follow-up reconcile applied for frontend API/types wiring:
+    - `core/frontend/src/api/queens.ts`
+    - `core/frontend/src/lib/colony-registry.ts`
+    - `core/frontend/src/context/ColonyContext.tsx`
+    - `core/frontend/src/api/agents.ts`
+    - `core/frontend/src/api/types.ts`
+    - `core/frontend/src/types/colony.ts`
+    - `core/frontend/src/pages/org-chart.tsx`
+  - targeted frontend checks passed:
+    - `cd core/frontend && npm test -- --run` -> `49 passed`;
+    - `cd core/frontend && npm run build` -> `ok`.
+  - full regression gate passed:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+    - result: `ok=7 failed=0`.
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd4a-frontend-tools-execution-2026-04-24.json`.
+  - `Current Focus` moved to item `278`.
+
+278. `P1` ND-4B Frontend Conversation/Runtime UX Bounded Replay
+- Status: `done`
+- Scope:
+  - выполнить bounded replay оставшегося frontend non-destructive conversation/runtime блока;
+  - зафиксировать patch+probe и прогнать frontend test/build + full regression gate;
+  - добавить execution artifact и синхронизировать wave15 docs/backlog.
+- Done when:
+  - ND-4B patch replay применён по согласованному bounded scope;
+  - `core/frontend` test/build green;
+  - full regression gate green (`ok=7 failed=0`);
+  - execution evidence добавлен, `Current Focus` moved to next lane.
+- Progress:
+  - ND-4A завершён и зафиксирован;
+  - ND-4B bounded patch prepared:
+    - `docs/ops/upstream-migration/wave15-nd4b-frontend-runtime.patch`;
+  - ND-4B probe artifact:
+    - `docs/ops/upstream-migration/wave15-nd4b-frontend-runtime-probe-2026-04-24.json`;
+  - probe result: `git apply --check` fail (`exit_code=1`) on:
+    - `core/frontend/src/api/execution.ts`
+    - `core/frontend/src/lib/chat-helpers.test.ts`
+    - `core/frontend/src/lib/chat-helpers.ts`
+    - `core/frontend/src/pages/queen-dm.tsx`
+  - reconcile-mode execution plan added:
+    - `docs/ops/upstream-migration/wave15-nd4b-frontend-runtime-replay-plan-2026-04-24.md`.
+  - ND-4B executed in reconcile mode:
+    - direct upstream sync (`6` files),
+    - clean three-way merge (`2` files),
+    - manual conflict resolution (`4` files).
+  - targeted frontend checks passed:
+    - `cd core/frontend && npm test -- --run` -> `53 passed`;
+    - `cd core/frontend && npm run build` -> `ok`.
+  - full regression gate passed:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+    - result: `ok=7 failed=0`.
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd4b-frontend-runtime-execution-2026-04-24.json`.
+  - `Current Focus` moved to item `279`.
+
+279. `P1` ND-4C Framework Skills + Queen/LLM Wiring Bounded Triage
+- Status: `done`
+- Scope:
+  - провести bounded triage non-destructive delta в `core/framework` для `skills/*`, selective `agents/*`, `llm/*`, `loader/*`, `host/*`;
+  - выделить первый replay candidate с минимальным blast radius;
+  - подготовить patch+probe+replay plan для execution phase.
+- Done when:
+  - создан ND-4C triage artifact с lane split и приоритетом;
+  - подготовлен первый ND-4C bounded candidate patch;
+  - probe (`git apply --check`) выполнен и классифицирован (replay/reconcile);
+  - readiness зафиксирована для следующего execution item.
+- Progress:
+  - ND-4B successfully completed with full gate green.
+  - ND-4C triage artifacts created:
+    - `docs/ops/upstream-migration/wave15-nd4c-framework-triage-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd4c-framework-triage-2026-04-24.md`.
+  - first bounded candidate selected (`ND-4C1` framework skills surface, `10` files):
+    - `docs/ops/upstream-migration/wave15-nd4c1-framework-skills.patch`;
+    - `docs/ops/upstream-migration/wave15-nd4c1-framework-skills-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd4c1-framework-skills-replay-plan-2026-04-24.md`.
+  - probe status: `git apply --check` pass (`exit_code=0`).
+  - ND-4C1 execution completed:
+    - patch applied;
+    - targeted skills suite passed (`256 passed`);
+    - full regression gate passed (`ok=7 failed=0`).
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd4c1-framework-skills-execution-2026-04-24.json`.
+  - `Current Focus` moved to item `280`.
+
+280. `P1` ND-4C2 Queen/LLM/Loader/Host Bounded Replay Planning
+- Status: `done`
+- Scope:
+  - выделить следующий bounded candidate в `core/framework` после ND-4C1,
+    фокус: `agents/queen`, `llm`, `loader`, `host`;
+  - подготовить patch+probe+replay plan для execution без destructive lanes;
+  - зафиксировать классификацию рисков и readiness.
+- Done when:
+  - сформирован ND-4C2 bounded scope с явным списком файлов;
+  - patch/probe artifacts созданы и `git apply --check` результат классифицирован;
+  - replay plan зафиксирован для следующего execution шага.
+- Progress:
+  - ND-4C1 execution завершен;
+  - ND-4C2 bounded candidate selected (`loader + host`, `8` files).
+  - patch artifact:
+    - `docs/ops/upstream-migration/wave15-nd4c2-loader-host.patch`;
+  - probe artifact:
+    - `docs/ops/upstream-migration/wave15-nd4c2-loader-host-probe-2026-04-24.json`;
+  - replay plan:
+    - `docs/ops/upstream-migration/wave15-nd4c2-loader-host-replay-plan-2026-04-24.md`;
+  - probe status: `git apply --check` pass (`exit_code=0`).
+  - ND-4C2 execution completed:
+    - bounded patch applied;
+    - targeted framework/runtime suite passed (`415 passed, 9 skipped`);
+    - full regression gate passed (`ok=7 failed=0`).
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd4c2-loader-host-execution-2026-04-24.json`.
+  - `Current Focus` moved to item `281`.
+
+281. `P1` ND-4C3 Queen/LLM Bounded Replay Planning
+- Status: `done`
+- Scope:
+  - выделить следующий bounded candidate после ND-4C2 в `core/framework/agents/queen` + `core/framework/llm`;
+  - подготовить patch+probe+replay plan без destructive lanes;
+  - зафиксировать риск-классификацию и readiness для execution.
+- Done when:
+  - сформирован ND-4C3 bounded scope c явным списком файлов;
+  - patch/probe artifacts созданы и `git apply --check` классифицирован;
+  - replay plan зафиксирован для execution шага.
+- Progress:
+  - ND-4C2 execution завершён с зелёным full gate;
+  - сформирован bounded scope ND-4C3 (`queen + llm`, `15` files);
+  - artifacts:
+    - `docs/ops/upstream-migration/wave15-nd4c3-queen-llm.patch`;
+    - `docs/ops/upstream-migration/wave15-nd4c3-queen-llm-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd4c3-queen-llm-replay-plan-2026-04-24.md`;
+  - probe status: `git apply --check` failed on
+    `core/framework/agents/queen/nodes/__init__.py` and
+    `core/framework/llm/litellm.py`, classified as `reconcile-required`;
+  - `Current Focus` moved to item `282`.
+
+282. `P1` ND-4C3 Queen/LLM Bounded Replay Execution
+- Status: `done`
+- Scope:
+  - выполнить reconcile execution для ND-4C3 bounded scope (`queen + llm`);
+  - сохранить локальные runtime/proxy guardrails в конфликтующих файлах;
+  - прогнать targeted tests + full regression gate и зафиксировать execution evidence.
+- Done when:
+  - ND-4C3 scope применён (replay/reconcile) без destructive lanes;
+  - targeted checks и full gate green (`ok=7 failed=0`);
+  - execution artifact добавлен, `Current Focus` moved to next lane.
+- Progress:
+  - replay plan готов, scope и конфликтные файлы классифицированы;
+  - execution completed in reconcile mode:
+    - upstream changes applied for `13/15` scoped files;
+    - `2` conflict files kept as deferred reconcile lane:
+      - `core/framework/agents/queen/nodes/__init__.py`
+      - `core/framework/llm/litellm.py`;
+  - targeted checks passed: `145 passed, 9 skipped`;
+  - full regression gate passed: `ok=7 failed=0`;
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd4c3-queen-llm-execution-2026-04-24.json`;
+  - `Current Focus` moved to item `283`.
+
+283. `P1` ND-4C4 Reconcile Blocked Queen/LLM Files
+- Status: `done`
+- Scope:
+  - вручную reconcile двух блокирующих файлов ND-4C3:
+    - `core/framework/agents/queen/nodes/__init__.py`
+    - `core/framework/llm/litellm.py`;
+  - сохранить локальные proxy/runtime guardrails и принять совместимые upstream улучшения;
+  - зафиксировать reconcile evidence и прогнать targeted + full gate.
+- Done when:
+  - оба conflict-файла переведены в согласованное состояние (merge/reconcile);
+  - targeted tests и full regression gate green;
+  - execution artifact добавлен и `Current Focus` moved to next lane.
+- Progress:
+  - ND-4C3 replay executed and validated;
+  - `core/framework/agents/queen/nodes/__init__.py` reconciled via upstream direct sync;
+  - targeted ND-4C4 checks green: `145 passed, 9 skipped`;
+  - full regression gate green: `ok=7 failed=0`;
+  - reconcile evidence:
+    - `docs/ops/upstream-migration/wave15-nd4c4-reconcile-progress-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd4c4-reconcile-execution-2026-04-24.json`;
+  - litellm reconcile playbook:
+    - `docs/ops/upstream-migration/wave15-nd4c4-litellm-reconcile-plan-2026-04-24.md`;
+  - `core/framework/llm/litellm.py` reconciled in manual mode:
+    - local proxy/runtime queue/failover contracts preserved as intentional local divergence;
+    - duplicate `json_object` hint branch removed.
+  - `Current Focus` moved to item `284`.
+
+284. `P1` Post-ND4 Residual Inventory Refresh and Next Candidate
+- Status: `done`
+- Scope:
+  - переснять residual non-destructive inventory после ND-4C4;
+  - определить следующий bounded candidate без destructive lanes;
+  - подготовить patch/probe/replay-plan артефакты для следующего execution item.
+- Done when:
+  - residual inventory snapshot зафиксирован;
+  - выбран следующий bounded lane с явным scope;
+  - backlog/docs переключены на execution item.
+- Progress:
+  - ND-4C4 successfully closed with green targeted tests and full gate;
+  - residual snapshot created:
+    - `docs/ops/upstream-migration/wave15-post-nd4-residual-inventory-2026-04-24.json`;
+  - next bounded candidate selected:
+    - `ND-5A` orchestrator micro-lane (`4` files);
+  - prepared artifacts:
+    - `docs/ops/upstream-migration/wave15-nd5a-orchestrator.patch`;
+    - `docs/ops/upstream-migration/wave15-nd5a-orchestrator-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd5a-orchestrator-replay-plan-2026-04-24.md`;
+  - probe status: `git apply --check` pass (`exit_code=0`);
+  - `Current Focus` moved to item `285`.
+
+285. `P1` ND-5A Orchestrator Micro-Lane Execution
+- Status: `done`
+- Scope:
+  - выполнить bounded replay `core/framework/orchestrator/*` (4 файла);
+  - прогнать targeted orchestrator tests + full regression gate;
+  - зафиксировать execution evidence и обновить migration/backlog docs.
+- Done when:
+  - ND-5A patch применён/согласован по scope;
+  - targeted checks и full gate green;
+  - execution artifact добавлен и `Current Focus` moved to next lane.
+- Progress:
+  - ND-5A patch replayed:
+    - `git apply docs/ops/upstream-migration/wave15-nd5a-orchestrator.patch`;
+  - reconcile fix added for compatibility:
+    - `core/framework/host/event_bus.py` restored backward-compatible `prompt/options` path for `emit_client_input_requested`;
+  - targeted checks green:
+    - `uv run pytest core/tests/test_event_loop_node.py core/tests/test_safe_eval.py core/tests/test_node_conversation.py -q`
+      -> `285 passed, 4 skipped`;
+  - full regression gate green:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd5a-orchestrator-execution-2026-04-24.json`;
+  - `Current Focus` moved to item `286`.
+
+286. `P1` ND-5B Server Mini-Lane Reconcile Planning
+- Status: `done`
+- Scope:
+  - подготовить bounded ND-5B lane для server delta (`README + routes_events`);
+  - зафиксировать probe status и reconcile-plan до apply;
+  - держать full gate baseline green перед execution.
+- Done when:
+  - ND-5B patch/probe/replay-plan artifacts созданы и согласованы;
+  - backlog/docs указывают на execution-ready next step.
+- Progress:
+  - ND-5A closed with green targeted and full gates;
+  - ND-5A post-residual snapshot created:
+    - `docs/ops/upstream-migration/wave15-post-nd5a-residual-inventory-2026-04-24.json`;
+  - prepared ND-5B artifacts:
+    - `docs/ops/upstream-migration/wave15-nd5b-server-mini.patch`;
+    - `docs/ops/upstream-migration/wave15-nd5b-server-mini-probe-2026-04-24.json`;
+    - `docs/ops/upstream-migration/wave15-nd5b-server-mini-replay-plan-2026-04-24.md`;
+  - probe result:
+    - `git apply --check` -> `reconcile_required` (manual reconcile needed for both scoped files).
+  - reconcile analysis captured:
+    - `docs/ops/upstream-migration/wave15-nd5b-server-mini-reconcile-analysis-2026-04-24.md`
+      (current decision: keep local AppKey docs + retain `TRIGGER_FIRED` stream contract).
+  - targeted server baseline checks:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "events or health" -q`
+      -> `8 passed, 185 deselected`;
+  - full regression gate baseline:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - progress evidence:
+    - `docs/ops/upstream-migration/wave15-nd5b-server-mini-progress-2026-04-24.json`.
+  - execution completed:
+    - `core/framework/server/routes_events.py` reconciled with upstream replay behavior (`TRIGGER_FIRED` added back into `_REPLAY_TYPES`);
+    - execution evidence:
+      - `docs/ops/upstream-migration/wave15-nd5b-server-mini-execution-2026-04-25.json`;
+  - `Current Focus` moved to item `287`.
+
+287. `P1` ND-5C Agent-Loop Prompting Micro-Lane Execution
+- Status: `done`
+- Scope:
+  - reconcile `core/framework/agent_loop/prompting.py` with upstream dynamic skills catalog provider path;
+  - validate agent-loop stability via targeted tests + full regression gate;
+  - capture execution evidence and update migration docs.
+- Done when:
+  - prompting lane replay applied and behavior documented;
+  - targeted checks and full gate are green;
+  - execution artifact added and `Current Focus` moved to next lane.
+- Progress:
+  - lane artifacts prepared:
+    - `docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting.patch`;
+  - replay applied:
+    - restored `dynamic_skills_catalog_provider` fallback path in `build_prompt_spec(...)`;
+  - targeted validation:
+    - `uv run pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q`
+      -> `163 passed, 4 skipped`;
+  - full gate validation:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting-probe-2026-04-25.json`;
+    - `docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting-replay-plan-2026-04-25.md`;
+    - `docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting-execution-2026-04-25.json`;
+  - `Current Focus` moved to item `288`.
+
+288. `P1` ND-5D Event-Publishing Micro-Lane Planning
+- Status: `done`
+- Scope:
+  - подготовить bounded replay для `core/framework/agent_loop/internals/event_publishing.py`;
+  - зафиксировать probe и replay-plan;
+  - удержать full gate baseline green до execution.
+- Done when:
+  - ND-5D patch/probe/replay-plan artifacts созданы;
+  - backlog/docs переключены на execution-ready ND-5D lane.
+- Progress:
+  - prepared artifacts:
+    - `docs/ops/upstream-migration/wave15-nd5d-event-publishing.patch`;
+    - `docs/ops/upstream-migration/wave15-nd5d-event-publishing-probe-2026-04-25.json`;
+    - `docs/ops/upstream-migration/wave15-nd5d-event-publishing-replay-plan-2026-04-25.md`;
+  - probe result:
+    - `git apply --check` -> `replay_ready`;
+  - replay applied:
+    - restored `cache_creation_tokens` and `cost_usd` fields in
+      `core/framework/agent_loop/internals/event_publishing.py`;
+  - targeted validation:
+    - `uv run pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q`
+      -> `163 passed, 4 skipped`;
+  - full gate validation:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd5d-event-publishing-execution-2026-04-25.json`;
+  - `Current Focus` moved to item `289`.
+
+289. `P1` ND-5E Agent-Loop Types Micro-Lane Execution
+- Status: `done`
+- Scope:
+  - reconcile upstream deltas for:
+    - `core/framework/agent_loop/types.py`
+    - `core/framework/agent_loop/internals/types.py`;
+  - validate agent-loop stability with targeted + full gate;
+  - capture execution evidence and keep migration docs in sync.
+- Done when:
+  - ND-5E replay applied or explicitly reconciled;
+  - targeted checks and full gate are green;
+  - execution evidence added and next lane prepared.
+- Progress:
+  - prepared artifacts:
+    - `docs/ops/upstream-migration/wave15-nd5e-agentloop-types.patch`;
+    - `docs/ops/upstream-migration/wave15-nd5e-agentloop-types-probe-2026-04-25.json`;
+    - `docs/ops/upstream-migration/wave15-nd5e-agentloop-types-replay-plan-2026-04-25.md`;
+  - probe result:
+    - `git apply --check` -> `replay_ready`;
+  - replay applied:
+    - `core/framework/agent_loop/types.py`;
+    - `core/framework/agent_loop/internals/types.py`;
+  - targeted validation:
+    - `uv run pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q`
+      -> `163 passed, 4 skipped`;
+  - full gate validation:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd5e-agentloop-types-execution-2026-04-25.json`;
+  - `Current Focus` moved to item `290`.
+
+290. `P1` ND-5F Agents Discovery Micro-Lane Execution
+- Status: `done`
+- Scope:
+  - reconcile upstream delta for `core/framework/agents/discovery.py`;
+  - validate `/api/agents`-related contract stability with targeted + full gate;
+  - capture execution evidence and prepare next bounded lane.
+- Done when:
+  - ND-5F replay applied or explicitly reconciled;
+  - targeted checks and full gate are green;
+  - execution evidence added and next lane prepared.
+- Progress:
+  - prepared artifacts:
+    - `docs/ops/upstream-migration/wave15-nd5f-agents-discovery.patch`;
+    - `docs/ops/upstream-migration/wave15-nd5f-agents-discovery-probe-2026-04-25.json`;
+    - `docs/ops/upstream-migration/wave15-nd5f-agents-discovery-replay-plan-2026-04-25.md`;
+  - probe result:
+    - `git apply --check` -> `replay_ready`;
+  - replay applied:
+    - `core/framework/agents/discovery.py`;
+  - targeted validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "org or colony or queen" -q`
+      -> `9 passed, 184 deselected`;
+  - full gate validation:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - execution evidence:
+    - `docs/ops/upstream-migration/wave15-nd5f-agents-discovery-execution-2026-04-25.json`;
+  - lane close checks:
+    - `git diff --name-only upstream/main -- core/framework/agents/discovery.py` -> empty (byte-equal);
+  - `Current Focus` moved to item `291`.
+
+291. `P1` Wave15 Post-ND5F Residual Snapshot + Triage
+- Status: `done`
+- Scope:
+  - переснять residual non-destructive inventory после закрытия ND-5F;
+  - обновить triage-решения по keep-local divergence vs replay candidates;
+  - зафиксировать handoff к следующему bounded wave.
+- Done when:
+  - residual inventory artifact создан и задокументирован;
+  - triage doc фиксирует решения и next-lane selection;
+  - backlog/docs синхронизированы.
+- Progress:
+  - residual inventory artifact:
+    - `docs/ops/upstream-migration/wave15-post-nd5f-residual-inventory-2026-04-25.json`;
+  - residual triage artifact:
+    - `docs/ops/upstream-migration/wave15-post-nd5f-residual-triage-2026-04-25.md`;
+  - migration master doc updated:
+    - `docs/ops/upstream-migration/wave15-non-destructive-plan-2026-04-24.md` (ND-5F execution closed, Wave16-R1 handoff added);
+  - baseline gate remains green from latest ND-5F execution:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - `Current Focus` moved to item `292`.
+
+292. `P1` Wave16-R1 Residual Governance Lane Planning
+- Status: `done`
+- Scope:
+  - сформировать явный allowlist для intentional keep-local divergences в `core/framework`;
+  - выделить первый bounded replay candidate вне allowlist (минимальный риск);
+  - подготовить execution-ready lane artifacts (probe + replay-plan + validation matrix).
+- Done when:
+  - allowlist решений зафиксирован в migration docs;
+  - выбран и обоснован один bounded replay candidate;
+  - есть артефакты для следующего execution шага.
+- Progress:
+  - стартовая база взята из:
+    - `docs/ops/upstream-migration/wave15-post-nd5f-residual-triage-2026-04-25.md`;
+  - governance-plan draft:
+    - `docs/ops/upstream-migration/wave16-r1-residual-governance-plan-2026-04-25.md`;
+  - allowlist решений formalized:
+    - explicit keep-local set for AppKey/runtime-routing/MCP-name compatibility paths in `core/framework`;
+  - candidate selection + execution (`Wave16-R2`):
+    - `core/framework/server/README.md` evaluated as reconcile-only candidate;
+    - execution artifact:
+      - `docs/ops/upstream-migration/wave16-r2-server-readme-reconcile-execution-2026-04-25.json`;
+    - decision: `keep_local` (upstream README line still references legacy `request.app["manager"]`, local README aligned to `APP_KEY_MANAGER`);
+  - gate baseline revalidated:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - `Current Focus` moved to item `293`.
+
+293. `P1` Wave16-R3 Server/Orchestrator Test-Contract Bounded Lane Planning
+- Status: `done`
+- Scope:
+  - triage residual test-surface delta for `core/framework/server/tests/test_queen_orchestrator.py`;
+  - classify upstream-vs-local test contract differences (legacy queen identity vs project-workspace/mcp-tools behavior);
+  - prepare bounded reconcile plan with explicit validation commands.
+- Done when:
+  - reconcile decision documented (replay/merge/keep-local with reasons);
+  - execution-ready artifact set prepared for R3 lane;
+  - backlog/docs synchronized with next concrete execution step.
+- Progress:
+  - baseline diff inspected:
+    - `git diff upstream/main -- core/framework/server/tests/test_queen_orchestrator.py`;
+  - triage artifact:
+    - `docs/ops/upstream-migration/wave16-r3-server-orchestrator-test-contract-triage-2026-04-25.md`;
+  - targeted local contract check:
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q`
+      -> `3 passed`;
+  - runtime probe finding:
+    - `create_queen(...)` direct probe fails with import-contract error
+      (`ImportError: cannot import name '_QUEEN_BUILDING_TOOLS' from framework.agents.queen.nodes`);
+  - decision:
+    - `reconcile_only` for upstream test replay (legacy signature not compatible with current API);
+  - `Current Focus` moved to item `294`.
+
+294. `P1` Wave16-R4 Queen Orchestrator Import-Contract Reconcile Planning
+- Status: `done`
+- Scope:
+  - map and reconcile import contract between `core/framework/server/queen_orchestrator.py` and `core/framework/agents/queen/nodes/__init__.py`;
+  - prepare bounded execution plan to make `create_queen(...)` probe-initialization testable again;
+  - define minimal regression tests for current (non-legacy) queen bootstrap path.
+- Done when:
+  - reconcile strategy documented with explicit file scope and risks;
+  - execution-ready artifact set prepared for R4;
+  - backlog/docs synchronized with next concrete execution commands.
+- Progress:
+  - blocker captured in R3 triage artifact:
+    - `docs/ops/upstream-migration/wave16-r3-server-orchestrator-test-contract-triage-2026-04-25.md`;
+  - import-contract map captured:
+    - `docs/ops/upstream-migration/wave16-r4-queen-import-contract-map-2026-04-25.json`;
+    - summary: `required_symbols=29`, `missing_symbols=25` between `queen_orchestrator` import list and `queen.nodes` exports;
+  - reconcile progress artifact:
+    - `docs/ops/upstream-migration/wave16-r4-queen-import-contract-reconcile-progress-2026-04-25.json`;
+  - applied compatibility shim:
+    - `core/framework/server/queen_orchestrator.py` now resolves legacy/new node symbols via fallback mapper (avoids strict import crash on missing `_QUEEN_*` exports);
+    - `core/framework/server/queen_orchestrator.py` reflection subscription call updated to current API (`global_memory_dir`, `queen_memory_dir`, `queen_id`);
+  - targeted local baseline:
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q`
+      -> `3 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py core/framework/server/tests/test_api.py -k "queen" -q`
+      -> `12 passed, 184 deselected`;
+  - full gate revalidated after reconcile:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - runtime probe update:
+    - previous ImportError on `_QUEEN_BUILDING_TOOLS` resolved;
+    - reflection signature blocker resolved (queen loop can initialize/cancel in probe harness);
+    - residual observation for next lane: prompt content currently lacks explicit queen identity markers (`<core_identity>`, `Head of Technology`).
+  - `Current Focus` moved to item `295`.
+
+295. `P1` Wave16-R5 Queen Identity/Prompt Contract Validation Planning
+- Status: `done`
+- Scope:
+  - verify current queen bootstrap prompt contract vs expected persona identity behavior;
+  - determine whether identity composition regression exists in runtime prompt assembly;
+  - prepare bounded fix plan + regression test strategy for identity contract.
+- Done when:
+  - contract findings documented with reproducible probe output;
+  - reconcile strategy defined (code path + test coverage additions);
+  - execution-ready artifact set prepared for R5 implementation.
+- Progress:
+  - initial runtime probe observation captured:
+    - prompt does not include `<core_identity>` and does not include `Head of Technology` string under current harness;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r5-queen-identity-contract-execution-2026-04-25.json`;
+  - applied fix:
+    - added `_hydrate_queen_identity_prompt(...)` in `core/framework/server/queen_orchestrator.py`;
+    - invoked identity hydration during queen bootstrap (`phase_state.queen_profile` + `phase_state.queen_identity_prompt`);
+  - test coverage added:
+    - `core/framework/server/tests/test_queen_orchestrator.py` now includes identity-hydration tests (`5 passed`);
+  - targeted validations:
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q`
+      -> `5 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "queen" -q`
+      -> `9 passed, 184 deselected`;
+  - runtime probe result:
+    - `create_queen` prompt now contains `<core_identity>` and `Head of Technology`;
+  - full gate revalidated:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh`
+      -> `ok=7 failed=0`;
+  - `Current Focus` moved to item `296`.
+
+296. `P1` Wave16-R6 Runtime Warning/Noise Hardening Planning
+- Status: `done`
+- Scope:
+  - triage repeated runtime warnings observed in probe harness:
+    - skill collision warnings (`_preset_skills` vs `_default_skills`);
+    - async cleanup timeout warnings during ad-hoc probe shutdown;
+  - classify operator-impacting vs test-harness-only noise;
+  - define bounded remediation plan with risk controls.
+- Done when:
+  - warning inventory documented with root-cause classification;
+  - one bounded remediation candidate selected for execution;
+  - backlog/docs synchronized for next implementation lane.
+- Progress:
+  - warnings captured in R4/R5 probe outputs and artifacts;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r6-runtime-warning-noise-hardening-execution-2026-04-25.json`;
+  - applied remediations:
+    - `core/framework/skills/discovery.py`: expected bundled framework↔preset collisions are treated as deterministic overrides (no operator warning spam);
+    - `core/framework/host/agent_host.py` + `core/framework/host/colony_runtime.py`: cancellation timeout path downgraded to debug, real failures keep warning+trace;
+    - `core/framework/host/execution_manager.py`: stop-time grace timeout switched from warning to informational shutdown signal;
+  - coverage:
+    - `core/tests/test_skill_discovery.py` expanded with collision-behavior checks (expected bundled suppression + non-bundled warning retention);
+  - validation:
+    - `uv run --package framework pytest core/tests/test_skill_discovery.py -q` -> `10 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+  - `Current Focus` moved to item `297`.
+
+297. `P1` Wave16-R7 Gate Stability Soak Verification
+- Status: `done`
+- Scope:
+  - stabilize full-gate execution after R6 by removing suite-order-dependent API test behavior;
+  - verify repeatability of `upstream_sync_regression_gate` under full profile;
+  - capture final execution artifact and pass/fail evidence.
+- Done when:
+  - autonomous ops-status flaky assertions are deterministic in full test-suite context;
+  - full gate passes at least once end-to-end after fixes;
+  - backlog/docs synchronized with next residual lane.
+- Progress:
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r7-autonomous-ops-status-flake-stabilization-execution-2026-04-25.json`;
+  - stabilized tests in `core/framework/server/tests/test_api.py`:
+    - stale/no-progress checks no longer rely on auto-start runtime side-effects;
+    - assertions use `project_id`-filtered ops-status response to avoid top-N truncation interference;
+  - targeted validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "autonomous_ops_status_includes_release_matrix_snapshot or autonomous_ops_status_reports_stuck_runs or autonomous_ops_status_reports_no_progress_projects" -q` -> `3 passed`;
+  - full gate validation (pass #1):
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh` -> `ok=7 failed=0`;
+  - full gate validation (pass #2 soak):
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh` -> `ok=7 failed=0`;
+  - stability note:
+    - server API suite now stable in full-run context (`193 passed`) after deterministic stale/no-progress test setup;
+  - `Current Focus` moved to item `298`.
+
+298. `P1` Wave16-R8 Post-Soak Residual Lane Selection
+- Status: `done`
+- Scope:
+  - recalculate residual overlap vs upstream after completed R6/R7 hardening;
+  - pick the next bounded non-destructive reconcile lane with explicit keep-local guards;
+  - prepare execution-ready artifact set (probe + replay-plan + validation matrix).
+- Done when:
+  - residual shortlist updated with one selected next lane;
+  - lane plan documented in upstream-migration docs;
+  - backlog/docs synchronized with concrete next execution commands.
+- Progress:
+  - precondition satisfied:
+    - gate soak stable (`ok=7 failed=0` twice) after R7 stabilization;
+  - lane-selection artifact:
+    - `docs/ops/upstream-migration/wave16-r8-residual-lane-selection-plan-2026-04-25.md`;
+  - selected next bounded lane:
+    - `R8A` = `core/framework/loader/mcp_client.py` (smallest non-trivial delta, low blast radius, runtime-noise-aligned);
+  - R8A execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8a-mcp-client-execution-2026-04-25.json`;
+  - validation:
+    - `uv run --package framework pytest core/tests/test_mcp_client.py -q` -> `7 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "mcp or credentials or health" -q` -> `17 passed, 176 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -q` -> `46 passed`;
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh` -> `ok=7 failed=0`;
+  - outcome:
+    - R8A completed as `keep_local` reconcile (no extra code patch required; local anyio-teardown quirk handling retained intentionally);
+  - `Current Focus` moved to item `299`.
+
+299. `P1` Wave16-R8B Residual Micro-Lane Continuation
+- Status: `done`
+- Scope:
+  - execute next low-blast-radius residual lane after R8A;
+  - prioritize loader/server micro-diff paths (`mcp_registry`, `routes_config`, `routes_logs`) with strict keep-local guards;
+  - produce execution artifact and validation evidence.
+- Done when:
+  - one R8B lane is executed (replay/reconcile/keep-local) with explicit decision;
+  - targeted validations pass and full gate remains green;
+  - backlog/docs synchronized with next residual lane.
+- Progress:
+  - precondition:
+    - R8A completed with full gate green (`ok=7 failed=0`);
+  - selected lane:
+    - `core/framework/server/routes_config.py`;
+  - reconcile decision:
+    - `keep_local` to preserve typed `aiohttp.AppKey` access for `manager` and `credential_store` (`APP_KEY_MANAGER`, `APP_KEY_CREDENTIAL_STORE`) and avoid string-key warning drift;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8b-routes-config-execution-2026-04-25.json`;
+  - validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "credentials or provider or model or config" -q` -> `13 passed, 180 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh` -> `ok=7 failed=0`;
+  - outcome:
+    - R8B completed with no additional code patch required (local AppKey-backed implementation retained intentionally);
+  - `Current Focus` moved to item `300`.
+
+300. `P1` Wave16-R8C Routes Logs Residual Micro-Lane
+- Status: `done`
+- Scope:
+  - evaluate residual delta for `core/framework/server/routes_logs.py` after R8B;
+  - protect local runtime/log-store fixes (`colony_runtime|graph_runtime` fallback and graph node-log route compatibility) from upstream regression;
+  - produce explicit reconcile decision with gate evidence.
+- Done when:
+  - R8C decision (`replay`/`reconcile`/`keep_local`) is captured with rationale;
+  - targeted logs-route validation and full gate remain green;
+  - backlog/docs synchronized with the next residual lane.
+- Progress:
+  - precondition:
+    - R8B completed and full gate remains green (`ok=7 failed=0`);
+  - selected lane:
+    - `core/framework/server/routes_logs.py`;
+  - reconcile decision:
+    - `keep_local` because upstream variant leaves `log_store` assignment under an early-return block and does not preserve local `colony_runtime|graph_runtime` fallback + graph-route compatibility;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8c-routes-logs-execution-2026-04-25.json`;
+  - validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "logs" -q` -> `8 passed, 185 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh` -> `ok=7 failed=0`;
+  - outcome:
+    - R8C completed with no additional code patch required (local runtime/log-route compatibility retained intentionally);
+  - `Current Focus` moved to item `301`.
+
+301. `P1` Wave16-R8D MCP Registry Naming Residual Micro-Lane
+- Status: `done`
+- Scope:
+  - evaluate remaining low-blast-radius residual delta in `core/framework/loader/mcp_registry.py`;
+  - reconcile `hive-tools` vs `hive_tools` canonical naming without breaking existing seeded defaults and active agent discovery;
+  - produce explicit decision with guard validation.
+- Done when:
+  - R8D decision (`replay`/`reconcile`/`keep_local`) is documented with rationale;
+  - targeted MCP registry/credentials checks pass and full gate remains green;
+  - backlog/docs synchronized with the next residual lane.
+- Progress:
+  - precondition:
+    - R8C completed and full gate remains green (`ok=7 failed=0`);
+  - selected lane:
+    - `core/framework/loader/mcp_registry.py`;
+  - reconcile decision:
+    - `keep_local` to preserve canonical `hive-tools` naming aligned with runner registry and existing local runtime/docs config;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8d-mcp-registry-naming-execution-2026-04-25.json`;
+  - validation:
+    - `uv run --package framework pytest core/tests/test_mcp_registry.py -q` -> `89 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "mcp or credentials" -q` -> `13 passed, 180 deselected`;
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh` -> `ok=7 failed=0` (latest post-R8C run, unchanged code surface for R8D).
+  - outcome:
+    - R8D completed with no additional code patch required (local naming contract retained intentionally);
+  - `Current Focus` moved to item `302`.
+
+302. `P1` Wave16-R8E Residual Shortlist Refresh
+- Status: `done`
+- Scope:
+  - recalculate current residual micro-diff shortlist after R8B/R8C/R8D lane closures;
+  - exclude lanes explicitly guarded as intentional keep-local contracts;
+  - select one next bounded non-destructive lane with validation matrix.
+- Done when:
+  - refreshed residual shortlist artifact is generated;
+  - one next execution-ready lane is selected with rationale;
+  - backlog/docs synchronized for follow-up execution.
+- Progress:
+  - precondition:
+    - R8D completed with targeted MCP checks green and full gate baseline still green;
+  - shortlist artifact:
+    - `docs/ops/upstream-migration/wave16-r8e-residual-shortlist-2026-04-25.json`;
+  - refreshed low-blast-radius candidates:
+    - `core/framework/server/routes_messages.py` (`+2/-1`);
+    - `core/framework/loader/cli.py` (`+2/-2`);
+    - `core/framework/server/README.md` (`+1/-1`, docs-sync only);
+  - guarded keep-local set confirmed:
+    - `core/framework/server/routes_logs.py` (runtime/log-store compatibility guard);
+    - `core/framework/loader/mcp_registry.py` (canonical naming contract guard);
+  - selected next execution target:
+    - `core/framework/server/routes_messages.py` (AppKey contract micro-lane, lowest executable blast radius).
+  - execution precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r8e-routes-messages-precheck-2026-04-25.json`;
+  - precheck validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "message or classify" -q` -> `4 passed, 189 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh` -> `ok=7 failed=0`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8e-routes-messages-execution-2026-04-25.json`;
+  - outcome:
+    - selected execution target `core/framework/server/routes_messages.py` completed as `keep_local` (AppKey contract retained intentionally);
+  - `Current Focus` moved to item `303`.
+
+303. `P1` Wave16-R8F Loader CLI AppKey Micro-Lane
+- Status: `done`
+- Scope:
+  - evaluate residual AppKey delta in `core/framework/loader/cli.py`;
+  - preserve consistent manager access contract (`APP_KEY_MANAGER`) in serve/bootstrap cleanup path;
+  - capture explicit reconcile decision and validation evidence.
+- Done when:
+  - R8F decision (`replay`/`reconcile`/`keep_local`) is documented with rationale;
+  - targeted loader/server checks pass and full gate remains green;
+  - backlog/docs synchronized with next residual lane.
+- Progress:
+  - precondition:
+    - R8E completed with full gate green (`ok=7 failed=0`);
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r8f-loader-cli-precheck-2026-04-25.json`;
+  - observed delta:
+    - `core/framework/loader/cli.py` uses `APP_KEY_MANAGER` import + typed manager lookup in `run_server()` cleanup path;
+  - precheck validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "config or credentials or health" -q` -> `17 passed, 176 deselected`;
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh` -> `ok=7 failed=0`;
+  - known test debt (pre-existing, not introduced by lane):
+    - `uv run --package framework pytest core/tests/test_colony_fork_flow.py -q` -> collection `ImportError` (`_queen_session_dir` missing in `framework.server.session_manager`);
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8f-loader-cli-execution-2026-04-25.json`;
+  - outcome:
+    - R8F completed as `keep_local` (loader CLI AppKey contract retained intentionally);
+  - `Current Focus` moved to item `304`.
+
+304. `P1` Wave16-R8G Server README AppKey Docs-Sync Lane
+- Status: `done`
+- Scope:
+  - evaluate residual docs-only delta in `core/framework/server/README.md`;
+  - keep docs aligned with local AppKey runtime contract (`request.app[APP_KEY_MANAGER]`);
+  - capture explicit reconcile decision with lightweight validation evidence.
+- Done when:
+  - R8G decision (`replay`/`reconcile`/`keep_local`) is documented with rationale;
+  - docs/runtime contract consistency is preserved;
+  - backlog/docs synchronized with the next residual lane.
+- Progress:
+  - precondition:
+    - R8F completed with full gate baseline still green (`ok=7 failed=0`);
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r8g-server-readme-precheck-2026-04-25.json`;
+  - observed delta:
+    - `core/framework/server/README.md` contains a 1-line manager access pattern update to AppKey notation;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8g-server-readme-execution-2026-04-25.json`;
+  - outcome:
+    - R8G completed as `keep_local` docs-sync (AppKey documentation contract retained intentionally);
+  - `Current Focus` moved to item `305`.
+
+305. `P1` Wave16-R8H Queen MCP Registry Naming Lane
+- Status: `done`
+- Scope:
+  - evaluate residual include-list naming delta in `core/framework/agents/queen/mcp_registry.json`;
+  - preserve consistency with canonical `hive-tools` MCP server naming across loader/runner/queen contracts;
+  - capture explicit reconcile decision and lightweight validation evidence.
+- Done when:
+  - R8H decision (`replay`/`reconcile`/`keep_local`) is documented with rationale;
+  - targeted queen/runtime checks pass and gate baseline remains green;
+  - backlog/docs synchronized with the next residual lane.
+- Progress:
+  - precondition:
+    - R8G completed and full gate baseline remains green (`ok=7 failed=0`);
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r8h-queen-mcp-registry-precheck-2026-04-25.json`;
+  - observed delta:
+    - `core/framework/agents/queen/mcp_registry.json` include list uses `hive-tools` vs legacy `hive_tools`;
+  - precheck validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8h-queen-mcp-registry-execution-2026-04-25.json`;
+  - outcome:
+    - R8H completed as `keep_local` (queen include naming aligned to canonical `hive-tools`);
+  - `Current Focus` moved to item `306`.
+
+306. `P1` Wave16-R8I Residual Shortlist Checkpoint
+- Status: `done`
+- Scope:
+  - refresh remaining residual micro-diff shortlist after R8F/R8G/R8H closures;
+  - separate intentional keep-local contract lanes from executable next candidates;
+  - choose one next bounded lane with validation matrix.
+- Done when:
+  - refreshed shortlist artifact is produced with explicit keep-local bucket;
+  - next executable lane selected and documented;
+  - backlog/docs synchronized for follow-up execution.
+- Progress:
+  - precondition:
+    - R8H completed with targeted queen checks green and gate baseline stable;
+  - checkpoint artifact:
+    - `docs/ops/upstream-migration/wave16-r8i-residual-checkpoint-2026-04-25.json`;
+  - shortlist update:
+    - selected candidate for next lane: `core/framework/host/execution_manager.py` (`+3/-2`);
+    - local-additive-only files (`runtime/__init__.py`, `runtime/tests/__init__.py`, `graph/event_loop/__init__.py`) bucketed separately as non-replay targets;
+  - intentional keep-local bucket re-confirmed for prior AppKey/naming/runtime contract lanes.
+  - outcome:
+    - R8I checkpoint completed and next lane selected (`R8J`).
+  - `Current Focus` moved to item `307`.
+
+307. `P1` Wave16-R8J Execution Manager Warning-Noise Lane
+- Status: `done`
+- Scope:
+  - evaluate residual delta in `core/framework/host/execution_manager.py`;
+  - preserve runtime warning-noise hardening (`warning` -> `info` with stream context) where intentional;
+  - capture explicit reconcile decision with targeted validation evidence.
+- Done when:
+  - R8J decision (`replay`/`reconcile`/`keep_local`) is documented with rationale;
+  - targeted execution/autonomous checks pass and gate baseline remains green;
+  - backlog/docs synchronized with the next residual lane.
+- Progress:
+  - precondition:
+    - R8I checkpoint completed with selected R8J candidate;
+  - validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "autonomous or execution" -q` -> `83 passed, 110 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8j-execution-manager-execution-2026-04-25.json`;
+  - outcome:
+    - R8J completed as `keep_local` (execution_manager warning-noise hardening retained intentionally);
+  - `Current Focus` moved to item `308`.
+
+308. `P1` Wave16-R8K Local-Additive Residual Classification Checkpoint
+- Status: `done`
+- Scope:
+  - classify remaining low-size residuals that are local-additive (not upstream replay candidates);
+  - separate additive local exports/package markers from true replay/reconcile candidates;
+  - publish checkpoint artifact with next executable lane selection.
+- Done when:
+  - local-additive bucket is explicitly documented;
+  - next executable lane (if any) is selected with rationale;
+  - backlog/docs synchronized for follow-up execution.
+- Progress:
+  - precondition:
+    - R8J completed with targeted execution/autonomous tests green;
+  - checkpoint artifact:
+    - `docs/ops/upstream-migration/wave16-r8k-local-additive-checkpoint-2026-04-25.json`;
+  - outcome:
+    - local-additive residual bucket formalized and separated from replay candidates;
+    - next executable lane selected: `R8L` (`agent_host.py` + `colony_runtime.py` timeout-noise contract pair).
+  - `Current Focus` moved to item `309`.
+
+309. `P1` Wave16-R8L Agent Host/Colony Runtime Timeout-Noise Lane
+- Status: `done`
+- Scope:
+  - evaluate paired residual deltas in:
+    - `core/framework/host/agent_host.py`;
+    - `core/framework/host/colony_runtime.py`;
+  - preserve intentional timeout-noise handling contract:
+    - `FutureTimeoutError` -> debug (not warning spam),
+    - real failures keep warning with `exc_info=True`;
+  - capture explicit reconcile decision and paired-lane validation evidence.
+- Done when:
+  - R8L decision (`replay`/`reconcile`/`keep_local`) is documented with rationale;
+  - targeted host/runtime checks pass and gate baseline remains green;
+  - backlog/docs synchronized with the next residual lane.
+- Progress:
+  - precondition:
+    - R8K checkpoint selected R8L as next bounded executable lane;
+  - validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "autonomous or execution" -q` -> `83 passed, 110 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r8l-agent-host-colony-runtime-execution-2026-04-25.json`;
+  - outcome:
+    - R8L completed as `keep_local` for paired timeout-noise handling contract.
+  - `Current Focus` moved to item `310`.
+
+310. `P1` Wave16-R8M Micro-Lane Closure Checkpoint
+- Status: `done`
+- Scope:
+  - consolidate results of R8A..R8L micro-lanes;
+  - decide whether to continue with additional micro-lanes or transition to next medium-size residual bundle;
+  - produce explicit checkpoint artifact with recommended next wave cut.
+- Done when:
+  - closure checkpoint artifact is published with current residual map and recommendation;
+  - next lane family (micro continuation vs medium bundle) is selected;
+  - backlog/docs synchronized for subsequent execution.
+- Progress:
+  - precondition:
+    - R8L completed with targeted validation green;
+  - closure artifact:
+    - `docs/ops/upstream-migration/wave16-r8m-micro-lane-closure-checkpoint-2026-04-25.json`;
+  - outcome:
+    - micro-lane wave R8A..R8L consolidated;
+    - recommended transition from micro-lanes to medium bundle (`R9A routes_queens`).
+  - `Current Focus` moved to item `311`.
+
+311. `P1` Wave16-R9A Routes Queens Medium-Bundle Kickoff
+- Status: `done`
+- Scope:
+  - execute first medium-size residual lane on `core/framework/server/routes_queens.py`;
+  - preserve local runtime/queue/telegram contract hardening where intentional while evaluating upstream deltas;
+  - capture replay/reconcile/keep-local decision with medium-lane validation evidence.
+- Done when:
+  - R9A decision is documented with rationale and bounded blast-radius notes;
+  - targeted queen API/orchestrator checks pass and full gate remains green;
+  - backlog/docs synchronized with next medium-lane candidate.
+- Progress:
+  - precondition:
+    - R8M closure checkpoint selected R9A as next recommended lane;
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9a-routes-queens-precheck-2026-04-25.json`;
+  - precheck summary:
+    - medium delta (`+95/-51`) centered on AppKey migration, JSON parse hardening, phase normalization, and queen session lifecycle flow updates;
+  - precheck validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "queen" -q` -> `9 passed, 184 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9a-routes-queens-execution-2026-04-25.json`;
+  - full gate validation:
+    - `HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh` -> `ok=7 failed=0`;
+  - outcome:
+    - R9A completed as `keep_local` (routes_queens local lifecycle/phase hardening retained intentionally).
+  - `Current Focus` moved to item `312`.
+
+312. `P1` Wave16-R9B Routes Execution Medium-Lane
+- Status: `done`
+- Scope:
+  - evaluate medium-size residual lane in `core/framework/server/routes_execution.py`;
+  - assess local queue/admission/policy enforcement behavior vs upstream diff;
+  - capture reconcile decision with bounded validation evidence.
+- Done when:
+  - R9B decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted execution-focused API tests pass and gate baseline remains green;
+  - backlog/docs synchronized with next medium-lane candidate.
+- Progress:
+  - precondition:
+    - R9A completed with full gate baseline green (`ok=7 failed=0`);
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9b-routes-execution-precheck-2026-04-25.json`;
+  - precheck summary:
+    - medium delta (`+150/-23`) centered on execution queueing, policy-gated admission, runtime abstraction helper, and client message metadata propagation;
+  - precheck validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "execution" -q` -> `29 passed, 164 deselected`;
+  - extended validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "execution or autonomous" -q` -> `83 passed, 110 deselected`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9b-routes-execution-execution-2026-04-25.json`;
+  - outcome:
+    - R9B completed as `keep_local` (execution queue/admission/policy behavior retained intentionally).
+  - `Current Focus` moved to item `313`.
+
+313. `P1` Wave16-R9C Cursor Persistence Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate residual behavior delta in `core/framework/agent_loop/internals/cursor_persistence.py`;
+  - decide on keep/reconcile for timestamp stamping and trigger/message formatting behavior;
+  - capture explicit decision with targeted event-loop/conversation validation evidence.
+- Done when:
+  - R9C decision (`replay`/`reconcile`/`keep_local`) is documented with rationale;
+  - targeted event-loop and conversation tests pass;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9B completed with execution/autonomous checks green and gate baseline stable;
+  - checkpoint artifact:
+    - `docs/ops/upstream-migration/wave16-r9c-medium-bundle-checkpoint-2026-04-25.json`;
+  - selected candidate:
+    - `core/framework/agent_loop/internals/cursor_persistence.py` (`+5/-15`, behavior around injected message formatting/stamps);
+  - precheck validation:
+    - `uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q` -> `163 passed, 4 skipped`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9c-cursor-persistence-execution-2026-04-25.json`;
+  - outcome:
+    - R9C completed as `keep_local` (cursor/trigger formatting behavior retained intentionally).
+  - `Current Focus` moved to item `314`.
+
+314. `P1` Wave16-R9D Compaction Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate behavioral residual lane in `core/framework/agent_loop/internals/compaction.py`;
+  - decide reconcile strategy for `preserve_user_messages` path removal and prompt semantics;
+  - capture decision with targeted compaction/event-loop validation evidence.
+- Done when:
+  - R9D decision (`replay`/`reconcile`/`keep_local`) is documented with rationale;
+  - targeted event-loop/conversation tests remain green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9C completed with event-loop/conversation tests green;
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9d-compaction-precheck-2026-04-25.json`;
+  - precheck summary:
+    - delta (`+8/-44`) centered on removal of `preserve_user_messages` branch and compaction prompt simplification;
+  - precheck validation:
+    - `uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q` -> `163 passed, 4 skipped`;
+  - execution patch:
+    - restored `preserve_user_messages` compatibility path in:
+      - `core/framework/agent_loop/internals/compaction.py`;
+      - `core/framework/graph/event_loop/compaction.py`;
+    - preserved default behavior for existing callers (`preserve_user_messages=False` by default).
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9d-compaction-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q` -> `163 passed, 4 skipped`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "execution" -q` -> `29 passed, 164 deselected`;
+  - outcome:
+    - R9D completed as `reconcile` (preserve-user-messages contract restored for compact-and-fork flow).
+  - `Current Focus` moved to item `315`.
+
+315. `P1` Wave16-R9E Conversation Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate residual behavior lane in `core/framework/agent_loop/conversation.py`;
+  - assess reconcile strategy for conversation tool/result shaping changes vs local runtime contract;
+  - capture decision with targeted event-loop/conversation and execution API validation evidence.
+- Done when:
+  - R9E decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with the next lane.
+- Progress:
+  - precondition:
+    - R9D completed with compaction compatibility restored and targeted tests green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9e-conversation-precheck-2026-04-25.json`;
+  - precheck summary:
+    - delta (`+11/-99`) with runtime contract mismatch on `Message(... inherited_from=...)` in compact-and-fork path;
+    - reconcile required to avoid TypeError and preserve provenance metadata.
+  - execution patch:
+    - restored `inherited_from` and `is_trigger` metadata fields in `Message`;
+    - restored persistence serialization/deserialization for these fields;
+    - restored optional `is_trigger` parameter in `NodeConversation.add_user_message(...)`.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9e-conversation-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q` -> `163 passed, 4 skipped`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "execution" -q` -> `29 passed, 164 deselected`;
+  - outcome:
+    - R9E completed as `reconcile` (cross-session message metadata contract restored).
+  - `Current Focus` moved to item `316`.
+
+316. `P1` Wave16-R9F Execution Manager Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate small residual lane in `core/framework/host/execution_manager.py`;
+  - verify local execution lifecycle behavior vs upstream minimal AppKey/flow deltas;
+  - capture lane decision with targeted runtime/execution validation evidence.
+- Done when:
+  - R9F decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9E completed with conversation metadata contract restored.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9f-execution-manager-precheck-2026-04-25.json`;
+  - precheck summary:
+    - minimal delta (`+3/-2`) limited to cancellation-grace logging level/message in `ExecutionManager.stop()`;
+    - no lifecycle/contract change in execution semantics.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9f-execution-manager-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "execution" -q` -> `29 passed, 164 deselected`;
+    - `uv run --package framework pytest core/tests/test_runtime.py -q` -> `15 passed, 2 skipped`;
+    - `uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q` -> `11 passed`;
+  - outcome:
+    - R9F completed as `keep_local` (noise-hardening info-level cancellation log retained intentionally).
+  - `Current Focus` moved to item `317`.
+
+317. `P1` Wave16-R9G Routes Logs Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/server/routes_logs.py`;
+  - verify local runtime/log-store compatibility behavior vs upstream small delta;
+  - capture decision with targeted API/runtime validation evidence.
+- Done when:
+  - R9G decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9F completed with execution lifecycle tests green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9g-routes-logs-precheck-2026-04-25.json`;
+  - precheck summary:
+    - delta (`+12/-6`) centered on runtime-shape fallback (`colony_runtime`/`graph_runtime`) and backward-compatible graph node logs route;
+    - upstream-only topology assumptions flagged as compatibility risk.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9g-routes-logs-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "logs" -q` -> `8 passed, 185 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "execution" -q` -> `29 passed, 164 deselected`;
+  - outcome:
+    - R9G completed as `keep_local` (runtime topology and endpoint compatibility hardening retained).
+  - `Current Focus` moved to item `318`.
+
+318. `P1` Wave16-R9H Agent Host Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/host/agent_host.py`;
+  - verify local agent-host lifecycle behavior vs upstream small delta;
+  - capture decision with targeted runtime/execution validation evidence.
+- Done when:
+  - R9H decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9G completed with logs/execution API checks green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9h-agent-host-precheck-2026-04-25.json`;
+  - precheck summary:
+    - minimal delta (`+5/-1`) centered on timeout/error split in `cancel_all_tasks()` diagnostics;
+    - local branch preserves clearer timeout-vs-failure logging contract.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9h-agent-host-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_runtime.py -q` -> `15 passed, 2 skipped`;
+    - `uv run --package framework pytest core/tests/test_trigger_fires_into_queen.py -q` -> `7 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "execution" -q` -> `29 passed, 164 deselected`;
+  - outcome:
+    - R9H completed as `keep_local` (improved cancel diagnostics retained without behavior regression).
+  - `Current Focus` moved to item `319`.
+
+319. `P1` Wave16-R9I Colony Runtime Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/host/colony_runtime.py`;
+  - verify local colony runtime lifecycle behavior vs upstream small delta;
+  - capture decision with targeted runtime/overseer validation evidence.
+- Done when:
+  - R9I decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9H completed with host/runtime/trigger checks green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9i-colony-runtime-precheck-2026-04-25.json`;
+  - precheck summary:
+    - minimal delta (`+5/-1`) centered on timeout/error split in `cancel_all_tasks()` diagnostics;
+    - local branch preserves clearer timeout-vs-failure logging for colony shutdown paths.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9i-colony-runtime-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_colony_runtime_overseer.py core/tests/test_run_parallel_workers_tool.py -q` -> `16 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "execution or logs" -q` -> `37 passed, 156 deselected`;
+  - outcome:
+    - R9I completed as `keep_local` (colony runtime cancel diagnostics retained without behavior regression).
+  - `Current Focus` moved to item `320`.
+
+320. `P1` Wave16-R9J Host Event Bus Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/host/event_bus.py`;
+  - verify local event bus behavior vs upstream small delta;
+  - capture decision with targeted host/runtime/event-bus validation evidence.
+- Done when:
+  - R9J decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9I completed with colony runtime + API validation bundles green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9j-host-event-bus-precheck-2026-04-25.json`;
+  - precheck summary:
+    - small additive delta (`+9/-0`) to keep `emit_client_input_requested` backward-compatible for single-question prompt/options path;
+    - questions-array path remains intact for multi-question flows.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9j-host-event-bus-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_event_type_extension.py -q` -> `78 passed`;
+    - `uv run --package framework pytest core/tests/test_event_loop_node.py -k "ask_user or client_input_requested" -q` -> `2 passed, 1 skipped, 66 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k "input_requested or ask_user or question" -q` -> `1 passed, 45 deselected`;
+  - outcome:
+    - R9J completed as `keep_local` (interactive input payload compatibility retained).
+  - `Current Focus` moved to item `321`.
+
+321. `P1` Wave16-R9K Queen Lifecycle Tools Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/tools/queen_lifecycle_tools.py`;
+  - verify local queen lifecycle tool behavior vs upstream small delta;
+  - capture decision with targeted queen/session/execution validation evidence.
+- Done when:
+  - R9K decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9J completed with event-bus and bridge interaction checks green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9k-queen-lifecycle-tools-precheck-2026-04-25.json`;
+  - precheck summary:
+    - additive compatibility delta (`+12/-0`) introduces prompt aliasing between `prompt_building` and `prompt_independent`;
+    - preserves legacy caller/test compatibility on phase prompt initialization.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9k-queen-lifecycle-tools-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_create_colony_tool.py core/tests/test_run_parallel_workers_tool.py core/tests/test_queen_memory.py -q` -> `53 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k "execution or colony or queen" -q` -> `34 passed, 159 deselected`;
+  - outcome:
+    - R9K completed as `keep_local` (phase prompt compatibility shim retained).
+  - note:
+    - test harness updated for current fork signature contract in `core/tests/test_create_colony_tool.py` (`concurrency_hint` support).
+  - `Current Focus` moved to item `322`.
+
+322. `P1` Wave16-R9L Queen Memory V2 Behavior Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/agents/queen/queen_memory_v2.py`;
+  - verify local memory/recall behavior vs upstream small delta;
+  - capture decision with targeted queen memory and session validation evidence.
+- Done when:
+  - R9L decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9K completed with lifecycle-tools and queen API bundles green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9l-queen-memory-v2-precheck-2026-04-25.json`;
+  - precheck summary:
+    - compatibility delta (`+16/-4`) keeps colony memory paths in `colony_memory/<normalized_session_id>`;
+    - retains backward-compatible `init_memory_dir(..., migrate_legacy=...)` contract for orchestrator/session-manager callers.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9l-queen-memory-v2-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_queen_memory.py -q` -> `32 passed`;
+    - `uv run --package framework pytest core/tests/test_create_colony_tool.py core/tests/test_run_parallel_workers_tool.py -q` -> `21 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+    - `uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q` -> `9 passed`;
+  - outcome:
+    - R9L completed as `keep_local` (memory path + signature compatibility preserved with green queen/session bundles).
+
+323. `P1` Wave16-R9M Tool Registry Built-in SaveData Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/loader/tool_registry.py`;
+  - verify local built-in tool contract (`save_data`) vs upstream additive delta;
+  - capture decision with targeted tool-registry/context validation evidence.
+- Done when:
+  - R9M decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9L completed with queen memory/session bundles green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9m-tool-registry-precheck-2026-04-25.json`;
+  - precheck summary:
+    - compatibility delta (`+42/-0`) keeps built-in `save_data` registered directly in `ToolRegistry`;
+    - preserves execution-context `data_dir` precedence contract for deterministic file writes.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9m-tool-registry-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_tool_registry.py -k 'builtin_save_data or concurrency_safe_tools' -q` -> `2 passed, 38 deselected`;
+    - `uv run --package framework pytest core/tests/test_tool_context_propagation.py -q` -> `2 passed`;
+    - `uv run --package framework pytest core/tests/test_mcp_registry_loader.py -q` -> `3 passed`;
+  - outcome:
+    - R9M completed as `keep_local` (built-in save_data availability and context-routing behavior retained).
+  - `Current Focus` moved to item `324`.
+
+324. `P1` Wave16-R9N Graph Package Boundary Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/graph/__init__.py`;
+  - verify local graph package boundary exports and import-safety behavior vs upstream;
+  - capture decision with targeted graph/runtime import validation evidence.
+- Done when:
+  - R9N decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9M completed with tool-registry/context bundles green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9n-graph-package-boundary-precheck-2026-04-25.json`;
+  - precheck summary:
+    - additive package delta (`+65/-0`) exposes stable `framework.graph` public exports via `__all__`;
+    - reduces deep-module import coupling for runtime/server callers.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9n-graph-package-boundary-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_event_loop_node.py -q` -> `65 passed, 4 skipped`;
+    - `uv run --package framework pytest core/tests/test_runtime.py -q` -> `15 passed, 2 skipped`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'execution or queen' -q` -> `34 passed, 159 deselected`;
+    - `uv run --package framework python - <<'PY' ... import framework.graph export check ... PY` -> `graph_exports_ok=8`, `__all__ size=30`.
+  - outcome:
+    - R9N completed as `keep_local` (graph package boundary exports retained with green bundles).
+  - `Current Focus` moved to item `325`.
+
+325. `P1` Wave16-R9O Runtime Package Boundary Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/runtime/__init__.py`;
+  - verify local runtime package export boundary and import compatibility vs upstream;
+  - capture decision with targeted runtime/server validation evidence.
+- Done when:
+  - R9O decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9N completed with graph package boundary validation green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9o-runtime-package-boundary-precheck-2026-04-25.json`;
+  - precheck summary:
+    - additive package delta (`+5/-0`) exposes stable `framework.runtime.Runtime` import boundary;
+    - avoids deep-path coupling to `framework.runtime.core`.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9o-runtime-package-boundary-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_runtime.py -q` -> `15 passed, 2 skipped`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'autonomous or execution' -q` -> `83 passed, 110 deselected`;
+    - `uv run --package framework python - <<'PY' ... import framework.runtime export check ... PY` -> `runtime_export_ok`, `__all__=['Runtime']`.
+  - outcome:
+    - R9O completed as `keep_local` (runtime package boundary export retained with green bundles).
+  - `Current Focus` moved to item `326`.
+
+326. `P1` Wave16-R9P Event-Loop Package Boundary Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/graph/event_loop/__init__.py`;
+  - verify local event-loop package exports and import compatibility vs upstream;
+  - capture decision with targeted event-loop/runtime validation evidence.
+- Done when:
+  - R9P decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9O completed with runtime package boundary validation green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9p-event-loop-package-boundary-precheck-2026-04-25.json`;
+  - precheck summary:
+    - additive package delta (`+6/-0`) documents event-loop subpackage boundary and compatibility note;
+    - no functional runtime behavior changes.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9p-event-loop-package-boundary-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_event_loop_node.py -q` -> `65 passed, 4 skipped`;
+    - `uv run --package framework python - <<'PY' ... import framework.graph.event_loop.* submodule check ... PY` -> `event_loop_submodules_import_ok=4`.
+  - outcome:
+    - R9P completed as `keep_local` (doc-only package boundary initializer retained).
+  - `Current Focus` moved to item `327`.
+
+327. `P1` Wave16-R9Q Runtime Tests Package Marker Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/runtime/tests/__init__.py`;
+  - verify local runtime tests package marker behavior and test discovery compatibility vs upstream;
+  - capture decision with targeted runtime test collection evidence.
+- Done when:
+  - R9Q decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9P completed with event-loop boundary checks green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9q-runtime-tests-package-marker-precheck-2026-04-25.json`;
+  - precheck summary:
+    - additive package marker delta (`+1/-0`) keeps explicit runtime-tests package boundary.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9q-runtime-tests-package-marker-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/runtime/tests -q` -> `69 passed`;
+    - `uv run --package framework pytest core/tests/test_runtime.py -q` -> `15 passed, 2 skipped`;
+  - outcome:
+    - R9Q completed as `keep_local` (runtime tests package marker retained).
+  - `Current Focus` moved to item `328`.
+
+328. `P1` Wave16-R9R MCP Client Teardown Noise-Hardening Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/loader/mcp_client.py`;
+  - verify local teardown logging behavior for known anyio cancel-scope quirk vs upstream;
+  - capture decision with targeted MCP loader/registry/API evidence.
+- Done when:
+  - R9R decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9Q completed with runtime test-discovery validation green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9r-mcp-client-teardown-lane-precheck-2026-04-25.json`;
+  - precheck summary:
+    - compatibility delta (`+5/-1`) downgrades known anyio teardown quirk log from warning to debug;
+    - non-quirk teardown errors remain warning-level.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9r-mcp-client-teardown-lane-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_mcp_client.py -q` -> `7 passed`;
+    - `uv run --package framework pytest core/tests/test_mcp_registry_loader.py core/tests/test_tool_registry.py -k 'mcp' -q` -> `17 passed, 26 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'mcp or credentials' -q` -> `13 passed, 180 deselected`;
+  - outcome:
+    - R9R completed as `keep_local` (MCP teardown warning-noise hardening retained with green MCP bundles).
+  - `Current Focus` moved to item `329`.
+
+329. `P1` Wave16-R9S Loader CLI AppKey Contract Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/loader/cli.py`;
+  - verify local APP_KEY manager access contract compatibility vs upstream;
+  - capture decision with targeted loader/server boot validation evidence.
+- Done when:
+  - R9S decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9R completed with MCP loader teardown bundles green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9s-loader-cli-appkey-precheck-2026-04-25.json`;
+  - precheck summary:
+    - compatibility delta (`+2/-2`) aligns loader CLI to typed AppKey manager contract (`app[APP_KEY_MANAGER]`);
+    - avoids raw-string `app["manager"]` access drift.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9s-loader-cli-appkey-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_runner_cli_frontend.py -q` -> `3 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'execution or health' -q` -> `33 passed, 160 deselected`;
+  - known non-lane issue:
+    - `uv run --package framework pytest core/tests/test_colony_fork_flow.py -q` -> collection error (`ImportError: _queen_session_dir`) tracked as legacy test-drift outside loader/cli lane.
+  - outcome:
+    - R9S completed as `keep_local` (typed APP_KEY manager access retained; unrelated legacy test-drift isolated).
+  - `Current Focus` moved to item `330`.
+
+330. `P1` Wave16-R9T Loader MCP Registry Canonical Alias Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/loader/mcp_registry.py`;
+  - verify canonical default server naming (`hive-tools`) and stale alias handling vs upstream;
+  - capture decision with targeted MCP registry/CLI validation evidence.
+- Done when:
+  - R9T decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9S completed with loader CLI AppKey contract validation green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9t-loader-mcp-registry-canonical-precheck-2026-04-25.json`;
+  - precheck summary:
+    - compatibility delta (`+2/-2`) keeps canonical server key `hive-tools`;
+    - preserves cleanup path for legacy alias `hive_tools`.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9t-loader-mcp-registry-canonical-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_mcp_registry.py -k 'ensure_defaults or stale or hive_tools or hive-tools' -q` -> `5 passed, 84 deselected`;
+    - `uv run --package framework pytest core/tests/test_mcp_registry_cli.py -k 'defaults or list or info or config' -q` -> `18 passed, 44 deselected`;
+  - outcome:
+    - R9T completed as `keep_local` (canonical MCP registry naming contract retained).
+  - `Current Focus` moved to item `331`.
+
+331. `P1` Wave16-R9U Runner MCP Registry Baseline Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/runner/mcp_registry.py`;
+  - verify local runner-side MCP registry baseline divergence and compatibility envelope vs upstream;
+  - capture bounded decision with targeted runner/MCP contract validation.
+- Done when:
+  - R9U decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9T completed with loader MCP registry canonical alias validation green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9u-runner-mcp-registry-precheck-2026-04-25.json`;
+  - precheck summary:
+    - large local baseline delta (`+982/-0`) retained for runner-side MCP registry contract;
+    - verified canonical default seeding + legacy alias cleanup behavior.
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9u-runner-mcp-registry-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework python - <<'PY' ... import framework.runner.mcp_registry check ... PY` -> `runner_mcp_registry_import_ok=True`;
+    - `uv run --package framework python - <<'PY' ... MCPRegistry.ensure_defaults stale alias cleanup smoke ... PY` -> `runner_mcp_registry_defaults_ok` and canonical servers present;
+    - `uv run --package framework pytest core/tests/test_mcp_registry.py -q` -> `89 passed`.
+  - outcome:
+    - R9U completed as `keep_local` (runner MCP registry baseline retained as bounded local contract).
+  - `Current Focus` moved to item `332`.
+
+332. `P1` Wave16-R9V Server README AppKey Docs Alignment Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/server/README.md`;
+  - verify documentation alignment with current typed AppKey access pattern (`APP_KEY_MANAGER`);
+  - capture decision with bounded doc-contract rationale.
+- Done when:
+  - R9V decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - docs contract is synchronized with active server code pattern;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9U completed with runner MCP registry baseline validation green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9v-server-readme-appkey-precheck-2026-04-25.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9v-server-readme-appkey-execution-2026-04-25.json`;
+  - outcome:
+    - R9V completed as `keep_local` (server docs aligned to typed AppKey manager access pattern).
+  - `Current Focus` moved to item `333`.
+
+333. `P1` Wave16-R9W Queen MCP Registry Canonical Include Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/agents/queen/mcp_registry.json`;
+  - verify queen include-list alignment with canonical MCP registry server naming (`hive-tools`);
+  - capture decision with targeted queen orchestration validation.
+- Done when:
+  - R9W decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted queen/session checks remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9V completed with server README AppKey docs alignment.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9w-queen-mcp-registry-canonical-precheck-2026-04-25.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9w-queen-mcp-registry-canonical-execution-2026-04-25.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'queen' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R9W completed as `keep_local` (queen MCP include-list canonical naming retained).
+  - `Current Focus` moved to item `334`.
+
+334. `P1` Wave16-R9X Runner Package Export Boundary Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/runner/__init__.py`;
+  - verify runner package public exports and lazy-load cycle-avoidance contract vs upstream;
+  - capture decision with targeted runner/session validation evidence.
+- Done when:
+  - R9X decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9W completed with queen MCP registry canonical include validation green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9x-runner-package-boundary-precheck-2026-04-25.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9x-runner-package-boundary-execution-2026-04-26.json`;
+  - validation progress:
+    - `uv run --package framework python - <<'PY' ... import framework.runner export check ... PY` -> `runner_pkg_exports_ok`, `runner_all=11`;
+    - `uv run --package framework pytest core/tests/test_runner_api_key_env_var.py core/tests/test_runner_model_fallback_chain.py -q` -> `4 passed`;
+    - `uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q` -> `9 passed`.
+  - outcome:
+    - R9X completed as `keep_local` (runner package boundary retained with green runner/session bundles).
+  - `Current Focus` moved to item `335`.
+
+335. `P1` Wave16-R9Y Routes Messages AppKey Contract Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/server/routes_messages.py`;
+  - verify typed AppKey manager access contract vs upstream (`request.app[APP_KEY_MANAGER]`);
+  - capture bounded decision with targeted classify-route validation.
+- Done when:
+  - R9Y decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9X completed with runner package boundary validation green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9y-routes-messages-appkey-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9y-routes-messages-appkey-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'messages_classify or classify_route' -q` -> `1 passed, 192 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'messages or classify' -q` -> `1 passed, 192 deselected`.
+  - outcome:
+    - R9Y completed as `keep_local` (typed AppKey manager access retained in classify route).
+  - `Current Focus` moved to item `336`.
+
+336. `P1` Wave16-R9Z Execution Manager Cancellation-Grace Logging Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/host/execution_manager.py`;
+  - verify cancellation-grace observability contract (`info` vs `warning`) remains noise-safe and behavior-neutral;
+  - capture bounded decision with targeted execution/runtime lifecycle validation.
+- Done when:
+  - R9Z decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted execution/runtime tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9Y completed with routes_messages AppKey contract validation green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r9z-execution-manager-cancel-grace-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r9z-execution-manager-cancel-grace-execution-2026-04-26.json`;
+  - precheck summary:
+    - bounded execution-manager delta (`+5/-1`) in cancellation-grace logging branch only;
+    - local message includes `stream_id` and uses `info` to reduce expected warning-noise.
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'execution' -q` -> `29 passed, 164 deselected`;
+    - `uv run --package framework pytest core/tests/test_runtime.py -q` -> `15 passed, 2 skipped`;
+    - `uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q` -> `11 passed`.
+  - outcome:
+    - R9Z completed as `keep_local` (execution-manager cancellation-grace logging contract retained).
+  - `Current Focus` moved to item `337`.
+
+337. `P1` Wave16-R10A Routes Execution Policy/Queue Runtime-Shape Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/server/routes_execution.py`;
+  - verify project policy + queue endpoint + runtime-shape compatibility contract vs upstream;
+  - capture bounded decision with targeted API/Telegram execution-control validation.
+- Done when:
+  - R10A decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted API/bridge tests remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R9Z completed with execution-manager lifecycle bundle green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10a-routes-execution-policy-queue-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10a-routes-execution-policy-queue-execution-2026-04-26.json`;
+  - precheck summary:
+    - substantial routes_execution delta (`+173/-26`) adds project queue endpoint and policy-aware trigger gating;
+    - runtime adapter `_session_runtime` aligns graph/colony runtime shapes;
+    - chat path now propagates `source/client_message_id` metadata through event bus.
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'queue_if_busy or max_concurrent_runs or client_message_id' -q` -> `1 passed, 192 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'trigger or pause or stop or replay' -q` -> `21 passed, 172 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k 'status or sessions or run' -q` -> `2 passed, 44 deselected`.
+  - outcome:
+    - R10A completed as `keep_local` (policy/queue/runtime-shape routes_execution contract retained).
+  - `Current Focus` moved to item `338`.
+
+338. `P1` Wave16-R10B Host/Runtime Residual Shortlist Lane
+- Status: `done`
+- Scope:
+  - refresh residual shortlist after R10A closure and execute smallest coupled host/runtime lane;
+  - validate `agent_host` + `colony_runtime` compatibility envelope against current local session lifecycle contract;
+  - capture bounded decision and explicit risk notes.
+- Done when:
+  - R10B decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted host/runtime + queen orchestration tests are classified (pass or out-of-lane drift);
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10A completed with routes_execution queue/policy API bundle green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10b-residual-shortlist-refresh-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10b-host-runtime-shortlist-execution-2026-04-26.json`;
+  - validation:
+    - `uv run --package framework pytest core/tests/test_session_unified_colony_runtime.py -q` -> `3 passed` (migrated from removed private API to current lifecycle contract);
+    - `uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q` -> `11 passed`;
+    - `uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q` -> `5 passed`.
+  - outcome:
+    - R10B completed as `reconcile` (legacy test drift resolved by aligning tests to current SessionManager runtime contract).
+  - `Current Focus` moved to item `339`.
+
+339. `P1` Wave16-R10C Host Cancel-Timeout/Noise Micro-Lane
+- Status: `done`
+- Scope:
+  - evaluate small residual deltas in `agent_host` and `colony_runtime` cancel-all-tasks wrappers;
+  - verify timeout-vs-failure log split remains behavior-neutral and reduces expected warning-noise;
+  - capture bounded decision with host/runtime worker regression bundle.
+- Done when:
+  - R10C decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - target host/runtime worker bundles remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10B closed with unified-runtime test drift reconciliation.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10c-host-cancel-timeout-noise-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10c-host-cancel-timeout-noise-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q` -> `11 passed`;
+    - `uv run --package framework pytest core/tests/test_run_parallel_workers_tool.py -q` -> `5 passed`;
+    - `uv run --package framework pytest core/tests/test_create_colony_tool.py -q` -> `16 passed`.
+  - outcome:
+    - R10C completed as `keep_local` (timeout-specific debug/noise hardening retained in host cancellation wrappers).
+  - `Current Focus` moved to item `340`.
+
+340. `P1` Wave16-R10D Routes Logs Runtime-Shape Compatibility Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/server/routes_logs.py`;
+  - verify node-log routes and runtime shape fallback (`colony_runtime`/`graph_runtime`) stay compatible with current Web/API consumers;
+  - capture bounded decision with logs API regression evidence.
+- Done when:
+  - R10D decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - logs/node_logs API bundle remains green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10C completed with host/runtime cancellation bundle green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10d-routes-logs-runtime-shape-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10d-routes-logs-runtime-shape-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'logs or node_logs' -q` -> `8 passed, 185 deselected`.
+  - outcome:
+    - R10D completed as `keep_local` (routes_logs runtime-shape + graph-route alias compatibility retained).
+  - `Current Focus` moved to item `341`.
+
+341. `P1` Wave16-R10E Queen Memory Compatibility Namespace Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/agents/queen/queen_memory_v2.py`;
+  - verify normalized colony-memory path contract and `migrate_legacy` compatibility parameter behavior;
+  - capture bounded decision with queen-memory and session-manager regression evidence.
+- Done when:
+  - R10E decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - queen-memory/session-manager bundles remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10D completed with logs/node_logs API compatibility bundle green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10e-queen-memory-compat-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10e-queen-memory-compat-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_queen_memory.py -q` -> `32 passed`;
+    - `uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q` -> `9 passed`.
+  - outcome:
+    - R10E completed as `keep_local` (queen memory namespace normalization and migrate_legacy compatibility retained).
+  - `Current Focus` moved to item `342`.
+
+342. `P1` Wave16-R10F Cursor Persistence Compatibility Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/agent_loop/internals/cursor_persistence.py`;
+  - verify external-event/trigger persistence formatting changes remain compatible with event-loop and conversation storage contracts;
+  - capture bounded decision with targeted event-loop/node-conversation evidence.
+- Done when:
+  - R10F decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - event-loop/node-conversation bundles remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10E completed with queen-memory/session-manager bundle green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10f-cursor-persistence-compat-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10f-cursor-persistence-compat-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_event_loop_node.py -k 'inject_event or cursor' -q` -> `2 passed, 67 deselected`;
+    - `uv run --package framework pytest core/tests/test_node_conversation.py -q` -> `98 passed`.
+  - outcome:
+    - R10F completed as `keep_local` (cursor persistence formatting contract retained without regression).
+  - `Current Focus` moved to item `343`.
+
+343. `P1` Wave16-R10G Queen Lifecycle Prompt Alias Compatibility Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/tools/queen_lifecycle_tools.py`;
+  - verify `prompt_building` ↔ `prompt_independent` alias compatibility in `QueenPhaseState`;
+  - capture bounded decision with queen-memory and colony-tools regression evidence.
+- Done when:
+  - R10G decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - phase-state alias + colony tools bundles remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10F completed with event-loop/node-conversation bundles green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10g-queen-lifecycle-prompt-alias-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10g-queen-lifecycle-prompt-alias-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_queen_memory.py -q` -> `32 passed`;
+    - `uv run --package framework pytest core/tests/test_create_colony_tool.py -q` -> `16 passed`;
+    - `uv run --package framework pytest core/tests/test_run_parallel_workers_tool.py -q` -> `5 passed`.
+  - outcome:
+    - R10G completed as `keep_local` (prompt alias compatibility retained for legacy/new QueenPhaseState callers).
+  - `Current Focus` moved to item `344`.
+
+344. `P1` Wave16-R10H Skills Discovery Bundled-Collision Precedence Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/skills/discovery.py`;
+  - verify bundled `framework`↔`preset` collision precedence contract remains deterministic and low-noise;
+  - capture bounded decision with skill discovery/integration regression evidence.
+- Done when:
+  - R10H decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - skill discovery/integration suites remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10G completed with prompt-alias + colony tools bundle green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10h-skills-discovery-collision-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10h-skills-discovery-collision-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_skill_discovery.py -q` -> `10 passed`;
+    - `uv run --package framework pytest core/tests/test_skill_integration.py -q` -> `9 passed`.
+  - outcome:
+    - R10H completed as `keep_local` (bundled framework/preset skill override precedence retained, warning noise reduced).
+  - `Current Focus` moved to item `345`.
+
+345. `P1` Wave16-R10I Runtime Trigger-Definition Contract Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/runtime/triggers.py`;
+  - verify `TriggerDefinition` schema contract used by session/API trigger lifecycle remains stable;
+  - capture bounded decision with trigger CRUD + queen trigger-firing regression evidence.
+- Done when:
+  - R10I decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - trigger API + trigger-firing suites remain green after decision;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10H completed with discovery precedence bundle green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10i-runtime-triggers-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10i-runtime-triggers-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'update_trigger or test_trigger' -q` -> `9 passed, 184 deselected`;
+    - `uv run --package framework pytest core/tests/test_trigger_fires_into_queen.py -q` -> `7 passed`.
+  - outcome:
+    - R10I completed as `keep_local` (runtime TriggerDefinition contract retained with green trigger bundles).
+  - `Current Focus` moved to item `346`.
+
+346. `P1` Wave16-R10J Routes Config AppKey Contract Refresh Lane
+- Status: `done`
+- Scope:
+  - evaluate residual lane in `core/framework/server/routes_config.py`;
+  - verify typed AppKey access (`APP_KEY_MANAGER`, `APP_KEY_CREDENTIAL_STORE`) does not regress llm config/model contract;
+  - capture bounded decision with available model/provider regression evidence.
+- Done when:
+  - R10J decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted model/provider bundles are classified (pass or out-of-lane drift);
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10I completed with trigger contract bundle green.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10j-routes-config-appkey-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10j-routes-config-appkey-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_routes_config_appkey_contract.py -q` -> `3 passed`;
+    - `uv run --package framework pytest core/tests/test_litellm_provider.py -q` -> `100 passed`;
+  - out-of-lane drift observed:
+    - `uv run --package framework pytest core/tests/test_model_catalog.py -q` -> `5 failed, 9 passed` (catalog expectation drift unrelated to routes_config AppKey access; requires separate catalog baseline lane).
+  - outcome:
+    - R10J completed as `keep_local` (typed AppKey contract retained with focused tests + provider bundle green).
+  - `Current Focus` moved to item `347`.
+
+347. `P1` Wave16-R10K Model Catalog Baseline Drift Lane
+- Status: `done`
+- Scope:
+  - evaluate baseline drift between `core/framework/llm/model_catalog.json` and `core/tests/test_model_catalog.py`;
+  - classify authoritative source (`catalog` vs test expectations) for frontier model/provider metadata;
+  - capture bounded decision with model/provider regression evidence.
+- Done when:
+  - R10K decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - model-catalog suite is either green or explicitly reconciled with bounded baseline notes;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10J completed with AppKey routes-config contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10k-model-catalog-baseline-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10k-model-catalog-baseline-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_model_catalog.py -q` -> `14 passed`;
+    - `uv run --package framework pytest core/tests/test_litellm_provider.py -q` -> `100 passed`.
+  - outcome:
+    - R10K completed as `reconcile` (test baseline aligned to current local `model_catalog.json` authority; runtime catalog unchanged).
+  - `Current Focus` moved to item `348`.
+
+348. `P1` Wave16-R10L Model Catalog Consumer Contract Lane
+- Status: `done`
+- Scope:
+  - verify reconciled `model_catalog` baseline is consumed consistently by provider/runtime and routes-config model application paths;
+  - ensure AppKey-configured provider behavior and catalog metadata contract remain synchronized;
+  - capture bounded decision with consumer-side regression evidence.
+- Done when:
+  - R10L decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - model-catalog/provider/routes-config consumer contract tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10K completed with catalog baseline reconcile evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10l-model-catalog-consumer-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10l-model-catalog-consumer-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/tests/test_model_catalog.py -q` -> `14 passed`;
+    - `uv run --package framework pytest core/tests/test_litellm_provider.py -q` -> `100 passed`;
+    - `uv run --package framework pytest core/tests/test_routes_config_appkey_contract.py -q` -> `3 passed`.
+  - outcome:
+    - R10L completed as `keep_local` (consumer-contract bundle green; no runtime/catalog code mutation required).
+  - `Current Focus` moved to item `349`.
+
+349. `P1` Wave16-R10M Execution Template Model-Profile Propagation Lane
+- Status: `done`
+- Scope:
+  - verify `execution_template`/`model_profile` values propagate consistently from project API payloads into runtime worker/session handoff;
+  - ensure routes-config model-catalog baseline remains aligned with project execution-template contracts;
+  - capture bounded decision with API + session-manager contract evidence.
+- Done when:
+  - R10M decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - project execution-template API and session worker-handoff model-profile bundles are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10L completed with model-catalog consumer contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10m-execution-template-model-profile-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10m-execution-template-model-profile-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'project_execution_template' -q` -> `2 passed, 191 deselected`;
+    - `uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q` -> `9 passed`.
+  - outcome:
+    - R10M completed as `keep_local` (execution-template/model-profile propagation contract stayed green without code changes).
+  - `Current Focus` moved to item `350`.
+
+350. `P1` Wave16-R10N Autonomous Pipeline Stage-Profile Contract Lane
+- Status: `done`
+- Scope:
+  - verify autonomous backlog/pipeline routes keep stage-specific `model_profile` contract intact (`design/implement/review/validate`);
+  - ensure project execution-template defaults and pipeline dispatch semantics remain synchronized;
+  - capture bounded decision with pipeline contract regression evidence.
+- Done when:
+  - R10N decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted autonomous pipeline contract tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10M completed with execution-template/model-profile propagation evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10n-autonomous-pipeline-stage-profile-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10n-autonomous-pipeline-stage-profile-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'backlog_create_ci_first_contract_with_service_matrix or backlog_and_pipeline_happy_path or pipeline_dispatch_next_picks_highest_priority_todo or pipeline_escalates_on_review_after_retries' -q` -> `4 passed, 189 deselected`.
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'backlog_ or pipeline_' -q` -> `42 passed, 151 deselected`;
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'project_execution_template_defaults_and_update or project_execution_template_rejects_invalid_payload' -q` -> `2 passed, 191 deselected`.
+  - outcome:
+    - R10N completed as `keep_local` (autonomous stage-profile contract validated on expanded pipeline bundle; no code changes required).
+  - `Current Focus` moved to item `351`.
+
+351. `P1` Wave16-R10O Autonomous GitHub Evaluate + Auto-Next Policy Contract Lane
+- Status: `done`
+- Scope:
+  - verify autonomous GitHub evaluation ingestion and report synthesis contract remain stable;
+  - verify `auto_next` policy behavior (`success`/`manual_pending`) remains aligned with project execution-template defaults;
+  - capture bounded decision with endpoint-level regression evidence.
+- Done when:
+  - R10O decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted `pipeline_evaluate_github` + `pipeline_auto_next` contract tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10N completed with expanded autonomous pipeline contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10o-autonomous-github-evaluate-auto-next-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10o-autonomous-github-evaluate-auto-next-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github or pipeline_auto_next' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R10O completed as `keep_local` (GitHub evaluate + auto-next policy contracts validated without runtime changes).
+  - `Current Focus` moved to item `352`.
+
+352. `P1` Wave16-R10P Autonomous Run-Until-Terminal + Execute-Next Contract Lane
+- Status: `done`
+- Scope:
+  - verify `run_until_terminal` lifecycle contract remains stable (terminal detection, conflict handling, summary/report continuity);
+  - verify `execute_next` endpoint contract remains stable for backlog dispatch and empty-queue behavior;
+  - capture bounded decision with endpoint-contract regression evidence.
+- Done when:
+  - R10P decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted `pipeline_run_until_terminal` + `pipeline_execute_next` tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10O completed with GitHub evaluate + auto-next policy contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10p-autonomous-run-terminal-execute-next-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10p-autonomous-run-terminal-execute-next-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_run_until_terminal or pipeline_execute_next' -q` -> `4 passed, 189 deselected`.
+  - outcome:
+    - R10P completed as `keep_local` (run-until-terminal + execute-next endpoint contracts validated without code changes).
+  - `Current Focus` moved to item `353`.
+
+353. `P1` Wave16-R10Q Autonomous Loop Run-Cycle + Tick-All Contract Lane
+- Status: `done`
+- Scope:
+  - verify `pipeline_loop_tick_all` endpoint contract (project-id validation + dispatch semantics) remains stable;
+  - verify `pipeline_loop_run_cycle` contract (max_steps validation, terminal/pr-ready summary, report endpoint coupling) remains stable;
+  - capture bounded decision with loop-control endpoint regression evidence.
+- Done when:
+  - R10Q decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted `pipeline_loop_run_cycle` + `pipeline_loop_tick_all` tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10P completed with run-until-terminal/execute-next contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10q-autonomous-loop-cycle-tickall-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10q-autonomous-loop-cycle-tickall-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle or pipeline_loop_tick_all' -q` -> `7 passed, 186 deselected`.
+  - outcome:
+    - R10Q completed as `keep_local` (loop run-cycle/tick-all endpoint contracts validated without runtime changes).
+  - `Current Focus` moved to item `354`.
+
+354. `P1` Wave16-R10R Autonomous Loop Tick-Resolution Transition Contract Lane
+- Status: `done`
+- Scope:
+  - verify `pipeline_loop_tick` transition handling for event-log completion/failure signals remains stable;
+  - verify terminal worker completion resolution paths remain stable (including no execution event and unloaded session scenarios);
+  - capture bounded decision with loop state-transition regression evidence.
+- Done when:
+  - R10R decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tick-resolution transition tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10Q completed with loop run-cycle/tick-all contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10r-autonomous-loop-tick-resolution-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10r-autonomous-loop-tick-resolution-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_ignores_queen_active_stream_when_worker_completed or pipeline_loop_tick_resolves_when_terminal_worker_completed_without_execution_event or pipeline_loop_tick_resolves_from_worker_completed_when_session_not_loaded or pipeline_loop_tick_resolves_execution_failed_from_event_log' -q` -> `5 passed, 188 deselected`.
+  - outcome:
+    - R10R completed as `keep_local` (tick-resolution transition contracts validated without runtime changes).
+  - `Current Focus` moved to item `355`.
+
+355. `P1` Wave16-R10S Autonomous Loop Tick Heartbeat + Dispatch Contract Lane
+- Status: `done`
+- Scope:
+  - verify loop tick dispatch semantics when idle and when active execution already exists;
+  - verify heartbeat update semantics while execution remains running;
+  - capture bounded decision with loop dispatch/heartbeat regression evidence.
+- Done when:
+  - R10S decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted loop dispatch/heartbeat tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10R completed with tick-resolution transition contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10s-autonomous-loop-tick-heartbeat-dispatch-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10s-autonomous-loop-tick-heartbeat-dispatch-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_dispatches_next_when_idle or pipeline_loop_tick_returns_await_execution_for_active_execution_run or pipeline_loop_tick_updates_execution_heartbeat_while_running or pipeline_dispatch_next_rejects_when_active_run_exists' -q` -> `4 passed, 189 deselected`.
+  - outcome:
+    - R10S completed as `keep_local` (loop tick heartbeat/dispatch contracts validated without runtime changes).
+  - `Current Focus` moved to item `356`.
+
+356. `P1` Wave16-R10T Autonomous Evaluate + Report Endpoint Contract Lane
+- Status: `done`
+- Scope:
+  - verify evaluate endpoint contract for checks ingestion and status normalization remains stable;
+  - verify report endpoint continuity and coupling with evaluate results remains stable;
+  - capture bounded decision with evaluate/report endpoint regression evidence.
+- Done when:
+  - R10T decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted evaluate/report endpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10S completed with tick heartbeat/dispatch contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10t-autonomous-evaluate-report-endpoint-contract-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10t-autonomous-evaluate-report-endpoint-contract-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_endpoint_accepts_status_field or pipeline_report_endpoint' -q` -> `3 passed, 190 deselected`.
+  - outcome:
+    - R10T completed as `keep_local` (evaluate/report endpoint contracts validated without runtime changes).
+  - `Current Focus` moved to item `357`.
+
+357. `P1` Wave16-R10U Autonomous Run-Cycle Reporting Continuity Lane
+- Status: `done`
+- Scope:
+  - verify run-cycle summary outcomes contract remains stable across non-terminal/terminal variants;
+  - verify run-cycle report endpoint continuity remains stable and aligned with aggregated pipeline report endpoint;
+  - capture bounded decision with reporting-contract regression evidence.
+- Done when:
+  - R10U decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted run-cycle reporting continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10T completed with evaluate/report endpoint contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10u-autonomous-run-cycle-reporting-continuity-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10u-autonomous-run-cycle-reporting-continuity-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q` -> `4 passed, 189 deselected`.
+  - outcome:
+    - R10U completed as `keep_local` (run-cycle reporting continuity contracts validated without runtime changes).
+  - `Current Focus` moved to item `358`.
+
+358. `P1` Wave16-R10V Autonomous Loop-Control Input Validation Contract Lane
+- Status: `done`
+- Scope:
+  - verify `pipeline_loop_tick_all` input validation remains stable for invalid project_ids payloads;
+  - verify `pipeline_loop_run_cycle` endpoint accepts valid payloads and rejects invalid `max_steps`;
+  - capture bounded decision with loop-control input-validation contract evidence.
+- Done when:
+  - R10V decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted loop-control input-validation tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10U completed with run-cycle reporting continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10v-autonomous-loop-control-input-validation-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10v-autonomous-loop-control-input-validation-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_all_rejects_non_array_project_ids or pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_rejects_invalid_max_steps' -q` -> `3 passed, 190 deselected`.
+  - outcome:
+    - R10V completed as `keep_local` (loop-control input-validation contracts validated without runtime changes).
+  - `Current Focus` moved to item `359`.
+
+359. `P1` Wave16-R10W Autonomous Backlog Create/Update Contract Continuity Lane
+- Status: `done`
+- Scope:
+  - verify backlog create contract remains stable for CI-first defaults and docker-lane fallback behavior;
+  - verify backlog update contract remains stable for validation mode override semantics;
+  - verify repo/ref inheritance defaults from project context remain stable in backlog create flow.
+- Done when:
+  - R10W decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted autonomous backlog create/update contract tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10V completed with loop-control input-validation contract evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10w-autonomous-backlog-contract-continuity-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10w-autonomous-backlog-contract-continuity-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'backlog_create_ci_first_contract_with_service_matrix or backlog_create_defaults_to_ci_first_when_docker_lane_disabled or backlog_update_validation_contract_and_mode_override or backlog_create_defaults_repo_and_branch_from_project or backlog_and_pipeline_happy_path or pipeline_dispatch_next_picks_highest_priority_todo' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R10W completed as `keep_local` (backlog create/update continuity contracts validated without runtime changes).
+  - `Current Focus` moved to item `360`.
+
+360. `P1` Wave16-R10X Autonomous Execution Dispatch Lifecycle Continuity Lane
+- Status: `done`
+- Scope:
+  - verify execution dispatch lifecycle remains stable for `run_create` trigger path and `execute_next` endpoint behavior;
+  - verify empty-backlog handling and highest-priority dispatch ordering remain stable;
+  - capture bounded decision with dispatch-lifecycle regression evidence.
+- Done when:
+  - R10X decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted dispatch lifecycle tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10W completed with backlog create/update continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10x-autonomous-execution-dispatch-lifecycle-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10x-autonomous-execution-dispatch-lifecycle-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_run_create_with_session_triggers_execution or pipeline_execute_next_endpoint or pipeline_execute_next_empty_backlog or pipeline_dispatch_next_picks_highest_priority_todo' -q` -> `4 passed, 189 deselected`.
+  - outcome:
+    - R10X completed as `keep_local` (execution dispatch lifecycle contracts validated without runtime changes).
+  - `Current Focus` moved to item `361`.
+
+361. `P1` Wave16-R10Y Autonomous GitHub Evaluate + Auto-Next Extended Continuity Lane
+- Status: `done`
+- Scope:
+  - verify GitHub evaluate endpoint continuity for PR review-feedback ingestion and summary-comment publish path;
+  - verify auto-next policy continuity across success/manual-pending/no-token variants;
+  - capture bounded decision with extended GitHub evaluate/auto-next contract evidence.
+- Done when:
+  - R10Y decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted extended GitHub evaluate/auto-next tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10X completed with execution dispatch lifecycle continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10y-autonomous-github-evaluate-auto-next-extended-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10y-autonomous-github-evaluate-auto-next-extended-continuity-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_endpoint or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_rejects_execution_stage or pipeline_auto_next_deferred_without_token_in_manual_mode' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R10Y completed as `keep_local` (extended GitHub evaluate/auto-next continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `362`.
+
+362. `P1` Wave16-R10Z Autonomous GitHub Evaluate + Auto-Next Mixed Payload + Fallback Continuity Lane
+- Status: `done`
+- Scope:
+  - verify evaluate contract continuity under mixed/missing GitHub payload fields (`checks`, `review_feedback`, `pr_url`) remains stable;
+  - verify auto-next fallback/deferred behavior continuity when evaluate summary is partial or intentionally constrained by policy;
+  - capture bounded decision with endpoint-level mixed-payload and fallback continuity evidence.
+- Done when:
+  - R10Z decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted evaluate/auto-next mixed payload + fallback tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10Y completed with extended evaluate/auto-next continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r10z-autonomous-github-evaluate-auto-next-mixed-fallback-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r10z-autonomous-github-evaluate-auto-next-mixed-fallback-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_evaluate_endpoint_accepts_status_field or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_endpoint' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R10Z completed as `keep_local` (mixed payload + fallback continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `363`.
+
+363. `P1` Wave16-R11A Autonomous Evaluate/Dispatch Edge Continuity Lane
+- Status: `done`
+- Scope:
+  - verify continuity between evaluate/auto-next outcomes and dispatch transitions (`queued`/`in_progress`/`terminal`) in edge sequencing;
+  - verify report/read-model endpoints remain consistent immediately after auto-next decision edges;
+  - capture bounded decision with end-to-end autonomous edge continuity evidence.
+- Done when:
+  - R11A decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted evaluate/dispatch edge continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R10Z completed with mixed payload + fallback continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11a-autonomous-evaluate-dispatch-edge-continuity-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11a-autonomous-evaluate-dispatch-edge-continuity-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_auto_next_endpoint or pipeline_execute_next_endpoint or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_report_endpoint or pipeline_run_create_with_session_triggers_execution or pipeline_loop_tick_dispatches_next_when_idle' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11A completed as `keep_local` (evaluate/dispatch edge continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `364`.
+
+364. `P1` Wave16-R11B Autonomous Run-Cycle + Auto-Next Report Coupling Continuity Lane
+- Status: `done`
+- Scope:
+  - verify run-cycle summary/report continuity remains stable when chained with auto-next decision outputs;
+  - verify report endpoint/read-model consistency across deferred/manual and successful auto-next branches;
+  - capture bounded decision with run-cycle + auto-next coupling continuity evidence.
+- Done when:
+  - R11B decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted run-cycle/report/auto-next coupling tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11A completed with evaluate/dispatch edge continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11b-autonomous-run-cycle-auto-next-report-coupling-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11b-autonomous-run-cycle-auto-next-report-coupling-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11B completed as `keep_local` (run-cycle/auto-next/report coupling bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `365`.
+
+365. `P1` Wave16-R11C Autonomous Loop Tick-All + Run-Cycle Integration Continuity Lane
+- Status: `done`
+- Scope:
+  - verify loop `tick_all` integration continuity with run-cycle endpoints under mixed project selection semantics;
+  - verify run-cycle/report continuity remains stable after tick_all-driven dispatch paths;
+  - capture bounded decision with loop-integration edge continuity evidence.
+- Done when:
+  - R11C decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tick_all + run-cycle integration tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11B completed with run-cycle/auto-next/report coupling continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11c-autonomous-loop-tickall-run-cycle-integration-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11c-autonomous-loop-tickall-run-cycle-integration-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_all_rejects_non_array_project_ids or pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_rejects_invalid_max_steps or pipeline_loop_tick_dispatches_next_when_idle or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11C completed as `keep_local` (tick_all/run-cycle integration bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `366`.
+
+366. `P1` Wave16-R11D Autonomous Loop Tick-Resolution + Run-Cycle Terminal Coupling Lane
+- Status: `done`
+- Scope:
+  - verify loop tick-resolution transitions remain stable when coupled with run-cycle terminal/pr-ready aggregation;
+  - verify run-cycle terminal outcome reporting remains consistent after tick-derived completion/failure edges;
+  - capture bounded decision with tick-resolution + terminal-coupling continuity evidence.
+- Done when:
+  - R11D decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tick-resolution + run-cycle terminal coupling tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11C completed with tick_all/run-cycle integration continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11d-autonomous-loop-tick-resolution-run-cycle-terminal-coupling-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11d-autonomous-loop-tick-resolution-run-cycle-terminal-coupling-execution-2026-04-26.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_loop_tick_resolves_when_terminal_worker_completed_without_execution_event or pipeline_loop_tick_resolves_from_worker_completed_when_session_not_loaded or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11D completed as `keep_local` (tick-resolution/run-cycle terminal coupling bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `367`.
+
+367. `P1` Wave16-R11E Autonomous Evaluate + Report Read-Model Coupling Continuity Lane
+- Status: `done`
+- Scope:
+  - verify evaluate endpoint status/checks ingestion remains consistently reflected by report read-model views;
+  - verify report endpoint continuity after evaluate-path updates under mixed status-field payloads;
+  - capture bounded decision with evaluate/report coupling continuity evidence.
+- Done when:
+  - R11E decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted evaluate/report read-model coupling tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11D completed with tick-resolution/run-cycle terminal coupling continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11e-autonomous-evaluate-report-readmodel-coupling-precheck-2026-04-26.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11e-autonomous-evaluate-report-readmodel-coupling-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_endpoint_accepts_status_field or pipeline_report_endpoint or pipeline_evaluate_github_endpoint or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_evaluate_github_no_checks_success_policy' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11E completed as `keep_local` (evaluate/report read-model coupling bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `368`.
+
+368. `P1` Wave16-R11F Autonomous GitHub Evaluate + Auto-Next Policy Edge Continuity Lane
+- Status: `done`
+- Scope:
+  - verify GitHub evaluate continuity when policy-related payload edges are present (`no_checks`, missing token, manual pending);
+  - verify auto-next policy outcomes stay consistent across deferred/success/reject branches;
+  - capture bounded decision with GitHub evaluate + auto-next policy-edge continuity evidence.
+- Done when:
+  - R11F decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted GitHub evaluate + auto-next policy-edge tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11E completed with evaluate/report read-model coupling continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11f-autonomous-github-evaluate-auto-next-policy-edge-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11f-autonomous-github-evaluate-auto-next-policy-edge-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_rejects_execution_stage or pipeline_auto_next_deferred_without_token_in_manual_mode' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11F completed as `keep_local` (GitHub evaluate/auto-next policy-edge bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `369`.
+
+369. `P1` Wave16-R11G Autonomous GitHub Review-Feedback + Report Coupling Continuity Lane
+- Status: `done`
+- Scope:
+  - verify GitHub review-feedback ingestion remains reflected in evaluate report payloads;
+  - verify summary-comment publish path continuity and report read-model stability across GitHub evaluate updates;
+  - capture bounded decision with review-feedback/report coupling continuity evidence.
+- Done when:
+  - R11G decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted GitHub review-feedback/report coupling tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11F completed with GitHub evaluate/auto-next policy-edge continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11g-autonomous-github-review-feedback-report-coupling-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11g-autonomous-github-review-feedback-report-coupling-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_endpoint or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_report_endpoint' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11G completed as `keep_local` (GitHub review-feedback/report coupling bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `370`.
+
+370. `P1` Wave16-R11H Autonomous GitHub Evaluate + Auto-Next Full-Contract Continuity Lane
+- Status: `done`
+- Scope:
+  - verify full GitHub evaluate contract continuity across review-feedback ingestion, summary-comment publish, no-checks policy, and PR URL fallback;
+  - verify auto-next full policy branch continuity (`success`, `manual_pending`, `deferred_without_token`, `reject_execution_stage`);
+  - capture bounded decision with full-contract GitHub evaluate/auto-next continuity evidence.
+- Done when:
+  - R11H decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted full-contract GitHub evaluate/auto-next tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11G completed with GitHub review-feedback/report coupling continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11h-autonomous-github-evaluate-auto-next-full-contract-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11h-autonomous-github-evaluate-auto-next-full-contract-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_endpoint or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_rejects_execution_stage or pipeline_auto_next_deferred_without_token_in_manual_mode' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R11H completed as `keep_local` (full-contract GitHub evaluate/auto-next bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `371`.
+
+371. `P1` Wave16-R11I Autonomous Run-Cycle + Report + Auto-Next Convergence Continuity Lane
+- Status: `done`
+- Scope:
+  - verify run-cycle summary/report continuity remains stable when combined with auto-next outcomes in one convergence path;
+  - verify report endpoint consistency across `terminal`, `pr_ready`, and `manual_pending` outcome branches;
+  - capture bounded decision with run-cycle/report/auto-next convergence continuity evidence.
+- Done when:
+  - R11I decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted convergence continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11H completed with full-contract GitHub evaluate/auto-next continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11i-autonomous-run-cycle-report-auto-next-convergence-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11i-autonomous-run-cycle-report-auto-next-convergence-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11I completed as `keep_local` (run-cycle/report/auto-next convergence bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `372`.
+
+372. `P1` Wave16-R11J Autonomous Loop-Tick + Dispatch + Report Convergence Continuity Lane
+- Status: `done`
+- Scope:
+  - verify loop tick dispatch semantics remain stable when converging into report/read-model updates;
+  - verify dispatch edge states (`idle`, `active run`, `reject active`) stay consistent with report surface after loop transitions;
+  - capture bounded decision with loop-tick/dispatch/report convergence continuity evidence.
+- Done when:
+  - R11J decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted loop-tick/dispatch/report convergence tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11I completed with run-cycle/report/auto-next convergence continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11j-autonomous-loop-tick-dispatch-report-convergence-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11j-autonomous-loop-tick-dispatch-report-convergence-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_dispatches_next_when_idle or pipeline_loop_tick_returns_await_execution_for_active_execution_run or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_execute_next_endpoint or pipeline_report_endpoint or pipeline_run_create_with_session_triggers_execution' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11J completed as `keep_local` (loop-tick/dispatch/report convergence bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `373`.
+
+373. `P1` Wave16-R11K Autonomous Loop-Heartbeat + Tick-All + Report Convergence Continuity Lane
+- Status: `done`
+- Scope:
+  - verify loop heartbeat updates and tick-all orchestration remain consistent with report/read-model continuity;
+  - verify tick-all dispatch outcomes across mixed project-id inputs remain reflected in reporting surface;
+  - capture bounded decision with loop-heartbeat/tick-all/report convergence continuity evidence.
+- Done when:
+  - R11K decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted loop-heartbeat/tick-all/report convergence tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11J completed with loop-tick/dispatch/report convergence continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11k-autonomous-loop-heartbeat-tickall-report-convergence-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11k-autonomous-loop-heartbeat-tickall-report-convergence-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_updates_execution_heartbeat_while_running or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_all_rejects_non_array_project_ids or pipeline_loop_tick_dispatches_next_when_idle or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11K completed as `keep_local` (loop-heartbeat/tick-all/report convergence bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `374`.
+
+374. `P1` Wave16-R11L Autonomous Tick-Resolution + Tick-All + Report Edge Continuity Lane
+- Status: `done`
+- Scope:
+  - verify tick-resolution transitions remain consistent when combined with tick-all orchestration paths;
+  - verify report/read-model continuity after tick-derived completion/failure edges triggered within tick-all flows;
+  - capture bounded decision with tick-resolution/tick-all/report edge continuity evidence.
+- Done when:
+  - R11L decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tick-resolution/tick-all/report edge tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11K completed with loop-heartbeat/tick-all/report convergence continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11l-autonomous-tick-resolution-tickall-report-edge-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11l-autonomous-tick-resolution-tickall-report-edge-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_all_rejects_non_array_project_ids or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11L completed as `keep_local` (tick-resolution/tick-all/report edge bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `375`.
+
+375. `P1` Wave16-R11M Autonomous Tick-Active-Stream + Heartbeat + Report Edge Continuity Lane
+- Status: `done`
+- Scope:
+  - verify tick handling around active-stream and worker-completed edges remains consistent with heartbeat/report updates;
+  - verify heartbeat update continuity does not regress report/read-model state across active execution paths;
+  - capture bounded decision with tick-active-stream/heartbeat/report edge continuity evidence.
+- Done when:
+  - R11M decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tick-active-stream/heartbeat/report edge tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11L completed with tick-resolution/tick-all/report edge continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11m-autonomous-tick-active-stream-heartbeat-report-edge-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11m-autonomous-tick-active-stream-heartbeat-report-edge-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_returns_await_execution_for_active_execution_run or pipeline_loop_tick_updates_execution_heartbeat_while_running or pipeline_loop_tick_ignores_queen_active_stream_when_worker_completed or pipeline_loop_tick_resolves_from_worker_completed_when_session_not_loaded or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11M completed as `keep_local` (tick-active-stream/heartbeat/report edge bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `376`.
+
+376. `P1` Wave16-R11N Autonomous Run-Cycle Input-Validation + Report Continuity Lane
+- Status: `done`
+- Scope:
+  - verify run-cycle input-validation semantics remain stable (`max_steps`, payload shape) while report surfaces remain consistent;
+  - verify run-cycle/report endpoints remain aligned after validation accept/reject branches;
+  - capture bounded decision with run-cycle input-validation/report continuity evidence.
+- Done when:
+  - R11N decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted run-cycle input-validation/report continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11M completed with tick-active-stream/heartbeat/report edge continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11n-autonomous-run-cycle-input-validation-report-continuity-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11n-autonomous-run-cycle-input-validation-report-continuity-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_rejects_invalid_max_steps or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11N completed as `keep_local` (run-cycle input-validation/report continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `377`.
+
+377. `P1` Wave16-R11O Autonomous Auto-Next Input-Validation + Report Continuity Lane
+- Status: `done`
+- Scope:
+  - verify auto-next input-validation and branch selection semantics remain stable across `success`/`manual_pending`/`deferred`/`reject` paths;
+  - verify report/read-model continuity remains stable after auto-next decisions and mixed status payload handling;
+  - capture bounded decision with auto-next input-validation/report continuity evidence.
+- Done when:
+  - R11O decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted auto-next input-validation/report continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11N completed with run-cycle input-validation/report continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11o-autonomous-auto-next-input-validation-report-continuity-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11o-autonomous-auto-next-input-validation-report-continuity-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_rejects_execution_stage or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_evaluate_endpoint_accepts_status_field or pipeline_report_endpoint' -q` -> `6 passed, 187 deselected`.
+  - outcome:
+    - R11O completed as `keep_local` (auto-next input-validation/report continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `378`.
+
+378. `P1` Wave16-R11P Autonomous GitHub Evaluate + Auto-Next + Report Cross-Edge Continuity Lane
+- Status: `done`
+- Scope:
+  - verify GitHub evaluate outputs, auto-next policy decisions, and report/read-model updates remain consistent as one cross-edge flow;
+  - verify cross-edge behavior remains stable across review-feedback, no-checks policy, PR URL fallback, and manual-pending/deferred branches;
+  - capture bounded decision with GitHub evaluate/auto-next/report cross-edge continuity evidence.
+- Done when:
+  - R11P decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted cross-edge continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11O completed with auto-next input-validation/report continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11p-autonomous-github-evaluate-auto-next-report-cross-edge-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11p-autonomous-github-evaluate-auto-next-report-cross-edge-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_report_endpoint' -q` -> `8 passed, 185 deselected`.
+  - outcome:
+    - R11P completed as `keep_local` (GitHub evaluate/auto-next/report cross-edge continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `379`.
+
+379. `P1` Wave16-R11Q Autonomous Full Evaluate/Auto-Next/Report Contract Convergence Lane
+- Status: `done`
+- Scope:
+  - verify full evaluate + auto-next + report contract convergence remains stable across direct evaluate and GitHub evaluate paths;
+  - verify report/read-model continuity across `success`, `manual_pending`, `deferred_without_token`, and review-feedback enriched flows;
+  - capture bounded decision with full contract-convergence continuity evidence.
+- Done when:
+  - R11Q decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted full contract-convergence tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11P completed with GitHub evaluate/auto-next/report cross-edge continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11q-autonomous-full-evaluate-auto-next-report-contract-convergence-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11q-autonomous-full-evaluate-auto-next-report-contract-convergence-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_no_checks_success_policy or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R11Q completed as `keep_local` (full evaluate/auto-next/report contract convergence bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `380`.
+
+380. `P1` Wave16-R11R Autonomous Run-Cycle/Evaluate/Report Convergence Edge Lane
+- Status: `done`
+- Scope:
+  - verify run-cycle outputs remain consistent when converged with evaluate/report pathways in edge transitions;
+  - verify report/read-model continuity across run-cycle terminal/pr-ready and evaluate-driven updates;
+  - capture bounded decision with run-cycle/evaluate/report convergence edge evidence.
+- Done when:
+  - R11R decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted run-cycle/evaluate/report convergence edge tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11Q completed with full evaluate/auto-next/report contract convergence evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11r-autonomous-run-cycle-evaluate-report-convergence-edge-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11r-autonomous-run-cycle-evaluate-report-convergence-edge-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_run_cycle_report_endpoint or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_endpoint_accepts_status_field or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `8 passed, 185 deselected`.
+  - outcome:
+    - R11R completed as `keep_local` (run-cycle/evaluate/report convergence edge bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `381`.
+
+381. `P1` Wave16-R11S Autonomous Tick-All/Dispatch + Evaluate/Report Convergence Lane
+- Status: `done`
+- Scope:
+  - verify tick-all and dispatch transitions remain consistent when converged with evaluate/report update paths;
+  - verify report/read-model continuity across idle/active/reject dispatch edges combined with evaluate outcomes;
+  - capture bounded decision with tick-all/dispatch + evaluate/report convergence evidence.
+- Done when:
+  - R11S decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tick-all/dispatch + evaluate/report convergence tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11R completed with run-cycle/evaluate/report convergence edge evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11s-autonomous-tickall-dispatch-evaluate-report-convergence-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11s-autonomous-tickall-dispatch-evaluate-report-convergence-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_all_endpoint or pipeline_loop_tick_all_rejects_non_array_project_ids or pipeline_loop_tick_dispatches_next_when_idle or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `8 passed, 185 deselected`.
+  - outcome:
+    - R11S completed as `keep_local` (tick-all/dispatch + evaluate/report convergence bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `382`.
+
+382. `P1` Wave16-R11T Autonomous Tick-Resolution/Dispatch + Evaluate/Report Cross-Edge Lane
+- Status: `done`
+- Scope:
+  - verify tick-resolution completion/failure edges remain consistent with dispatch/evaluate/report transitions;
+  - verify report/read-model continuity across tick-derived completion paths and evaluate-driven updates;
+  - capture bounded decision with tick-resolution/dispatch + evaluate/report cross-edge evidence.
+- Done when:
+  - R11T decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted tick-resolution/dispatch + evaluate/report cross-edge tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11S completed with tick-all/dispatch + evaluate/report convergence evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11t-autonomous-tick-resolution-dispatch-evaluate-report-cross-edge-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11t-autonomous-tick-resolution-dispatch-evaluate-report-cross-edge-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_loop_tick_dispatches_next_when_idle or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `8 passed, 185 deselected`.
+  - outcome:
+    - R11T completed as `keep_local` (tick-resolution/dispatch + evaluate/report cross-edge bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `383`.
+
+383. `P1` Wave16-R11U Autonomous Full Tick/Evaluate/Auto-Next/Report Convergence Lane
+- Status: `done`
+- Scope:
+  - verify full convergence of tick-resolution/tick-all dispatch edges with evaluate, auto-next, and report pathways;
+  - verify report/read-model continuity across completion/failure tick edges plus policy branches (`success`, `manual_pending`, `deferred`, `reject`);
+  - capture bounded decision with full tick/evaluate/auto-next/report convergence evidence.
+- Done when:
+  - R11U decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted full convergence tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11T completed with tick-resolution/dispatch + evaluate/report cross-edge evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11u-autonomous-full-tick-evaluate-auto-next-report-convergence-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11u-autonomous-full-tick-evaluate-auto-next-report-convergence-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_all_endpoint or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R11U completed as `keep_local` (full tick/evaluate/auto-next/report convergence bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `384`.
+
+384. `P1` Wave16-R11V Autonomous Full Tick-Resolution/Dispatch/Evaluate/Auto-Next/Report Edge Lane
+- Status: `done`
+- Scope:
+  - verify full convergence remains stable including tick-resolution completion/failure edges plus dispatch/evaluate/auto-next/report pathways;
+  - verify report/read-model continuity across completion/failure edges combined with policy outcomes and GitHub evaluate enrichments;
+  - capture bounded decision with full edge-convergence evidence.
+- Done when:
+  - R11V decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted full edge-convergence tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11U completed with full tick/evaluate/auto-next/report convergence evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11v-autonomous-full-tick-resolution-dispatch-evaluate-auto-next-report-edge-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11v-autonomous-full-tick-resolution-dispatch-evaluate-auto-next-report-edge-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_dispatches_next_when_idle or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R11V completed as `keep_local` (full tick-resolution/dispatch/evaluate/auto-next/report edge bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `385`.
+
+385. `P1` Wave16-R11W Autonomous Full Tick-Dispatch/Evaluate/Auto-Next/Report Policy-Enriched Convergence Lane
+- Status: `done`
+- Scope:
+  - verify full convergence remains stable for tick/dispatch + evaluate/auto-next/report with policy-enriched branches and GitHub feedback paths;
+  - verify report/read-model continuity across completion/failure, success/manual_pending/deferred/reject, and comment-publish flows;
+  - capture bounded decision with policy-enriched full convergence evidence.
+- Done when:
+  - R11W decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted policy-enriched full convergence tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11V completed with full tick-resolution/dispatch/evaluate/auto-next/report edge convergence evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11w-autonomous-full-tick-dispatch-evaluate-auto-next-report-policy-enriched-convergence-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11w-autonomous-full-tick-dispatch-evaluate-auto-next-report-policy-enriched-convergence-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_loop_tick_all_endpoint or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_report_endpoint' -q` -> `12 passed, 181 deselected`.
+  - outcome:
+    - R11W completed as `keep_local` (policy-enriched full convergence bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `386`.
+
+386. `P1` Wave16-R11X Autonomous Run-Cycle + Full Tick-Dispatch/Evaluate/Auto-Next/Report Super-Convergence Lane
+- Status: `done`
+- Scope:
+  - verify super-convergence remains stable across run-cycle and full tick/dispatch/evaluate/auto-next/report pathways;
+  - verify report/read-model continuity across completion/failure, success/manual_pending/deferred/reject, comment-publish, and run-cycle terminal paths;
+  - capture bounded decision with super-convergence evidence.
+- Done when:
+  - R11X decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted super-convergence tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11W completed with policy-enriched full convergence evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11x-autonomous-run-cycle-full-tick-dispatch-evaluate-auto-next-report-super-convergence-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11x-autonomous-run-cycle-full-tick-dispatch-evaluate-auto-next-report-super-convergence-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_report_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_loop_tick_all_endpoint or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_report_endpoint' -q` -> `14 passed, 179 deselected`.
+  - outcome:
+    - R11X completed as `keep_local` (run-cycle + full tick/dispatch/evaluate/auto-next/report super-convergence bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `387`.
+
+387. `P1` Wave16-R11Y Autonomous Policy/Tick/Run-Cycle/Report Closure Lane
+- Status: `done`
+- Scope:
+  - verify closure continuity across policy branches with tick/run-cycle/report surfaces;
+  - verify report/read-model consistency holds for closure-level branch combinations before wave handoff;
+  - capture bounded decision with closure-lane evidence.
+- Done when:
+  - R11Y decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted closure-lane tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11X completed with super-convergence evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11y-autonomous-policy-tick-run-cycle-report-closure-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11y-autonomous-policy-tick-run-cycle-report-closure-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_report_endpoint' -q` -> `10 passed, 183 deselected`.
+  - outcome:
+    - R11Y completed as `keep_local` (policy/tick/run-cycle/report closure bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `388`.
+
+388. `P1` Wave16-R11Z Autonomous Final Bounded Continuity Handoff Lane
+- Status: `done`
+- Scope:
+  - verify final bounded continuity across run-cycle, tick, evaluate, auto-next, and report endpoints before wave handoff;
+  - verify handoff-level consistency across failure/reject/report update paths and review-feedback enriched branches;
+  - capture bounded decision with final continuity handoff evidence.
+- Done when:
+  - R11Z decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted final bounded continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11Y completed with policy/tick/run-cycle/report closure evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r11z-autonomous-final-bounded-continuity-handoff-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r11z-autonomous-final-bounded-continuity-handoff-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_rejects_execution_stage or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R11Z completed as `keep_local` (final bounded continuity handoff bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `389`.
+
+389. `P1` Wave16-R12A Autonomous Wave Handoff Baseline Continuity Lane
+- Status: `done`
+- Scope:
+  - verify baseline continuity for post-handoff wave across run-cycle/tick/evaluate/auto-next/report surfaces;
+  - verify report/read-model consistency remains stable for baseline handoff branches before deeper R12 expansion;
+  - capture bounded decision with Wave16-R12A baseline continuity evidence.
+- Done when:
+  - R12A decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted baseline continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R11Z completed with final bounded continuity handoff evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12a-autonomous-wave-handoff-baseline-continuity-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12a-autonomous-wave-handoff-baseline-continuity-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_report_endpoint or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R12A completed as `keep_local` (wave handoff baseline continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `390`.
+
+390. `P1` Wave16-R12B Autonomous Policy/Review Continuity Expansion Lane
+- Status: `done`
+- Scope:
+  - verify policy and review-feedback continuity expansion for Wave16-R12 across evaluate/auto-next/report flows;
+  - verify report/read-model stability across no-checks/manual-pending/deferred/reject branches with review-comment publishing path;
+  - capture bounded decision with Wave16-R12B policy/review continuity evidence.
+- Done when:
+  - R12B decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted policy/review continuity expansion tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12A completed with wave handoff baseline continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12b-autonomous-policy-review-continuity-expansion-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12b-autonomous-policy-review-continuity-expansion-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_evaluate_endpoint_accepts_status_field or pipeline_loop_tick_dispatches_next_when_idle or pipeline_report_endpoint' -q` -> `8 passed, 185 deselected`.
+  - outcome:
+    - R12B completed as `keep_local` (policy/review continuity expansion bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `391`.
+
+391. `P1` Wave16-R12C Autonomous Tick/Run-Cycle/Report Continuity Consolidation Lane
+- Status: `done`
+- Scope:
+  - verify tick + run-cycle + report continuity consolidation after Wave16-R12 policy/review expansion;
+  - verify dispatch/evaluate/report coupling remains stable for terminal and edge transitions;
+  - capture bounded decision with Wave16-R12C continuity consolidation evidence.
+- Done when:
+  - R12C decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted continuity consolidation tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12B completed with policy/review continuity expansion evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12c-autonomous-tick-run-cycle-report-continuity-consolidation-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12c-autonomous-tick-run-cycle-report-continuity-consolidation-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R12C completed as `keep_local` (tick/run-cycle/report continuity consolidation bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `392`.
+
+392. `P1` Wave16-R12D Autonomous Full Continuity Super-Bundle Stabilization Lane
+- Status: `done`
+- Scope:
+  - verify full continuity super-bundle stability across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability of policy and report/read-model surfaces under mixed terminal and edge transitions;
+  - capture bounded decision with Wave16-R12D super-bundle stabilization evidence.
+- Done when:
+  - R12D decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted super-bundle stabilization tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12C completed with tick/run-cycle/report continuity consolidation evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12d-autonomous-full-continuity-super-bundle-stabilization-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12d-autonomous-full-continuity-super-bundle-stabilization-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12D completed as `keep_local` (full continuity super-bundle stabilization bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `393`.
+
+393. `P1` Wave16-R12E Autonomous Final Wave16-R12 Closure Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify final Wave16-R12 closure checkpoint continuity across run-cycle/tick/evaluate/auto-next/report;
+  - verify closure-level stability before transition into next wave planning/execution;
+  - capture bounded decision with final Wave16-R12 closure checkpoint evidence.
+- Done when:
+  - R12E decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted final closure checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12D completed with full continuity super-bundle stabilization evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12e-autonomous-final-wave12-closure-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12e-autonomous-final-wave12-closure-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_dispatches_next_when_idle or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R12E completed as `keep_local` (final Wave16-R12 closure checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `394`.
+
+394. `P1` Wave16-R12F Autonomous Wave Transition Baseline Continuity Lane
+- Status: `done`
+- Scope:
+  - verify baseline continuity during post-closure wave transition across run-cycle/tick/evaluate/auto-next/report;
+  - verify transition checkpoint stability before subsequent lane expansion;
+  - capture bounded decision with Wave16-R12F transition baseline continuity evidence.
+- Done when:
+  - R12F decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted transition baseline continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12E completed with final Wave16-R12 closure checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12f-autonomous-wave-transition-baseline-continuity-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12f-autonomous-wave-transition-baseline-continuity-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R12F completed as `keep_local` (wave transition baseline continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `395`.
+
+395. `P1` Wave16-R12G Autonomous Wave Transition Expansion Continuity Lane
+- Status: `done`
+- Scope:
+  - verify wave transition expansion continuity across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify policy and report stability for transition-edge branch combinations;
+  - capture bounded decision with Wave16-R12G expansion continuity evidence.
+- Done when:
+  - R12G decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted transition expansion continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12F completed with wave transition baseline continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12g-autonomous-wave-transition-expansion-continuity-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12g-autonomous-wave-transition-expansion-continuity-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_dispatches_next_when_idle or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R12G completed as `keep_local` (wave transition expansion continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `396`.
+
+396. `P1` Wave16-R12H Autonomous Wave Transition Stabilization Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify transition stabilization checkpoint continuity across run-cycle/tick/evaluate/auto-next/report;
+  - verify checkpoint stability before next transition lane expansion;
+  - capture bounded decision with Wave16-R12H stabilization checkpoint evidence.
+- Done when:
+  - R12H decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted transition stabilization checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12G completed with wave transition expansion continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12h-autonomous-wave-transition-stabilization-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12h-autonomous-wave-transition-stabilization-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R12H completed as `keep_local` (wave transition stabilization checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `397`.
+
+397. `P1` Wave16-R12I Autonomous Wave Transition Stabilization Expansion Continuity Lane
+- Status: `done`
+- Scope:
+  - verify transition stabilization expansion continuity across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify policy/report stability while expanding transition checkpoint coverage;
+  - capture bounded decision with Wave16-R12I stabilization expansion continuity evidence.
+- Done when:
+  - R12I decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted stabilization expansion continuity tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12H completed with transition stabilization checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12i-autonomous-wave-transition-stabilization-expansion-continuity-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12i-autonomous-wave-transition-stabilization-expansion-continuity-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_dispatches_next_when_idle or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R12I completed as `keep_local` (wave transition stabilization expansion continuity bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `398`.
+
+398. `P1` Wave16-R12J Autonomous Wave Transition Super-Bundle Continuity Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify transition super-bundle continuity across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify policy/report stability under mixed transition-edge and terminal combinations;
+  - capture bounded decision with Wave16-R12J super-bundle checkpoint evidence.
+- Done when:
+  - R12J decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted super-bundle continuity checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12I completed with transition stabilization expansion continuity evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12j-autonomous-wave-transition-super-bundle-continuity-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12j-autonomous-wave-transition-super-bundle-continuity-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12J completed as `keep_local` (wave transition super-bundle continuity checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `399`.
+
+399. `P1` Wave16-R12K Autonomous Post-Transition Full Continuity Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify post-transition full continuity across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify policy/report stability during full checkpoint pass;
+  - capture bounded decision with Wave16-R12K post-transition continuity evidence.
+- Done when:
+  - R12K decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted post-transition full continuity checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12J completed with transition super-bundle continuity checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12k-autonomous-post-transition-full-continuity-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12k-autonomous-post-transition-full-continuity-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_report_endpoint or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12K completed as `keep_local` (post-transition full continuity checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `400`.
+
+400. `P1` Wave16-R12L Autonomous Post-Transition Full Continuity Expansion Lane
+- Status: `done`
+- Scope:
+  - verify post-transition full continuity expansion across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify policy/report stability while expanding full checkpoint coverage;
+  - capture bounded decision with Wave16-R12L post-transition expansion continuity evidence.
+- Done when:
+  - R12L decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted post-transition full continuity expansion tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12K completed with post-transition full continuity checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12l-autonomous-post-transition-full-continuity-expansion-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12l-autonomous-post-transition-full-continuity-expansion-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12L completed as `keep_local` (post-transition full continuity expansion bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `401`.
+
+401. `P1` Wave16-R12M Autonomous Post-Transition Continuity Stabilization Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify post-transition continuity stabilization checkpoint across run-cycle/tick/evaluate/auto-next/report;
+  - verify checkpoint stability before next post-transition expansion lane;
+  - capture bounded decision with Wave16-R12M stabilization checkpoint evidence.
+- Done when:
+  - R12M decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted post-transition stabilization checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12L completed with post-transition full continuity expansion evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12m-autonomous-post-transition-continuity-stabilization-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12m-autonomous-post-transition-continuity-stabilization-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_report_endpoint or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R12M completed as `keep_local` (post-transition continuity stabilization checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `402`.
+
+402. `P1` Wave16-R12N Autonomous Post-Transition Continuity Expansion Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify post-transition continuity expansion checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability while expanding post-transition checkpoint coverage;
+  - capture bounded decision with Wave16-R12N expansion checkpoint evidence.
+- Done when:
+  - R12N decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted post-transition continuity expansion checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12M completed with post-transition continuity stabilization checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12n-autonomous-post-transition-continuity-expansion-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12n-autonomous-post-transition-continuity-expansion-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12N completed as `keep_local` (post-transition continuity expansion checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `403`.
+
+403. `P1` Wave16-R12O Autonomous Post-Transition Full Continuity Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify post-transition full continuity pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability through a full checkpoint pass before next handoff;
+  - capture bounded decision with Wave16-R12O full pass checkpoint evidence.
+- Done when:
+  - R12O decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted post-transition full continuity pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12N completed with post-transition continuity expansion checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12o-autonomous-post-transition-full-continuity-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12o-autonomous-post-transition-full-continuity-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_report_endpoint or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12O completed as `keep_local` (post-transition full continuity pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `404`.
+
+404. `P1` Wave16-R12P Autonomous Post-Transition Full Continuity Expansion Pass Lane
+- Status: `done`
+- Scope:
+  - verify post-transition full continuity expansion pass across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability through expansion-pass coverage before the next wave continuation;
+  - capture bounded decision with Wave16-R12P expansion pass evidence.
+- Done when:
+  - R12P decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted post-transition full continuity expansion pass tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12O completed with post-transition full continuity pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12p-autonomous-post-transition-full-continuity-expansion-pass-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12p-autonomous-post-transition-full-continuity-expansion-pass-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12P completed as `keep_local` (post-transition full continuity expansion pass bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `405`.
+
+405. `P1` Wave16-R12Q Autonomous Post-Transition Stabilization Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify post-transition stabilization expansion pass checkpoint across run-cycle/tick/evaluate/auto-next/report;
+  - verify checkpoint stability during expansion-pass coverage before subsequent lanes;
+  - capture bounded decision with Wave16-R12Q stabilization expansion pass checkpoint evidence.
+- Done when:
+  - R12Q decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted stabilization expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12P completed with post-transition full continuity expansion pass evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12q-autonomous-post-transition-stabilization-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12q-autonomous-post-transition-stabilization-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_report_endpoint or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q` -> `9 passed, 184 deselected`.
+  - outcome:
+    - R12Q completed as `keep_local` (post-transition stabilization expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `406`.
+
+406. `P1` Wave16-R12R Autonomous Post-Transition Mixed Full+Stabilization Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition full-continuity and stabilization checkpoint behavior across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed checkpoint combinations before next continuity extension;
+  - capture bounded decision with Wave16-R12R mixed checkpoint evidence.
+- Done when:
+  - R12R decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed full+stabilization checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12Q completed with post-transition stabilization expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12r-autonomous-post-transition-mixed-full-stabilization-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12r-autonomous-post-transition-mixed-full-stabilization-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12R completed as `keep_local` (post-transition mixed full+stabilization checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `407`.
+
+407. `P1` Wave16-R12S Autonomous Post-Transition Mixed Expansion Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify post-transition mixed expansion checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed expansion checkpoint combinations before next continuity lane;
+  - capture bounded decision with Wave16-R12S mixed expansion checkpoint evidence.
+- Done when:
+  - R12S decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed expansion checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12R completed with mixed full+stabilization checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12s-autonomous-post-transition-mixed-expansion-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12s-autonomous-post-transition-mixed-expansion-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12S completed as `keep_local` (post-transition mixed expansion checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `408`.
+
+408. `P1` Wave16-R12T Autonomous Post-Transition Mixed Continuity Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify post-transition mixed continuity pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability through mixed continuity pass coverage before subsequent expansion;
+  - capture bounded decision with Wave16-R12T mixed continuity pass checkpoint evidence.
+- Done when:
+  - R12T decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed continuity pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12S completed with post-transition mixed expansion checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12t-autonomous-post-transition-mixed-continuity-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12t-autonomous-post-transition-mixed-continuity-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12T completed as `keep_local` (post-transition mixed continuity pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `409`.
+
+409. `P1` Wave16-R12U Autonomous Post-Transition Mixed Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify post-transition mixed expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability through mixed expansion-pass coverage before next continuity wave;
+  - capture bounded decision with Wave16-R12U mixed expansion pass checkpoint evidence.
+- Done when:
+  - R12U decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12T completed with post-transition mixed continuity pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12u-autonomous-post-transition-mixed-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12u-autonomous-post-transition-mixed-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12U completed as `keep_local` (post-transition mixed expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `410`.
+
+410. `P1` Wave16-R12V Autonomous Post-Transition Mixed Stabilization+Continuity Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity pass combinations before next extension lane;
+  - capture bounded decision with Wave16-R12V mixed stabilization+continuity pass checkpoint evidence.
+- Done when:
+  - R12V decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12U completed with post-transition mixed expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12v-autonomous-post-transition-mixed-stabilization-continuity-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12v-autonomous-post-transition-mixed-stabilization-continuity-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12V completed as `keep_local` (post-transition mixed stabilization+continuity pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `411`.
+
+411. `P1` Wave16-R12W Autonomous Post-Transition Mixed Stabilization+Continuity Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R12W mixed stabilization+continuity expansion pass checkpoint evidence.
+- Done when:
+  - R12W decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12V completed with post-transition mixed stabilization+continuity pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12w-autonomous-post-transition-mixed-stabilization-continuity-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12w-autonomous-post-transition-mixed-stabilization-continuity-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12W completed as `keep_local` (post-transition mixed stabilization+continuity expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `412`.
+
+412. `P1` Wave16-R12X Autonomous Post-Transition Mixed Stabilization+Continuity Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R12X mixed stabilization+continuity extension pass checkpoint evidence.
+- Done when:
+  - R12X decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12W completed with post-transition mixed stabilization+continuity expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12x-autonomous-post-transition-mixed-stabilization-continuity-extension-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12x-autonomous-post-transition-mixed-stabilization-continuity-extension-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12X completed as `keep_local` (post-transition mixed stabilization+continuity extension pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `413`.
+
+413. `P1` Wave16-R12Y Autonomous Post-Transition Mixed Stabilization+Continuity Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R12Y mixed stabilization+continuity extension expansion pass checkpoint evidence.
+- Done when:
+  - R12Y decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12X completed with post-transition mixed stabilization+continuity extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12y-autonomous-post-transition-mixed-stabilization-continuity-extension-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12y-autonomous-post-transition-mixed-stabilization-continuity-extension-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12Y completed as `keep_local` (post-transition mixed stabilization+continuity extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `414`.
+
+414. `P1` Wave16-R12Z Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R12Z mixed stabilization+continuity extension closure pass checkpoint evidence.
+- Done when:
+  - R12Z decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12Y completed with post-transition mixed stabilization+continuity extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r12z-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r12z-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R12Z completed as `keep_local` (post-transition mixed stabilization+continuity extension closure pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `415`.
+
+415. `P1` Wave16-R13A Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13A mixed stabilization+continuity extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13A decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R12Z completed with post-transition mixed stabilization+continuity extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13a-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13a-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13A completed as `keep_local` (post-transition mixed stabilization+continuity extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `416`.
+
+416. `P1` Wave16-R13B Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13B mixed stabilization+continuity extension closure extension pass checkpoint evidence.
+- Done when:
+  - R13B decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13A completed with post-transition mixed stabilization+continuity extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13b-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13b-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13B completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `417`.
+
+417. `P1` Wave16-R13C Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13C mixed stabilization+continuity extension closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13C decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13B completed with post-transition mixed stabilization+continuity extension closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13c-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13c-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13C completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `418`.
+
+418. `P1` Wave16-R13D Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13D mixed stabilization+continuity extension closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13D decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13C completed with post-transition mixed stabilization+continuity extension closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13d-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13d-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13D completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `419`.
+
+419. `P1` Wave16-R13E Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13E mixed stabilization+continuity extension closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13E decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13D completed with post-transition mixed stabilization+continuity extension closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13e-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13e-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13E completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `420`.
+
+420. `P1` Wave16-R13F Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13F mixed stabilization+continuity extension closure extension closure extension pass checkpoint evidence.
+- Done when:
+  - R13F decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13E completed with post-transition mixed stabilization+continuity extension closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13f-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13f-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13F completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `421`.
+
+421. `P1` Wave16-R13G Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13G mixed stabilization+continuity extension closure extension closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13G decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13F completed with post-transition mixed stabilization+continuity extension closure extension closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13g-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13g-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13G completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `422`.
+
+422. `P1` Wave16-R13H Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13H mixed stabilization+continuity extension closure extension closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13H decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13G completed with post-transition mixed stabilization+continuity extension closure extension closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13h-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13h-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13H completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `423`.
+
+423. `P1` Wave16-R13I Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13I mixed stabilization+continuity extension closure extension closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13I decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13H completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13i-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13i-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13I completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `424`.
+
+424. `P1` Wave16-R13J Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13J mixed stabilization+continuity extension closure extension closure extension closure extension pass checkpoint evidence.
+- Done when:
+  - R13J decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13I completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13j-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13j-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13J completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `425`.
+
+425. `P1` Wave16-R13K Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13K mixed stabilization+continuity extension closure extension closure extension closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13K decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13J completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13k-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13k-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13K completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `426`.
+
+426. `P1` Wave16-R13L Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13L mixed stabilization+continuity extension closure extension closure extension closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13L decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13K completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13l-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13l-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13L completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `427`.
+
+427. `P1` Wave16-R13M Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13M mixed stabilization+continuity extension closure extension closure extension closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13M decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13L completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13m-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13m-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13M completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `428`.
+
+428. `P1` Wave16-R13N Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13N mixed stabilization+continuity extension closure extension closure extension closure extension closure extension pass checkpoint evidence.
+- Done when:
+  - R13N decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13M completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13n-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13n-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13N completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `429`.
+
+429. `P1` Wave16-R13O Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13O mixed stabilization+continuity extension closure extension closure extension closure extension closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13O decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13N completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13o-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13o-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13O completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `430`.
+
+430. `P1` Wave16-R13P Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13P mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13P decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13O completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13p-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13p-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13P completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `431`.
+
+431. `P1` Wave16-R13Q Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13Q mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13Q decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13P completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13q-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13q-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13Q completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `432`.
+
+432. `P1` Wave16-R13R Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13R mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure pass checkpoint evidence.
+- Done when:
+  - R13R decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13Q completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13r-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13r-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13R completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `433`.
+
+433. `P1` Wave16-R13S Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13S mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13S decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13R completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13s-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13s-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-expansion-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13S completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `434`.
+
+434. `P1` Wave16-R13T Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13T mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension pass checkpoint evidence.
+- Done when:
+  - R13T decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13S completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13t-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13t-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-pass-checkpoint-execution-2026-04-27.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13T completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `435`.
+
+435. `P1` Wave16-R13U Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13U mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13U decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13T completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13u-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-expansion-pass-checkpoint-precheck-2026-04-27.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13u-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13U completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `436`.
+
+436. `P1` Wave16-R13V Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13V mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13V decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13U completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13v-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13v-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13V completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `437`.
+
+437. `P1` Wave16-R13W Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13W mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13W decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13V completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13w-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13w-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13W completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `438`.
+
+438. `P1` Wave16-R13X Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13X mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension pass checkpoint evidence.
+- Done when:
+  - R13X decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13W completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13x-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-extension-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13x-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-extension-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13X completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `439`.
+
+439. `P1` Wave16-R13Y Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13Y mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13Y decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13X completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13y-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-extension-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13y-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-extension-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13Y completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `440`.
+
+440. `P1` Wave16-R13Z Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13Z mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13Z decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13Y completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13z-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-extension-closure-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13z-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-extension-closure-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13Z completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - `Current Focus` moved to item `441`.
+
+441. `P1` Wave16-R13AA Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AA mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13AA decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13Z completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13aa-autonomous-post-transition-mixed-stabilization-continuity-extension-closure-extension-closure-extension-closure-extension-closure-extension-closure-closure-extension-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13aa-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AA completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - execution artifact slug was shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `442`.
+
+442. `P1` Wave16-R13AB Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AB mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure pass checkpoint evidence.
+- Done when:
+  - R13AB decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AA completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ab-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-closure-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ab-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-closure-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AB completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `443`.
+
+443. `P1` Wave16-R13AC Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AC mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13AC decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AB completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ac-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-closure-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ac-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-closure-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AC completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `444`.
+
+444. `P1` Wave16-R13AD Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AD mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension pass checkpoint evidence.
+- Done when:
+  - R13AD decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AC completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ad-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ad-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AD completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `445`.
+
+445. `P1` Wave16-R13AE Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AE mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13AE decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AD completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ae-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ae-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AE completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `446`.
+
+446. `P1` Wave16-R13AF Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AF mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13AF decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AE completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13af-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13af-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AF completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `447`.
+
+447. `P1` Wave16-R13AG Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AG mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13AG decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AF completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ag-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ag-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AG completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `448`.
+
+448. `P1` Wave16-R13AH Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AH mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension pass checkpoint evidence.
+- Done when:
+  - R13AH decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AG completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ah-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ah-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AH completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `449`.
+
+449. `P1` Wave16-R13AI Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AI mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13AI decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AH completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ai-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ai-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AI completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `450`.
+
+450. `P1` Wave16-R13AJ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AJ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13AJ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AI completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13aj-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13aj-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AJ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `451`.
+
+451. `P1` Wave16-R13AK Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AK mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13AK decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AJ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ak-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ak-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AK completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `452`.
+
+452. `P1` Wave16-R13AL Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AL mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure pass checkpoint evidence.
+- Done when:
+  - R13AL decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AK completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13al-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13al-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AL completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `453`.
+
+453. `P1` Wave16-R13AM Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AM mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13AM decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AL completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13am-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13am-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AM completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `454`.
+
+454. `P1` Wave16-R13AN Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AN mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension pass checkpoint evidence.
+- Done when:
+  - R13AN decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AM completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13an-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13an-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AN completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `455`.
+
+455. `P1` Wave16-R13AO Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AO mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13AO decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AN completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ao-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ao-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AO completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `456`.
+
+456. `P1` Wave16-R13AP Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AP mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13AP decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AO completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ap-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ap-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AP completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `457`.
+
+457. `P1` Wave16-R13AQ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AQ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13AQ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AP completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13aq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13aq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AQ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `458`.
+
+458. `P1` Wave16-R13AR Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AR mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure pass checkpoint evidence.
+- Done when:
+  - R13AR decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AQ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ar-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ar-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AR completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `459`.
+
+459. `P1` Wave16-R13AS Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AS mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13AS decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AR completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13as-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13as-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AS completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `460`.
+
+460. `P1` Wave16-R13AT Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AT mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension pass checkpoint evidence.
+- Done when:
+  - R13AT decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AS completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13at-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13at-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AT completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `461`.
+
+461. `P1` Wave16-R13AU Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AU mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension expansion pass checkpoint evidence.
+- Done when:
+  - R13AU decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AT completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13au-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-expansion-pass-checkpoint-precheck-2026-04-28.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13au-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-expansion-pass-checkpoint-execution-2026-04-28.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AU completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `462`.
+
+462. `P1` Wave16-R13AV Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AV mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure pass checkpoint evidence.
+- Done when:
+  - R13AV decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AU completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13av-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13av-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AV completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `463`.
+
+463. `P1` Wave16-R13AW Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AW mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure expansion pass checkpoint evidence.
+- Done when:
+  - R13AW decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AV completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13aw-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13aw-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AW completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `464`.
+
+464. `P1` Wave16-R13AX Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AX mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure pass checkpoint evidence.
+- Done when:
+  - R13AX decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AW completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ax-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-closure-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ax-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-closure-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AX completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `465`.
+
+465. `P1` Wave16-R13AY Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AY mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13AY decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AX completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ay-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-closure-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ay-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-closure-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AY completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `466`.
+
+466. `P1` Wave16-R13AZ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13AZ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure pass checkpoint evidence.
+- Done when:
+  - R13AZ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AY completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13az-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-closure-closure-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13az-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex6-closure-ext-closure-extension-closure-extension-closure-closure-extension-closure-closure-extension-closure-closure-closure-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13AZ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex6...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `467`.
+
+467. `P1` Wave16-R13BA Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BA mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BA decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13AZ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ba-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex7-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ba-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex7-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BA completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex7...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `468`.
+
+468. `P1` Wave16-R13BB Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BB mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BB decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BA completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bb-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex8-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bb-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex8-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BB completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex8...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `469`.
+
+469. `P1` Wave16-R13BC Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BC mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BC decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BB completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bc-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex9-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bc-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex9-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BC completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex9...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `470`.
+
+470. `P1` Wave16-R13BD Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BD mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BD decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BC completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bd-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex10-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bd-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex10-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BD completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex10...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `471`.
+
+471. `P1` Wave16-R13BE Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BE mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BE decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BD completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13be-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex11-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13be-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex11-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BE completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex11...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `472`.
+
+472. `P1` Wave16-R13BF Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BF mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BF decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BE completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bf-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex12-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bf-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex12-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BF completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex12...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `473`.
+
+473. `P1` Wave16-R13BG Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BG mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BG decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BF completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bg-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex13-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bg-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex13-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BG completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex13...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `474`.
+
+474. `P1` Wave16-R13BH Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BH mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BH decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BG completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bh-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex14-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bh-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex14-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BH completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex14...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `475`.
+
+475. `P1` Wave16-R13BI Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BI mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BI decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BH completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bi-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex15-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bi-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex15-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BI completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex15...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `476`.
+
+476. `P1` Wave16-R13BJ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BJ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BJ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BI completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bj-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex16-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bj-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex16-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_report_endpoint or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BJ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex16...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `477`.
+
+477. `P1` Wave16-R13BK Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BK mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BK decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BJ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bk-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex17-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bk-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex17-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BK completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex17...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `478`.
+
+478. `P1` Wave16-R13BL Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BL mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BL decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BK completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bl-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex18-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bl-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex18-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BL completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex18...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `479`.
+
+479. `P1` Wave16-R13BM Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BM mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BM decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BL completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bm-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex19-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bm-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex19-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BM completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex19...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `480`.
+
+480. `P1` Wave16-R13BN Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BN mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BN decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BM completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bn-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex20-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bn-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex20-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BN completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex20...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `481`.
+
+481. `P1` Wave16-R13BO Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BO mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BO decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BN completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bo-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex21-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bo-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex21-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BO completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex21...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `482`.
+
+482. `P1` Wave16-R13BP Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BP mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BP decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BO completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bp-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex22-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bp-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex22-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BP completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex22...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `483`.
+
+483. `P1` Wave16-R13BQ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BQ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BQ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BP completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex23-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex23-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BQ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex23...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `484`.
+
+484. `P1` Wave16-R13BR Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BR mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BR decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BQ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13br-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex24-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13br-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex24-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BR completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex24...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `485`.
+
+485. `P1` Wave16-R13BS Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BS mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BS decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BR completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bs-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex25-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bs-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex25-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BS completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex25...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `486`.
+
+486. `P1` Wave16-R13BT Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BT mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BT decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BS completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bt-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex26-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bt-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex26-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BT completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex26...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `487`.
+
+487. `P1` Wave16-R13BU Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BU mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BU decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BT completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bu-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex27-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bu-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex27-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BU completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex27...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `488`.
+
+488. `P1` Wave16-R13BV Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BV mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BV decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BU completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bv-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex28-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bv-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex28-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BV completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex28...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `489`.
+
+489. `P1` Wave16-R13BW Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BW mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BW decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BV completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bw-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex29-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bw-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex29-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BW completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex29...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `490`.
+
+490. `P1` Wave16-R13BX Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BX mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BX decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BW completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bx-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex30-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bx-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex30-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BX completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex30...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `491`.
+
+491. `P1` Wave16-R13BY Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BY mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BY decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BX completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13by-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex31-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13by-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex31-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BY completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex31...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `492`.
+
+492. `P1` Wave16-R13BZ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13BZ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13BZ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BY completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13bz-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex32-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13bz-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex32-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13BZ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex32...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `493`.
+
+493. `P1` Wave16-R13CA Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CA mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CA decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13BZ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ca-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex33-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ca-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex33-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CA completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex33...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `494`.
+
+494. `P1` Wave16-R13CB Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CB mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CB decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CA completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cb-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex34-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cb-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex34-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CB completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex34...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `495`.
+
+495. `P1` Wave16-R13CC Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CC mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CC decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CB completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cc-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex35-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cc-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex35-expansion-pass-checkpoint-execution-2026-04-29.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CC completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex35...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `496`.
+
+496. `P1` Wave16-R13CD Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CD mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CD decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CC completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cd-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex36-expansion-pass-checkpoint-precheck-2026-04-29.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cd-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex36-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CD completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex36...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `497`.
+
+497. `P1` Wave16-R13CE Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CE mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CE decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CD completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ce-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex37-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ce-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex37-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CE completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex37...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `498`.
+
+498. `P1` Wave16-R13CF Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CF mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CF decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CE completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cf-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex38-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cf-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex38-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CF completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex38...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `499`.
+
+499. `P1` Wave16-R13CG Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CG mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CG decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CF completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cg-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex39-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cg-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex39-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CG completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex39...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `500`.
+
+500. `P1` Wave16-R13CH Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CH mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CH decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CG completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ch-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex40-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ch-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex40-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CH completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex40...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `501`.
+
+501. `P1` Wave16-R13CI Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CI mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CI decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CH completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ci-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex41-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ci-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex41-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CI completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex41...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `502`.
+
+502. `P1` Wave16-R13CJ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CJ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CJ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CI completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cj-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex42-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cj-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex42-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CJ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex42...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `503`.
+
+503. `P1` Wave16-R13CK Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CK mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CK decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CJ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ck-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex43-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ck-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex43-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CK completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex43...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `504`.
+
+504. `P1` Wave16-R13CL Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CL mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CL decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CK completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cl-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex44-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cl-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex44-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CL completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex44...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `505`.
+
+505. `P1` Wave16-R13CM Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CM mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CM decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CL completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cm-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex45-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cm-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex45-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CM completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex45...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `506`.
+
+506. `P1` Wave16-R13CN Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CN mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CN decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CM completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cn-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex46-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cn-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex46-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CN completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex46...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `507`.
+
+507. `P1` Wave16-R13CO Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CO mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CO decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CN completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13co-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex47-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13co-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex47-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CO completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex47...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `508`.
+
+508. `P1` Wave16-R13CP Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CP mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CP decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CO completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cp-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex48-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cp-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex48-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CP completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex48...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `509`.
+
+509. `P1` Wave16-R13CQ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CQ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CQ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CP completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex49-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex49-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CQ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex49...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `510`.
+
+510. `P1` Wave16-R13CR Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CR mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CR decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CQ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cr-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex50-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cr-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex50-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CR completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex50...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `511`.
+
+511. `P1` Wave16-R13CS Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CS mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CS decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CR completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cs-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex51-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cs-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex51-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CS completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex51...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `512`.
+
+512. `P1` Wave16-R13CT Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CT mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CT decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CS completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ct-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex52-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ct-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex52-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CT completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex52...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `513`.
+
+513. `P1` Wave16-R13CU Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CU mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CU decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CT completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cu-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex53-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cu-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex53-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CU completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex53...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `514`.
+
+514. `P1` Wave16-R13CV Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CV mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CV decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CU completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cv-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex54-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cv-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex54-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CV completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex54...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `515`.
+
+515. `P1` Wave16-R13CW Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CW mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CW decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CV completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cw-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex55-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cw-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex55-expansion-pass-checkpoint-execution-2026-04-30.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CW completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex55...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `516`.
+
+516. `P1` Wave16-R13CX Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CX mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CX decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CW completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cx-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex56-expansion-pass-checkpoint-precheck-2026-04-30.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cx-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex56-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CX completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex56...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `517`.
+
+517. `P1` Wave16-R13CY Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CY mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CY decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CX completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cy-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex57-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cy-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex57-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CY completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex57...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `518`.
+
+518. `P1` Wave16-R13CZ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13CZ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13CZ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CY completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13cz-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex58-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13cz-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex58-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13CZ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex58...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `519`.
+
+519. `P1` Wave16-R13DA Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DA mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DA decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13CZ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13da-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex59-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13da-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex59-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DA completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex59...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `520`.
+
+520. `P1` Wave16-R13DB Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DB mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DB decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DA completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13db-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex60-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13db-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex60-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DB completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex60...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `521`.
+
+521. `P1` Wave16-R13DC Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DC mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DC decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DB completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dc-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex61-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dc-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex61-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DC completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex61...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `522`.
+
+522. `P1` Wave16-R13DD Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DD mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DD decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DC completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dd-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex62-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dd-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex62-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DD completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex62...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `523`.
+
+523. `P1` Wave16-R13DE Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DE mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DE decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DD completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13de-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex63-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13de-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex63-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DE completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex63...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `524`.
+
+524. `P1` Wave16-R13DF Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DF mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DF decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DE completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13df-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex64-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13df-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex64-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DF completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex64...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `525`.
+
+525. `P1` Wave16-R13DG Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DG mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DG decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DF completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dg-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex65-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dg-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex65-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DG completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex65...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `526`.
+
+526. `P1` Wave16-R13DH Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DH mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DH decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DG completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dh-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex66-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dh-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex66-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DH completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex66...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `527`.
+
+527. `P1` Wave16-R13DI Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DI mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DI decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DH completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13di-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex67-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13di-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex67-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DI completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex67...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `528`.
+
+528. `P1` Wave16-R13DJ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DJ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DJ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DI completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dj-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex68-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dj-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex68-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DJ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex68...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `529`.
+
+529. `P1` Wave16-R13DK Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DK mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DK decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DJ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dk-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex69-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dk-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex69-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DK completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex69...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `530`.
+
+530. `P1` Wave16-R13DL Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DL mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DL decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DK completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dl-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex70-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dl-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex70-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DL completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex70...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `531`.
+
+531. `P1` Wave16-R13DM Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DM mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DM decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DL completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dm-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex71-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dm-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex71-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DM completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex71...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `532`.
+
+532. `P1` Wave16-R13DN Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DN mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DN decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DM completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dn-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex72-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dn-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex72-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DN completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex72...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `533`.
+
+533. `P1` Wave16-R13DO Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DO mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DO decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DN completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13do-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex73-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13do-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex73-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DO completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex73...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `534`.
+
+534. `P1` Wave16-R13DP Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DP mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DP decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DO completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dp-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex74-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dp-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex74-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DP completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex74...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `535`.
+
+535. `P1` Wave16-R13DQ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DQ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DQ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DP completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex75-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex75-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DQ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex75...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `536`.
+
+536. `P1` Wave16-R13DR Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DR mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DR decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DQ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dr-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex76-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dr-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex76-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DR completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex76...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `537`.
+
+537. `P1` Wave16-R13DS Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DS mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DS decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DR completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ds-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex77-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ds-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex77-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DS completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex77...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `538`.
+
+538. `P1` Wave16-R13DT Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DT mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DT decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DS completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dt-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex78-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dt-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex78-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DT completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex78...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `539`.
+
+539. `P1` Wave16-R13DU Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DU mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DU decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DT completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13du-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex79-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13du-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex79-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DU completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex79...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `540`.
+
+540. `P1` Wave16-R13DV Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DV mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DV decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DU completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dv-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex80-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dv-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex80-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DV completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex80...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `541`.
+
+541. `P1` Wave16-R13DW Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DW mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DW decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DV completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dw-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex81-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dw-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex81-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DW completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex81...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `542`.
+
+542. `P1` Wave16-R13DX Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DX mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DX decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DW completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dx-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex82-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dx-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex82-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DX completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex82...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `543`.
+
+543. `P1` Wave16-R13DY Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DY mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DY decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DX completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dy-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex83-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dy-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex83-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DY completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex83...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `544`.
+
+544. `P1` Wave16-R13DZ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13DZ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13DZ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DY completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13dz-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex84-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13dz-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex84-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13DZ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex84...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `545`.
+
+545. `P1` Wave16-R13EA Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EA mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EA decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13DZ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ea-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex85-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ea-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex85-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EA completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex85...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `546`.
+
+546. `P1` Wave16-R13EB Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EB mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EB decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EA completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13eb-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex86-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13eb-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex86-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EB completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex86...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `547`.
+
+547. `P1` Wave16-R13EC Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EC mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EC decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EB completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ec-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex87-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ec-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex87-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EC completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex87...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `548`.
+
+548. `P1` Wave16-R13ED Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13ED mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13ED decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EC completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ed-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex88-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ed-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex88-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13ED completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex88...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `549`.
+
+549. `P1` Wave16-R13EE Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EE mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EE decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13ED completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ee-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex89-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ee-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex89-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EE completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex89...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `550`.
+
+550. `P1` Wave16-R13EF Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EF mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EF decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EE completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ef-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex90-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ef-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex90-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EF completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex90...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `551`.
+
+551. `P1` Wave16-R13EG Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EG mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EG decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EF completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13eg-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex91-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13eg-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex91-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EG completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex91...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `552`.
+
+552. `P1` Wave16-R13EH Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EH mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EH decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EG completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13eh-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex92-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13eh-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex92-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EH completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex92...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `553`.
+
+553. `P1` Wave16-R13EI Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EI mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EI decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EH completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ei-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex93-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ei-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex93-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EI completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex93...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `554`.
+
+554. `P1` Wave16-R13EJ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EJ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EJ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EI completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ej-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex94-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ej-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex94-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EJ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex94...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `555`.
+
+555. `P1` Wave16-R13EK Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EK mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EK decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EJ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ek-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex95-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ek-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex95-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EK completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex95...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `556`.
+
+556. `P1` Wave16-R13EL Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EL mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EL decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EK completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13el-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex96-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13el-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex96-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EL completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex96...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `557`.
+
+557. `P1` Wave16-R13EM Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EM mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EM decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EL completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13em-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex97-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13em-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex97-expansion-pass-checkpoint-execution-2026-05-01.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EM completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex97...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `558`.
+
+558. `P1` Wave16-R13EN Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EN mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EN decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EM completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13en-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex98-expansion-pass-checkpoint-precheck-2026-05-01.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13en-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex98-expansion-pass-checkpoint-execution-2026-05-02.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EN completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex98...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `559`.
+
+559. `P1` Wave16-R13EO Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EO mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EO decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EN completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13eo-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex99-expansion-pass-checkpoint-precheck-2026-05-02.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13eo-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex99-expansion-pass-checkpoint-execution-2026-05-02.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EO completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex99...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `560`.
+
+560. `P1` Wave16-R13EP Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EP mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EP decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EO completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ep-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex100-expansion-pass-checkpoint-precheck-2026-05-02.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ep-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex100-expansion-pass-checkpoint-execution-2026-05-02.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EP completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex100...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `561`.
+
+561. `P1` Wave16-R13EQ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EQ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EQ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EP completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13eq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex101-expansion-pass-checkpoint-precheck-2026-05-02.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13eq-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex101-expansion-pass-checkpoint-execution-2026-05-02.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EQ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex101...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `562`.
+
+562. `P1` Wave16-R13ER Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13ER mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13ER decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EQ completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13er-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex102-expansion-pass-checkpoint-precheck-2026-05-02.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13er-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex102-expansion-pass-checkpoint-execution-2026-05-02.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13ER completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex102...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `563`.
+
+563. `P1` Wave16-R13ES Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13ES mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13ES decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13ER completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13es-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex103-expansion-pass-checkpoint-precheck-2026-05-02.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13es-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex103-expansion-pass-checkpoint-execution-2026-05-02.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13ES completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex103...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `564`.
+
+564. `P1` Wave16-R13ET Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13ET mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13ET decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13ES completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13et-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex104-expansion-pass-checkpoint-precheck-2026-05-02.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13et-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex104-expansion-pass-checkpoint-execution-2026-05-03.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13ET completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex104...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `565`.
+
+565. `P1` Wave16-R13EU Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EU mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EU decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13ET completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13eu-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex105-expansion-pass-checkpoint-precheck-2026-05-03.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13eu-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex105-expansion-pass-checkpoint-execution-2026-05-03.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EU completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex105...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `566`.
+
+566. `P1` Wave16-R13EV Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EV mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EV decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EU completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ev-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex106-expansion-pass-checkpoint-precheck-2026-05-03.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ev-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex106-expansion-pass-checkpoint-execution-2026-05-03.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EV completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex106...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `567`.
+
+567. `P1` Wave16-R13EW Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EW mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EW decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EV completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ew-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex107-expansion-pass-checkpoint-precheck-2026-05-03.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ew-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex107-expansion-pass-checkpoint-execution-2026-05-03.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EW completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex107...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `568`.
+
+568. `P1` Wave16-R13EX Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EX mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EX decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EW completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ex-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex108-expansion-pass-checkpoint-precheck-2026-05-03.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ex-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex108-expansion-pass-checkpoint-execution-2026-05-03.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EX completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex108...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `569`.
+
+569. `P1` Wave16-R13EY Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EY mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EY decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EX completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ey-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex109-expansion-pass-checkpoint-precheck-2026-05-03.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ey-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex109-expansion-pass-checkpoint-execution-2026-05-03.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EY completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex109...`) due filesystem basename length limit.
+  - `Current Focus` moved to item `570`.
+
+570. `P1` Wave16-R13EZ Autonomous Post-Transition Mixed Stabilization+Continuity Extension Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Extension Closure Extension Closure Extension Closure Closure Extension Closure Closure Extension Closure Closure Closure Expansion Pass Checkpoint Lane
+- Status: `done`
+- Scope:
+  - verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report;
+  - verify stability under mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass combinations before subsequent mixed wave lanes;
+  - capture bounded decision with Wave16-R13EZ mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+- Done when:
+  - R13EZ decision (`replay`/`reconcile`/`keep_local`) is documented with rationale and risk notes;
+  - targeted mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint tests are green;
+  - backlog/docs synchronized with next lane.
+- Progress:
+  - precondition:
+    - R13EY completed with post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint evidence.
+  - precheck artifact:
+    - `docs/ops/upstream-migration/wave16-r13ez-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex110-expansion-pass-checkpoint-precheck-2026-05-03.json`;
+  - execution artifact:
+    - `docs/ops/upstream-migration/wave16-r13ez-autonomous-post-transition-mixed-stabilization-continuity-ext-closurex110-expansion-pass-checkpoint-execution-2026-05-03.json`;
+  - execution validation:
+    - `uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q` -> `11 passed, 182 deselected`.
+  - outcome:
+    - R13EZ completed as `keep_local` (post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure extension closure extension closure extension closure extension closure closure extension closure closure extension closure closure closure expansion pass checkpoint bundle is green; no runtime changes required).
+  - note:
+    - precheck/execution artifact slugs were shortened (`continuity-ext-closurex110...`) due filesystem basename length limit.
+  - `Current Focus` moved to terminal completion state (no active execution item).
+
+## Execution Wave: Runtime + Cross-Channel Consistency (Wave 17)
+
+571. `P0` Cross-Channel Session Binding Contract (Web UI <-> Telegram)
+- Status: `done`
+- Scope:
+  - enforce deterministic mapping `telegram_chat_id -> active session_id` with explicit project context;
+  - align Web-selected queen/session context with Telegram-bound session context;
+  - add visibility endpoint/log marker so operator can inspect current channel/session binding.
+- Progress:
+  - bridge hardening: added auto-rebind path for `source=web` events by `project+queen` identity when chat was bound to stale session id;
+  - mirror continuity: web-originated input now triggers rebind before telegram mirror emit, reducing silent no-reply cases;
+  - tests: added `test_web_input_auto_rebinds_chat_by_project_and_queen` and kept restart-resume coverage green.
+- Outcome:
+  - added operator inspection endpoint `GET /api/telegram/bridge/bindings`;
+  - added binding transition log marker on `_bind_chat` (`chat/session/project/queen/prev`);
+  - added API tests for bindings endpoint status/snapshot contracts.
+- Done when:
+  - message from either channel lands in the same expected session when binding is active;
+  - no silent cross-session drift between Web and Telegram during normal control flow;
+  - tests cover bind/switch/new-session transitions.
+
+572. `P0` Message Mirror and De-duplication Across Interfaces
+- Status: `done`
+- Scope:
+  - make replies initiated in Web visible in Telegram (when bridge mirror enabled) and vice versa;
+  - eliminate duplicate user-message echo in Web timeline;
+  - guarantee idempotent message append contract per channel.
+- Progress:
+  - dedupe hardening: queen DM optimistic-user reconciliation now uses FIFO matching against unreconciled echoes only (`executionId`-aware), preventing duplicate bubbles on repeated same-content sends;
+  - shared contract: extracted common helper `findOptimisticUserMatchIndex` and reused it in both `queen-dm` and `colony-chat` upsert paths;
+  - tests: added unit coverage for FIFO reconcile and already-reconciled skip behavior in `chat-helpers.test.ts` (frontend test suite green).
+- Outcome:
+  - mirror path remains covered by bridge tests (`web -> telegram` and `telegram -> other chats`);
+  - user-message dedupe regression path is now covered by frontend unit tests;
+  - duplicate user bubbles on same-content quick sends are prevented by execution-aware reconciliation.
+- Done when:
+  - Web and Telegram histories are consistent for mirrored sessions;
+  - no duplicate user entries for a single submit action;
+  - regression tests added for mirror + dedupe logic.
+
+573. `P1` Provider Reliability Policy (Queue + Retry + Deterministic Fallback)
+- Status: `done`
+- Scope:
+  - implement policy: primary proxy/provider retries with bounded queue/backoff, then fallback after retry budget;
+  - codify fallback precedence in runtime config (including proxy-backed OpenAI-compatible routes);
+  - add observability for provider attempt chain and fallback reason.
+- Progress:
+  - fallback observability: added runtime attempt-chain recorder in `framework.llm.fallback` with bounded history (`HIVE_LLM_FALLBACK_STATUS_HISTORY_LIMIT`);
+  - API surfacing: `/api/llm/queue/status` now returns both queue/backoff snapshot and fallback attempt-chain snapshot (`fallback.recent_attempt_chains`);
+  - deterministic precedence: heavy routing profile now resolves `claude-opus-4-6 -> gpt-5.4 -> openai/glm-5.1`, and profile helper script follows the same terminal fallback;
+  - tests: added coverage for attempt-chain recording and routing precedence (`test_fallback_llm_provider.py`, `test_model_routing.py`) plus API contract extension in `test_api.py`;
+  - operational gate: `scripts/check_operational_api_contracts.py` now validates `/api/llm/queue/status` contract (queue + fallback policy/history shape).
+- Outcome:
+  - runtime status now exposes queue/backoff + fallback policy/attempt-chain in one place for operators;
+  - fallback chain precedence is codified for heavy profile with deterministic GLM terminal fallback;
+  - operational acceptance scripts can assert provider reliability telemetry in container-first checks.
+- Done when:
+  - transient 429/5xx do not immediately fail user turn;
+  - fallback activates only after configured retry budget is exhausted;
+  - operator can see provider chain decision in logs/API status.
+
+574. `P1` Container-Only Runtime Parity Gate (Web + Bridge + Ops)
+- Status: `done`
+- Scope:
+  - re-run parity checks fully in Docker profile (no host-only assumptions);
+  - validate Web submit path, Telegram bridge, credential modal/data explorer paths in container mode;
+  - capture parity checklist in runbook with exact commands.
+- Progress:
+  - parity gate extended: `scripts/check_runtime_parity.sh` now checks `/api/llm/queue/status` plus `/api/telegram/bridge/status` and `/api/telegram/bridge/bindings` contracts in addition to autonomous ops;
+  - runbook updated with explicit parity coverage list and container-specific `Data` behavior (`Session Data Explorer` / `.zip` as supported path, no `xdg-open` expectation in container);
+  - operational contract checker now includes dedicated `llm` contract validation (`scripts/check_operational_api_contracts.py --check llm`).
+- Outcome:
+  - rebuilt `hive-core` image with the new runtime/API changes and re-ran parity from container mode;
+  - `./scripts/check_runtime_parity.sh` passed end-to-end on `http://localhost:8787`;
+  - `uv run --no-project python scripts/check_operational_api_contracts.py --check llm` passed.
+- Done when:
+  - full smoke matrix passes from containerized runtime;
+  - known container caveats are documented with supported fallback behavior;
+  - acceptance scripts include parity checks for these paths.
+
+575. `P1` GitHub PR Review Feedback Integration Gate
+- Status: `done`
+- Scope:
+  - ensure autonomous review stage ingests PR review comments and review threads reliably;
+  - enforce credential validation path for GitHub review read/write actions before run;
+  - expose review-ingestion result in pipeline report.
+- Progress:
+  - added GitHub credential preflight in autonomous review/validation gate (`_validate_github_credential` via `/user`);
+  - added paginated PR feedback ingestion for reviews, review comments, and issue comments (`_github_fetch_paginated_list_json`);
+  - enriched report output with explicit `review_feedback_summary` (`ingested`, totals, and failure reason when feedback fetch fails);
+  - expanded API tests for credential failure UX, pagination behavior, and report feedback summary coverage.
+- Outcome:
+  - missing/invalid GitHub credential now fails early with actionable error before stage evaluation;
+  - review feedback ingestion is resilient across multi-page PR threads/comments;
+  - pipeline report includes machine-readable feedback ingestion status for operators.
+- Done when:
+  - agent can read reviewer feedback and include it in validation/report stage;
+  - missing/invalid GitHub credential is surfaced as explicit actionable error;
+  - report contains review-feedback summary section.
+
+576. `P2` Backlog and Sprint Re-Activation for Next Delivery Loop
+- Status: `done`
+- Scope:
+  - align `_bmad-output` workflow/sprint tracking with reopened backlog wave;
+  - create initial acceptance criteria/checklist for items `571..576`;
+  - wire automated status artifact refresh for new wave.
+- Progress:
+  - synchronized `Current Focus` and live parser state to `in_progress=[576]` (`focus_refs=[576]`);
+  - refreshed `_bmad-output` tracking artifacts for active wave context:
+    - `planning-artifacts/bmm-workflow-status.yaml` (wave metadata + active task binding);
+    - `implementation-artifacts/sprint-status.yaml` (epic-37 with `37-6 ... in-progress`);
+    - `planning-artifacts/implementation-readiness.md` (non-terminal wave snapshot);
+  - created wave acceptance checklist: `docs/ops/wave-17-acceptance-checklist.md` (tasks `571..576`);
+  - refreshed and indexed backlog status artifacts (`backlog_status_artifact` + hygiene + index check).
+- Outcome:
+  - backlog/BMM/sprint now consistently reflect active non-terminal wave state;
+  - operators have a single acceptance checklist for wave-17 closure;
+  - status artifact lifecycle remains automated and drift-safe for the reopened wave.
+- Closure:
+  - wave `571..576` marked complete after checklist + artifact refresh pass;
+  - `Current Focus` moved to terminal completion state (`in_progress=[]`);
+  - BMM sprint/workflow artifacts reconciled with closed-wave status.
+- Done when:
+  - backlog, BMM workflow status, and sprint tracking show active non-terminal state;
+  - next-wave checklist is documented and linked from runbook;
+  - status artifact refresh reflects reopened wave without drift.
+
+## Execution Wave: Autonomous Delivery Hardening (Wave 18)
+
+577. `P1` Autonomous Task Intake Contract (Template + Validator + UX)
+- Status: `done`
+- Scope:
+  - define strict task intake schema for autonomous runs (`goal`, `acceptance_criteria`, `constraints`, `delivery_mode`);
+  - add validator endpoint/check that rejects underspecified tasks with actionable errors;
+  - expose template/help in Telegram and Web so operator can submit valid tasks quickly.
+- Progress:
+  - added intake template API: `GET /api/autonomous/backlog/intake/template`;
+  - added intake validation API: `POST /api/autonomous/backlog/intake/validate` with actionable error list;
+  - integrated optional strict gate into backlog create (`strict_intake=true` or `HIVE_AUTONOMOUS_INTAKE_STRICT=1`) with deterministic contract checks;
+  - added Telegram operator command `/intake_template` with canonical payload example + API refs;
+  - added Web UI `Intake` control in `colony-chat` top bar with template refresh, payload JSON editor, and inline validator results;
+  - added server/API tests for template, validation failure path, strict-create behavior, and Telegram command dispatch.
+  - added frontend API coverage for intake template/validation endpoints.
+- Outcome:
+  - operators now have canonical payload schema and machine-checkable validation endpoint;
+  - strict intake mode can be enabled without breaking legacy backlog task creation flow.
+- Done when:
+  - invalid task submissions fail fast with clear remediation hints;
+  - valid task payloads can be converted into backlog items deterministically;
+  - docs include canonical intake template.
+
+578. `P1` Safe Execution Guardrails for Autonomous Runs
+- Status: `done`
+- Scope:
+  - enforce per-run boundaries: max duration, max retries, max tool calls, fail-fast on unsafe/unknown operations;
+  - add explicit run-stop reasons and escalation path to operator;
+  - ensure container-only execution policy remains default.
+- Progress:
+  - added project-level `execution_template.run_guardrails` contract with defaults:
+    - `max_run_seconds`,
+    - `max_tool_calls_execution_stage`,
+    - `max_loop_ticks_per_run`,
+    - `stop_action`,
+    - `fail_on_unknown_action`,
+    - `container_only`;
+  - wired `run_guardrails` into project execution-template PATCH flow (`routes_projects`);
+  - enforced runtime guardrails in autonomous loop:
+    - terminal stop on `max_run_seconds_exceeded`,
+    - terminal stop on `max_tool_calls_exceeded` for execution stage,
+    - fail-fast terminal stop on unknown runtime actions (policy-controlled),
+    - explicit guardrail stop artifacts/events in run report (`guardrail_stop`).
+  - added/updated API tests:
+    - execution-template default + update includes `run_guardrails`,
+    - invalid `run_guardrails` payload rejected,
+    - `run-until-terminal` duration guardrail stop,
+    - loop tick tool-call guardrail stop.
+- Outcome:
+  - bounded autonomous execution is enforced by project-level policy (`run_guardrails`);
+  - guardrail stops are now visible in run reports and `/api/autonomous/ops/status` summary
+    (`guardrail_stops_total`, `guardrail_stops_by_reason`) with per-project reason breakdown.
+- Done when:
+  - runaway/looping runs are auto-contained with explicit terminal reasons;
+  - guardrail decisions are visible in run report and ops status.
+
+579. `P1` Autonomous Observability Bundle (Run Timeline + Failure Taxonomy)
+- Status: `done`
+- Scope:
+  - add normalized run timeline artifact (stage transitions, retries, fallback, key tool actions);
+  - define failure taxonomy (`credential`, `provider`, `policy`, `runtime`, `code`) and classify terminal errors;
+  - surface summarized telemetry in `/api/autonomous/ops/status` and run report.
+- Progress:
+  - run report enriched with `timeline` and machine-readable `failure_taxonomy`;
+  - `/api/autonomous/ops/status` now aggregates:
+    - `terminal_failures_total`,
+    - global `failure_taxonomy`,
+    - per-project `failure_taxonomy`,
+    - guardrail stop totals/reasons;
+  - added API tests:
+    - `test_pipeline_report_endpoint_includes_timeline_and_failure_taxonomy`,
+    - `test_autonomous_ops_status_aggregates_failure_taxonomy`,
+    - plus regression sweep `autonomous|execution_template` (`72 passed`).
+- Outcome:
+  - terminal failure diagnostics are normalized and queryable from report/ops API;
+  - operator can identify category-level failure patterns without raw-log spelunking.
+- Done when:
+  - every terminal run has machine-readable failure classification;
+  - operator can diagnose failures from a single report without log spelunking.
+
+580. `P2` Wave 18 Closure Gate (E2E + Release Decision)
+- Status: `done`
+- Scope:
+  - run end-to-end autonomous scenario on one real project from intake -> execution -> review -> report;
+  - run container parity + acceptance gate bundle with wave-18 criteria;
+  - publish closure note with pass/fail and go/no-go decision.
+- Progress:
+  - rebuilt and restarted `hive-core` image (`docker compose up -d --build hive-core`) to ensure runtime includes wave-18 codepaths;
+  - executed live E2E scenario on runtime API:
+    - intake template + validation (`/api/autonomous/backlog/intake/*`),
+    - strict backlog create,
+    - run create + stage advances (`execution -> review -> validation`),
+    - final report retrieval with populated `timeline` (`timeline_items=4`);
+  - executed closure bundle:
+    - `./scripts/check_runtime_parity.sh` -> pass,
+    - `./scripts/acceptance_gate_presets.sh full --project wave18-demo-project` -> pass,
+    - release matrix promoted to `pass` (`must_passed=6/6`, `must_missing=0`);
+  - acceptance artifacts updated:
+    - `docs/ops/acceptance-reports/acceptance-report-20260503-125724.json`,
+    - `docs/ops/acceptance-reports/gate-latest.json`,
+    - `docs/ops/acceptance-reports/digest-latest.{json,md}`.
+- Outcome:
+  - wave-18 closure note published:
+    - `docs/ops/wave-18-closure-note-2026-05-03.md`;
+  - release decision finalized as **GO** with full gate `pass`.
+- Done when:
+  - wave-18 checklist is fully green;
+  - closure report is attached and backlog returns to consistent state.
+
+## Execution Wave: Telegram Bridge Resilience (Wave 19)
+
+581. `P1` Telegram 409 Conflict Auto-Recovery and Telemetry
+- Status: `done`
+- Scope:
+  - detect polling `getUpdates` `409 Conflict` errors deterministically;
+  - auto-attempt recovery in polling mode (`deleteWebhook`) with cooldown to avoid flapping;
+  - expose machine-readable conflict/recovery telemetry in bridge status API.
+- Progress:
+  - added conflict counters and timestamps in bridge runtime state:
+    - `poll_conflict_409_count`,
+    - `last_poll_conflict_409_at`,
+    - `last_poll_conflict_recover_at`,
+    - `last_poll_conflict_recover_result`;
+  - added auto-recovery controls:
+    - `HIVE_TELEGRAM_AUTO_CLEAR_WEBHOOK_ON_409` (default `1`),
+    - `HIVE_TELEGRAM_CONFLICT_RECOVER_COOLDOWN_SECONDS` (default `120`);
+  - extended status payload with new fields and cooldown policy values;
+  - added tests:
+    - bridge unit tests for recovery/cooldown/disable-flag behavior,
+    - API endpoint contract test for conflict telemetry fields,
+    - operational contract checker assertions when bridge is enabled.
+- Outcome:
+  - recurring 409 incidents are now observable and partially self-healing;
+  - operators can diagnose conflict/recovery state directly from `/api/telegram/bridge/status`.
+- Done when:
+  - 409 conflicts are counted and surfaced in status API;
+  - recovery attempts are bounded by cooldown and visible in telemetry;
+  - regression tests cover conflict path.
+
+582. `P1` Operator Recovery Endpoint and Safe Reset Controls
+- Status: `done`
+- Scope:
+  - add explicit operator endpoint to force bridge recovery/reset without full container restart;
+  - support safe reset of conflict counters/last-error markers for post-incident cleanup;
+  - expose action result in API and runbook.
+- Progress:
+  - added `POST /api/telegram/bridge/recover` in server app routing;
+  - implemented `TelegramBridge.operator_recover(...)` with safe toggles:
+    - `force_delete_webhook`,
+    - `drop_pending_updates`,
+    - `reset_conflict_telemetry`,
+    - `clear_last_error`;
+  - added API + unit tests for success/failure paths, including deterministic disabled-mode behavior.
+- Outcome:
+  - operator can recover/reset bridge state without container restart;
+  - reset/recovery result is machine-readable and immediately visible via bridge status.
+- Done when:
+  - operator can trigger recovery/reset with one API call;
+  - status reflects reset/recovery outcome immediately;
+  - tests validate success/failure paths.
+
+583. `P2` Telegram Bridge Incident Digest Integration
+- Status: `done`
+- Scope:
+  - include 409 conflict/recovery stats in periodic autonomous/ops digests;
+  - surface rising conflict rate as a soft warning in operator summary.
+- Progress:
+  - extended Telegram autonomous digest (`/autodigest`) with 409 KPI block:
+    - `telegram_conflicts_409` count/age/recovery result,
+    - `warning=telegram 409 conflicts rising` when threshold is exceeded;
+  - added configurable warning policy:
+    - `HIVE_TELEGRAM_CONFLICT_WARN_THRESHOLD` (default `3`),
+    - `HIVE_TELEGRAM_CONFLICT_WARN_WINDOW_SECONDS` (default `3600`);
+  - extended acceptance digest/ops summary artifacts with conflict KPI + soft-warning fields;
+  - added regression tests for digest formatting and warning projection into ops summary.
+- Outcome:
+  - periodic digest channels now expose bridge incident trend and recent recovery state;
+  - operator summary surfaces soft warning when conflict rate is rising.
+- Done when:
+  - digest contains conflict KPIs and latest recovery status;
+  - warnings appear only when thresholds are exceeded.
+
+584. `P2` Wave 19 Closure Gate (Bridge Resilience E2E)
+- Status: `done`
+- Scope:
+  - run controlled resilience scenario (simulate conflict signal path + verify recovery telemetry);
+  - run full acceptance/profile checks and publish closure note with go/no-go.
+- Progress:
+  - rebuilt and restarted container runtime (`docker compose up -d --build hive-core`);
+  - verified runtime bridge telemetry contract with live API:
+    - `poll_conflict_*` counters/timestamps/recovery fields,
+    - warning policy fields (`conflict_warn_threshold`, `conflict_warn_window_seconds`, `poll_conflict_warning_active`);
+  - validated operator-recovery endpoint in live runtime (`POST /api/telegram/bridge/recover`);
+  - passed regression bundles:
+    - `core/framework/server/tests/test_telegram_bridge.py` (`54 passed`),
+    - `core/framework/server/tests/test_api.py -k telegram_bridge` (`6 passed`),
+    - scripts suite for ops summary/digest/contracts (`14 passed`);
+  - regenerated acceptance artifacts:
+    - `docs/ops/acceptance-reports/acceptance-report-20260503-135713.json`,
+    - `docs/ops/acceptance-reports/digest-latest.{json,md}`;
+  - published closure note:
+    - `docs/ops/wave-19-closure-note-2026-05-03.md`.
+- Outcome:
+  - wave-19 resilience changes are live in container runtime and validated by API + tests;
+  - operator has deterministic recovery path and digest-level early warning signal for Telegram 409 trend.
+- Done when:
+  - wave-19 checklist green;
+  - closure report linked and backlog state consistent.

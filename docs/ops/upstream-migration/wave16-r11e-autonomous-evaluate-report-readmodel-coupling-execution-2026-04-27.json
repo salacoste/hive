@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T00:00:57Z",
+  "wave": "Wave16-R11E",
+  "title": "Autonomous evaluate + report read-model coupling continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "evaluate endpoint checks/status ingestion remains consistently reflected in report read-model",
+      "report endpoint continuity remains stable after evaluate-path updates under mixed status payload forms",
+      "no regressions observed in targeted evaluate/report coupling bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_endpoint_accepts_status_field or pipeline_report_endpoint or pipeline_evaluate_github_endpoint or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_evaluate_github_no_checks_success_policy' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11E lane closed as keep-local with green evaluate/report read-model coupling bundle",
+      "next lane continues GitHub evaluate + auto-next policy edge continuity"
+    ]
+  }
+}

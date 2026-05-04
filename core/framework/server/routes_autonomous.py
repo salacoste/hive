@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,16 @@ from framework.server.project_execution import resolve_execution_template
 APP_KEY_AUTONOMOUS_STORE: web.AppKey[AutonomousPipelineStore] = web.AppKey(
     "autonomous_pipeline_store", AutonomousPipelineStore
 )
+
+INTAKE_DELIVERY_MODES = {"patch_only", "pr_only", "patch_and_pr"}
+
+
+class GitHubApiError(RuntimeError):
+    """Structured GitHub API failure used for actionable HTTP responses."""
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _get_store(request: web.Request) -> AutonomousPipelineStore:
@@ -58,6 +69,63 @@ def _parse_optional_positive_int(value: Any, *, field_name: str) -> int | None:
     if parsed <= 0:
         raise ValueError(f"{field_name} must be a positive integer")
     return parsed
+
+
+def _intake_contract_enabled(value: Any = None) -> bool:
+    if value is not None:
+        return _parse_bool_param(value, default=False)
+    raw = os.environ.get("HIVE_AUTONOMOUS_INTAKE_STRICT", "").strip()
+    return _parse_bool_param(raw, default=False)
+
+
+def _validate_intake_contract(body: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    errors: list[str] = []
+    normalized: dict[str, Any] = {}
+
+    title = str(body.get("title") or "").strip()
+    goal = str(body.get("goal") or "").strip()
+    criteria_raw = body.get("acceptance_criteria")
+    constraints_raw = body.get("constraints")
+    delivery_mode = str(body.get("delivery_mode") or "").strip().lower()
+
+    if not title:
+        errors.append("title is required")
+    elif len(title) < 6:
+        errors.append("title must be at least 6 characters")
+    else:
+        normalized["title"] = title
+
+    if not goal:
+        errors.append("goal is required")
+    elif len(goal) < 12:
+        errors.append("goal must be at least 12 characters with concrete outcome")
+    else:
+        normalized["goal"] = goal
+
+    if not isinstance(criteria_raw, list):
+        errors.append("acceptance_criteria must be an array of non-empty strings")
+    else:
+        criteria = [str(x).strip() for x in criteria_raw if str(x).strip()]
+        if not criteria:
+            errors.append("acceptance_criteria cannot be empty")
+        else:
+            normalized["acceptance_criteria"] = criteria
+
+    if not isinstance(constraints_raw, list):
+        errors.append("constraints must be an array of non-empty strings")
+    else:
+        constraints = [str(x).strip() for x in constraints_raw if str(x).strip()]
+        if not constraints:
+            errors.append("constraints cannot be empty")
+        else:
+            normalized["constraints"] = constraints
+
+    if delivery_mode not in INTAKE_DELIVERY_MODES:
+        errors.append("delivery_mode must be one of: patch_only, pr_only, patch_and_pr")
+    else:
+        normalized["delivery_mode"] = delivery_mode
+
+    return errors, normalized
 
 
 def _validate_task_status(value: str) -> str:
@@ -117,6 +185,40 @@ def _stage_policy(project: dict[str, Any]) -> dict[str, Any]:
     escalate_on = retry_policy.get("escalate_on", [])
     escalate = {str(x).strip().lower() for x in escalate_on if str(x).strip()}
     return {"max_retries": max_retries, "escalate_on": escalate}
+
+
+def _run_guardrails(project: dict[str, Any]) -> dict[str, Any]:
+    execution = resolve_execution_template(project)
+    effective = execution.get("effective", {}).get("execution_template", {})
+    guardrails = effective.get("run_guardrails", {}) if isinstance(effective, dict) else {}
+    if not isinstance(guardrails, dict):
+        guardrails = {}
+
+    def _to_int(raw: Any, default: int, *, minimum: int, maximum: int) -> int:
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, min(maximum, parsed))
+
+    stop_action = str(guardrails.get("stop_action") or "failed").strip().lower()
+    if stop_action not in {"failed", "escalated"}:
+        stop_action = "failed"
+    fail_on_unknown_action = _parse_bool_param(guardrails.get("fail_on_unknown_action"), default=True)
+    return {
+        "max_run_seconds": _to_int(
+            guardrails.get("max_run_seconds", 1800), 1800, minimum=60, maximum=86400
+        ),
+        "max_tool_calls_execution_stage": _to_int(
+            guardrails.get("max_tool_calls_execution_stage", 150), 150, minimum=1, maximum=20000
+        ),
+        "max_loop_ticks_per_run": _to_int(
+            guardrails.get("max_loop_ticks_per_run", 24), 24, minimum=1, maximum=1000
+        ),
+        "stop_action": stop_action,
+        "fail_on_unknown_action": fail_on_unknown_action,
+        "container_only": _parse_bool_param(guardrails.get("container_only"), default=True),
+    }
 
 
 def _task_contract(task: Any) -> dict[str, Any]:
@@ -461,6 +563,51 @@ def _read_autonomous_loop_state() -> dict[str, Any] | None:
     return payload
 
 
+def _acceptance_gate_results_shared_path() -> Path:
+    raw = os.environ.get("HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".hive" / "server" / "acceptance" / "gate-latest.json"
+
+
+def _to_int_or_none(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _read_release_matrix_snapshot() -> dict[str, Any]:
+    path = _acceptance_gate_results_shared_path()
+    payload: dict[str, Any] = {}
+    if path.exists():
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                payload = loaded
+        except Exception:
+            payload = {}
+
+    matrix_raw = payload.get("release_matrix")
+    matrix = matrix_raw if isinstance(matrix_raw, dict) else {}
+    status = str(matrix.get("status") or "").strip().lower()
+    if status not in {"pass", "fail"}:
+        status = "unknown"
+    generated_at = str(payload.get("generated_at") or matrix.get("generated_at") or "").strip() or None
+    return {
+        "path": str(path),
+        "status": status,
+        "must_passed": _to_int_or_none(matrix.get("must_passed")),
+        "must_total": _to_int_or_none(matrix.get("must_total")),
+        "must_failed": _to_int_or_none(matrix.get("must_failed")),
+        "must_missing": _to_int_or_none(matrix.get("must_missing")),
+        "generated_at": generated_at,
+    }
+
+
 def _append_run_event(
     *,
     store: AutonomousPipelineStore,
@@ -481,6 +628,98 @@ def _append_run_event(
     )
     artifacts["events"] = events
     return store.update_run(run.id, {"artifacts": artifacts})
+
+
+def _count_execution_tool_calls(
+    session_id: str,
+    execution_id: str,
+    *,
+    worker_graph_id: str = "",
+) -> int:
+    events_path = Path.home() / ".hive" / "queen" / "session" / session_id / "events.jsonl"
+    if not events_path.exists():
+        return 0
+    count = 0
+    tool_started_types = {"tool_call_started", "tool_started"}
+    try:
+        with open(events_path, encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    evt = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(evt, dict):
+                    continue
+                if str(evt.get("execution_id") or "").strip() != execution_id:
+                    continue
+                evt_graph_id = str(evt.get("graph_id") or "").strip()
+                if worker_graph_id and evt_graph_id and evt_graph_id != worker_graph_id:
+                    continue
+                evt_type = str(evt.get("type") or "").strip().lower()
+                if evt_type in tool_started_types:
+                    count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def _apply_guardrail_terminal_stop(
+    *,
+    store: AutonomousPipelineStore,
+    run: Any,
+    stage: str,
+    stop_action: str,
+    reason: str,
+    details: dict[str, Any] | None = None,
+) -> Any | None:
+    stop_status = "escalated" if stop_action == "escalated" else "failed"
+    stage_states = dict(run.stage_states)
+    stage_states[stage] = stop_status
+    artifacts = dict(run.artifacts) if isinstance(run.artifacts, dict) else {}
+    stages = dict(artifacts.get("stages") or {}) if isinstance(artifacts.get("stages"), dict) else {}
+    stage_obj = dict(stages.get(stage) or {}) if isinstance(stages.get(stage), dict) else {}
+    stage_obj.update(
+        {
+            "result": stop_status,
+            "timestamp": time.time(),
+            "summary": f"Guardrail stop: {reason}",
+            "source": "guardrail_stop",
+            "output": {"reason": reason, "details": details or {}},
+            "guardrail": {"reason": reason, **(details or {})},
+        }
+    )
+    stages[stage] = stage_obj
+    artifacts["stages"] = stages
+    report = dict(artifacts.get("report") or {}) if isinstance(artifacts.get("report"), dict) else {}
+    report["guardrail_stop"] = {
+        "reason": reason,
+        "stage": stage,
+        "status": stop_status,
+        "details": details or {},
+        "timestamp": time.time(),
+    }
+    artifacts["report"] = report
+    updated = store.update_run(
+        run.id,
+        {
+            "status": stop_status,
+            "current_stage": stage,
+            "stage_states": stage_states,
+            "artifacts": artifacts,
+            "finished_at": time.time(),
+        },
+    )
+    if updated is not None:
+        _append_run_event(
+            store=store,
+            run=updated,
+            event_type="guardrail_stop",
+            data={"reason": reason, "stage": stage, "status": stop_status, "details": details or {}},
+        )
+    return updated
 
 
 def _is_execution_active(session: Any, execution_id: str, *, worker_graph_id: str = "") -> bool:
@@ -748,6 +987,13 @@ def _evaluate_github_for_run(
     post_review_summary: bool = False,
     review_summary_comment: str = "",
 ) -> tuple[Any | None, str | None, int]:
+    valid, validation_error = _validate_github_credential(
+        token=token,
+        require_write=bool(post_review_summary),
+    )
+    if not valid:
+        return None, validation_error or "GitHub credential validation failed", 400
+
     pr_url_for_report = pr_url or None
     try:
         resolved_repo, resolved_ref = _resolve_github_target(
@@ -867,15 +1113,18 @@ def _github_fetch_json(url: str, token: str) -> dict[str, Any]:
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"GitHub API error ({e.code}): {detail[:300]}") from e
+        raise GitHubApiError(
+            f"GitHub API error ({e.code}): {detail[:300]}",
+            status_code=int(e.code),
+        ) from e
     except urllib.error.URLError as e:
-        raise RuntimeError(f"GitHub API unreachable: {e}") from e
+        raise GitHubApiError(f"GitHub API unreachable: {e}") from e
     try:
         data = json.loads(body)
     except json.JSONDecodeError as e:
-        raise RuntimeError("GitHub API returned invalid JSON") from e
+        raise GitHubApiError("GitHub API returned invalid JSON") from e
     if not isinstance(data, dict):
-        raise RuntimeError("GitHub API returned unexpected payload")
+        raise GitHubApiError("GitHub API returned unexpected payload")
     return data
 
 
@@ -894,20 +1143,74 @@ def _github_fetch_list_json(url: str, token: str) -> list[dict[str, Any]]:
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"GitHub API error ({e.code}): {detail[:300]}") from e
+        raise GitHubApiError(
+            f"GitHub API error ({e.code}): {detail[:300]}",
+            status_code=int(e.code),
+        ) from e
     except urllib.error.URLError as e:
-        raise RuntimeError(f"GitHub API unreachable: {e}") from e
+        raise GitHubApiError(f"GitHub API unreachable: {e}") from e
     try:
         data = json.loads(body)
     except json.JSONDecodeError as e:
-        raise RuntimeError("GitHub API returned invalid JSON") from e
+        raise GitHubApiError("GitHub API returned invalid JSON") from e
     if not isinstance(data, list):
-        raise RuntimeError("GitHub API returned unexpected payload")
+        raise GitHubApiError("GitHub API returned unexpected payload")
     out: list[dict[str, Any]] = []
     for item in data:
         if isinstance(item, dict):
             out.append(item)
     return out
+
+
+def _github_fetch_paginated_list_json(
+    *,
+    url: str,
+    token: str,
+    per_page: int = 100,
+    max_pages: int = 10,
+) -> list[dict[str, Any]]:
+    """Fetch paginated GitHub list endpoints with deterministic upper bound."""
+
+    page = 1
+    out: list[dict[str, Any]] = []
+    while page <= max_pages:
+        sep = "&" if "?" in url else "?"
+        page_url = f"{url}{sep}{urllib.parse.urlencode({'per_page': per_page, 'page': page})}"
+        rows = _github_fetch_list_json(page_url, token)
+        if not rows:
+            break
+        out.extend(rows)
+        if len(rows) < per_page:
+            break
+        page += 1
+    return out
+
+
+def _validate_github_credential(
+    *,
+    token: str,
+    require_write: bool = False,
+) -> tuple[bool, str | None]:
+    """Validate token before autonomous review/write actions."""
+
+    try:
+        _github_fetch_json("https://api.github.com/user", token)
+    except GitHubApiError as e:
+        if e.status_code in {401, 403}:
+            return (
+                False,
+                "GitHub credential is invalid, expired, or lacks required access. "
+                "Update `github` credential (or GITHUB_TOKEN) and retry.",
+            )
+        return False, f"GitHub credential validation failed: {e}"
+    except RuntimeError as e:
+        return False, f"GitHub credential validation failed: {e}"
+
+    # Write permission is still enforced by the write endpoint itself
+    # (issue comment POST). We keep this marker for explicit UX signalling.
+    if require_write:
+        return True, None
+    return True, None
 
 
 def _parse_github_pr_url(value: str) -> tuple[str, int] | None:
@@ -938,17 +1241,17 @@ def _fetch_github_pr_feedback(
         raise ValueError("pr_number must be positive")
 
     repo = repository.strip()
-    reviews = _github_fetch_list_json(
-        f"https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews?per_page=100",
-        token,
+    reviews = _github_fetch_paginated_list_json(
+        url=f"https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews",
+        token=token,
     )
-    review_comments = _github_fetch_list_json(
-        f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments?per_page=100",
-        token,
+    review_comments = _github_fetch_paginated_list_json(
+        url=f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments",
+        token=token,
     )
-    issue_comments = _github_fetch_list_json(
-        f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=100",
-        token,
+    issue_comments = _github_fetch_paginated_list_json(
+        url=f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
+        token=token,
     )
 
     states = {"approved": 0, "changes_requested": 0, "commented": 0, "dismissed": 0, "pending": 0}
@@ -975,6 +1278,16 @@ def _fetch_github_pr_feedback(
             "created_at": str(row.get("created_at") or "").strip(),
         }
 
+    def _compact_review(row: dict[str, Any]) -> dict[str, Any]:
+        user = row.get("user") if isinstance(row.get("user"), dict) else {}
+        return {
+            "id": row.get("id"),
+            "author": str(user.get("login") or "").strip(),
+            "state": str(row.get("state") or "").strip().lower(),
+            "submitted_at": str(row.get("submitted_at") or "").strip(),
+            "body": str(row.get("body") or "").strip()[:400],
+        }
+
     return {
         "pr_number": pr_number,
         "reviews_summary": {
@@ -983,6 +1296,7 @@ def _fetch_github_pr_feedback(
         },
         "review_comments_summary": {"total": len(review_comments)},
         "issue_comments_summary": {"total": len(issue_comments)},
+        "reviews": [_compact_review(x) for x in reviews[:20]],
         "review_comments": [_compact_review_comment(x) for x in review_comments[:20]],
         "issue_comments": [_compact_issue_comment(x) for x in issue_comments[:20]],
     }
@@ -1401,6 +1715,31 @@ def _apply_stage_result(
             review_feedback = github_output.get("review_feedback")
             if isinstance(review_feedback, dict):
                 report["review_feedback"] = review_feedback
+                reviews_summary = review_feedback.get("reviews_summary")
+                review_comments_summary = review_feedback.get("review_comments_summary")
+                issue_comments_summary = review_feedback.get("issue_comments_summary")
+                report["review_feedback_summary"] = {
+                    "ingested": True,
+                    "reviews_total": (
+                        int(reviews_summary.get("total") or 0) if isinstance(reviews_summary, dict) else 0
+                    ),
+                    "review_comments_total": (
+                        int(review_comments_summary.get("total") or 0)
+                        if isinstance(review_comments_summary, dict)
+                        else 0
+                    ),
+                    "issue_comments_total": (
+                        int(issue_comments_summary.get("total") or 0)
+                        if isinstance(issue_comments_summary, dict)
+                        else 0
+                    ),
+                }
+            review_feedback_error = github_output.get("review_feedback_error")
+            if isinstance(review_feedback_error, str) and review_feedback_error.strip():
+                report["review_feedback_summary"] = {
+                    "ingested": False,
+                    "error": review_feedback_error.strip(),
+                }
             posted_review_comment = github_output.get("posted_review_comment")
             if isinstance(posted_review_comment, dict):
                 report["posted_review_comment"] = posted_review_comment
@@ -1444,6 +1783,145 @@ def _apply_stage_result(
     return updated, None
 
 
+def _build_run_timeline(run: Any) -> list[dict[str, Any]]:
+    timeline: list[dict[str, Any]] = [
+        {
+            "type": "run_started",
+            "timestamp": float(getattr(run, "started_at", 0.0) or 0.0),
+            "run_id": str(getattr(run, "id", "") or ""),
+            "status": str(getattr(run, "status", "") or ""),
+        }
+    ]
+    artifacts = run.artifacts if isinstance(run.artifacts, dict) else {}
+    stages = artifacts.get("stages")
+    if isinstance(stages, dict):
+        for stage in STAGES:
+            record = stages.get(stage)
+            if not isinstance(record, dict):
+                continue
+            ts = float(record.get("timestamp") or 0.0)
+            checks_summary = record.get("checks_summary") if isinstance(record.get("checks_summary"), dict) else {}
+            row = {
+                "type": "stage_result",
+                "timestamp": ts,
+                "stage": stage,
+                "result": str(record.get("result") or "").strip().lower(),
+                "attempt": int(record.get("attempt") or 0),
+                "source": str(record.get("source") or "").strip() or None,
+                "checks_failed": int(checks_summary.get("failed") or 0),
+            }
+            timeline.append(row)
+
+    events = artifacts.get("events")
+    if isinstance(events, list):
+        for raw_evt in events:
+            if not isinstance(raw_evt, dict):
+                continue
+            evt_type = str(raw_evt.get("type") or "").strip().lower()
+            ts = float(raw_evt.get("timestamp") or 0.0)
+            data = raw_evt.get("data") if isinstance(raw_evt.get("data"), dict) else {}
+            timeline.append(
+                {
+                    "type": "run_event",
+                    "event_type": evt_type,
+                    "timestamp": ts,
+                    "stage": str(data.get("stage") or "").strip() or None,
+                    "status": str(data.get("status") or "").strip() or None,
+                    "reason": str(data.get("reason") or "").strip() or None,
+                    "source": str(data.get("source") or "").strip() or None,
+                }
+            )
+
+    timeline.sort(key=lambda row: float(row.get("timestamp") or 0.0))
+    return timeline
+
+
+def _classify_terminal_failure(run: Any) -> dict[str, Any] | None:
+    status = str(getattr(run, "status", "") or "").strip().lower()
+    if status not in {"failed", "escalated"}:
+        return None
+    artifacts = run.artifacts if isinstance(run.artifacts, dict) else {}
+    report = artifacts.get("report") if isinstance(artifacts.get("report"), dict) else {}
+    stages = artifacts.get("stages") if isinstance(artifacts.get("stages"), dict) else {}
+    events = artifacts.get("events") if isinstance(artifacts.get("events"), list) else []
+
+    signals: list[str] = []
+    reasons: list[str] = []
+
+    guardrail = report.get("guardrail_stop") if isinstance(report, dict) else {}
+    if isinstance(guardrail, dict):
+        reason = str(guardrail.get("reason") or "").strip()
+        if reason:
+            reasons.append(reason)
+            signals.append(f"guardrail:{reason}")
+
+    for stage in ("review", "validation"):
+        stage_rec = stages.get(stage) if isinstance(stages, dict) else {}
+        checks_summary = stage_rec.get("checks_summary") if isinstance(stage_rec, dict) else {}
+        if isinstance(checks_summary, dict) and int(checks_summary.get("failed") or 0) > 0:
+            signals.append(f"{stage}_checks_failed")
+            reasons.append(f"{stage}_checks_failed")
+
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        evt_type = str(evt.get("type") or "").strip().lower()
+        data = evt.get("data") if isinstance(evt.get("data"), dict) else {}
+        reason = str(data.get("reason") or "").strip()
+        if evt_type == "auto_next_deferred" and reason:
+            reasons.append(reason)
+            signals.append(f"deferred:{reason}")
+        elif evt_type == "guardrail_stop" and reason:
+            reasons.append(reason)
+            signals.append(f"guardrail_event:{reason}")
+
+    summary_text = str(report.get("summary") or "").strip()
+    if summary_text:
+        reasons.append(summary_text)
+
+    blob = " ".join(reasons).lower()
+    category = "runtime"
+    if any(x in blob for x in ["credential", "missing_github_token", "api key", "oauth", "token", "unauthorized"]):
+        category = "credential"
+    elif any(
+        x in blob
+        for x in [
+            "rate limit",
+            "429",
+            "provider",
+            "anthropic",
+            "openai",
+            "gemini",
+            "glm",
+            "model unavailable",
+        ]
+    ):
+        category = "provider"
+    elif any(
+        x in blob
+        for x in [
+            "guardrail",
+            "max_run_seconds_exceeded",
+            "max_tool_calls_exceeded",
+            "unknown_runtime_action",
+            "no_checks_policy",
+        ]
+    ):
+        category = "policy"
+    elif any(x in blob for x in ["checks_failed", "test", "lint", "build", "compile", "validation"]):
+        category = "code"
+    elif any(x in blob for x in ["timeout", "docker", "stuck", "no_active_run", "conflict", "paused"]):
+        category = "runtime"
+
+    primary_reason = reasons[0] if reasons else status
+    return {
+        "category": category,
+        "status": status,
+        "reason": primary_reason,
+        "signals": signals[:20],
+    }
+
+
 async def handle_backlog_list(request: web.Request) -> web.Response:
     manager = request.app[APP_KEY_MANAGER]
     project_id = request.match_info["project_id"]
@@ -1458,6 +1936,48 @@ async def handle_backlog_list(request: web.Request) -> web.Response:
     return web.json_response({"project_id": project_id, "tasks": tasks})
 
 
+async def handle_backlog_intake_template(request: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "required_fields": ["title", "goal", "acceptance_criteria", "constraints", "delivery_mode"],
+            "delivery_mode_options": sorted(INTAKE_DELIVERY_MODES),
+            "example": {
+                "title": "Fix POST->GET redirect downgrade in n8n API wrapper",
+                "goal": "Implement redirect-safe request flow and validate behavior with regression checks.",
+                "acceptance_criteria": [
+                    "POST request method is preserved on 301/302 handling path",
+                    "Regression test covers redirect-downgrade scenario",
+                ],
+                "constraints": [
+                    "Container-first execution only",
+                    "Do not add new runtime dependencies without approval",
+                ],
+                "delivery_mode": "patch_and_pr",
+            },
+        }
+    )
+
+
+async def handle_backlog_intake_validate(request: web.Request) -> web.Response:
+    body = await request.json() if request.can_read_body else {}
+    if not isinstance(body, dict):
+        return web.json_response({"error": "json object expected"}, status=400)
+    errors, normalized = _validate_intake_contract(body)
+    if errors:
+        return web.json_response(
+            {
+                "valid": False,
+                "errors": errors,
+                "hints": [
+                    "Use /api/autonomous/backlog/intake/template for canonical payload shape.",
+                    "Include specific outcome in goal and at least one explicit constraint.",
+                ],
+            },
+            status=400,
+        )
+    return web.json_response({"valid": True, "normalized": normalized})
+
+
 async def handle_backlog_create(request: web.Request) -> web.Response:
     manager = request.app[APP_KEY_MANAGER]
     project_id = request.match_info["project_id"]
@@ -1466,6 +1986,21 @@ async def handle_backlog_create(request: web.Request) -> web.Response:
         return web.json_response({"error": f"Project '{project_id}' not found"}, status=404)
 
     body = await request.json() if request.can_read_body else {}
+    if not isinstance(body, dict):
+        return web.json_response({"error": "json object expected"}, status=400)
+
+    if _intake_contract_enabled(body.get("strict_intake")):
+        intake_errors, _normalized = _validate_intake_contract(body)
+        if intake_errors:
+            return web.json_response(
+                {
+                    "error": "autonomous task intake contract validation failed",
+                    "details": intake_errors,
+                    "hint": "Use /api/autonomous/backlog/intake/template and retry with strict_intake=true payload.",
+                },
+                status=400,
+            )
+
     title = str(body.get("title") or "").strip()
     goal = str(body.get("goal") or "").strip()
     if not title or not goal:
@@ -1739,6 +2274,7 @@ async def _loop_tick_project(
 
     stage = active_run.current_stage
     if stage == "execution":
+        guardrails = _run_guardrails(project)
         outcome = _resolve_execution_outcome(manager, active_run)
         outcome_status = str(outcome.get("status") or "unknown")
         if outcome_status in {"completed", "failed", "paused"}:
@@ -1766,6 +2302,38 @@ async def _loop_tick_project(
                 "run": updated.__dict__.copy(),
             }, 200
         if outcome_status == "running":
+            session_id = str(outcome.get("session_id") or "").strip()
+            execution_id = str(outcome.get("execution_id") or "").strip()
+            worker_graph_id = str(outcome.get("worker_graph_id") or "").strip()
+            if session_id and execution_id:
+                tool_calls = _count_execution_tool_calls(
+                    session_id,
+                    execution_id,
+                    worker_graph_id=worker_graph_id,
+                )
+                max_tool_calls = int(guardrails.get("max_tool_calls_execution_stage") or 150)
+                if tool_calls > max_tool_calls:
+                    stopped = _apply_guardrail_terminal_stop(
+                        store=store,
+                        run=active_run,
+                        stage="execution",
+                        stop_action=str(guardrails.get("stop_action") or "failed"),
+                        reason="max_tool_calls_exceeded",
+                        details={
+                            "tool_calls": tool_calls,
+                            "max_tool_calls": max_tool_calls,
+                            "session_id": session_id,
+                            "execution_id": execution_id,
+                        },
+                    )
+                    if stopped is not None:
+                        store.update_task(stopped.task_id, {"status": "blocked"})
+                        return {
+                            "action": "guardrail_stopped",
+                            "project_id": project_id,
+                            "reason": "max_tool_calls_exceeded",
+                            "run": stopped.__dict__.copy(),
+                        }, 200
             stage_states = dict(active_run.stage_states)
             stage_states["execution"] = "running"
             artifacts = dict(active_run.artifacts) if isinstance(active_run.artifacts, dict) else {}
@@ -2268,6 +2836,8 @@ async def handle_pipeline_run_report(request: web.Request) -> web.Response:
         return web.json_response({"error": f"Run '{run_id}' not found"}, status=404)
     report = run.artifacts.get("report") if isinstance(run.artifacts, dict) else {}
     stages = run.artifacts.get("stages") if isinstance(run.artifacts, dict) else {}
+    failure_taxonomy = _classify_terminal_failure(run)
+    timeline = _build_run_timeline(run)
     return web.json_response(
         {
             "run_id": run.id,
@@ -2278,6 +2848,8 @@ async def handle_pipeline_run_report(request: web.Request) -> web.Response:
             "attempts": run.attempts,
             "report": report if isinstance(report, dict) else {},
             "stages": stages if isinstance(stages, dict) else {},
+            "failure_taxonomy": failure_taxonomy or {},
+            "timeline": timeline,
         }
     )
 
@@ -2611,17 +3183,43 @@ async def _run_until_terminal(
     if run is None or run.project_id != project_id:
         return {"error": f"Run '{run_id}' not found"}, 404
 
+    guardrails = _run_guardrails(project)
+    max_run_seconds = int(guardrails.get("max_run_seconds") or 1800)
+    max_loop_ticks = int(guardrails.get("max_loop_ticks_per_run") or 24)
+    stop_action = str(guardrails.get("stop_action") or "failed")
+    fail_on_unknown_action = bool(guardrails.get("fail_on_unknown_action"))
+    effective_max_steps = min(max_steps, max_loop_ticks)
+
     steps: list[dict[str, Any]] = []
     final_run = run
     terminal = final_run.status in {"completed", "failed", "escalated"}
     action = "already_terminal" if terminal else "run_started"
 
-    for _ in range(max_steps):
+    for _ in range(effective_max_steps):
         final_run = store.get_run(run_id) or final_run
         if final_run.status in {"completed", "failed", "escalated"}:
             terminal = True
             action = "terminal"
             break
+        elapsed_seconds = max(0.0, float(time.time() - float(final_run.started_at or 0.0)))
+        if elapsed_seconds > float(max_run_seconds):
+            stopped = _apply_guardrail_terminal_stop(
+                store=store,
+                run=final_run,
+                stage=str(final_run.current_stage or "execution"),
+                stop_action=stop_action,
+                reason="max_run_seconds_exceeded",
+                details={
+                    "elapsed_seconds": elapsed_seconds,
+                    "max_run_seconds": max_run_seconds,
+                },
+            )
+            if stopped is not None:
+                store.update_task(stopped.task_id, {"status": "blocked"})
+                final_run = stopped
+                terminal = True
+                action = "guardrail_stopped"
+                break
 
         active_run = _project_has_active_run(store, project_id)
         if active_run is None:
@@ -2654,6 +3252,31 @@ async def _run_until_terminal(
             terminal = True
             action = "terminal"
             break
+        known_non_terminal_actions = {
+            "dispatched_next_task",
+            "execution_stage_resolved",
+            "advanced_with_github_checks",
+            "await_execution_stage_result",
+            "await_manual_stage_resolution",
+            "manual_evaluate_required",
+            "idle_no_todo_tasks",
+            "no_active_run",
+        }
+        if fail_on_unknown_action and action and action not in known_non_terminal_actions:
+            stopped = _apply_guardrail_terminal_stop(
+                store=store,
+                run=final_run,
+                stage=str(final_run.current_stage or "execution"),
+                stop_action=stop_action,
+                reason="unknown_runtime_action",
+                details={"action": action},
+            )
+            if stopped is not None:
+                store.update_task(stopped.task_id, {"status": "blocked"})
+                final_run = stopped
+                terminal = True
+                action = "guardrail_stopped"
+                break
         if not _cycle_should_continue(action):
             break
 
@@ -2667,6 +3290,7 @@ async def _run_until_terminal(
             "status": final_run.status,
             "steps_executed": len(steps),
             "max_steps": max_steps,
+            "effective_max_steps": effective_max_steps,
             "action": action,
             "steps": steps,
             "run": final_run.__dict__.copy(),
@@ -2793,6 +3417,10 @@ async def handle_autonomous_ops_status(request: web.Request) -> web.Response:
     no_progress_threshold = _no_progress_threshold_seconds()
     loop_stale_threshold = _loop_stale_threshold_seconds()
     docker_lane = _docker_lane_health()
+    guardrail_stops_total = 0
+    guardrail_stops_by_reason: dict[str, int] = {}
+    failure_taxonomy: dict[str, int] = {}
+    terminal_failures_total = 0
 
     per_project: dict[str, dict[str, Any]] = {}
     for t in tasks:
@@ -2807,6 +3435,10 @@ async def handle_autonomous_ops_status(request: web.Request) -> web.Response:
                 "max_stuck_for_seconds": 0.0,
                 "active_runs": 0,
                 "max_no_progress_seconds": 0.0,
+                "guardrail_stops": 0,
+                "guardrail_stop_reasons": {},
+                "terminal_failures": 0,
+                "failure_taxonomy": {},
             },
         )
         ts = bucket["task_status"]
@@ -2827,6 +3459,10 @@ async def handle_autonomous_ops_status(request: web.Request) -> web.Response:
                 "max_stuck_for_seconds": 0.0,
                 "active_runs": 0,
                 "max_no_progress_seconds": 0.0,
+                "guardrail_stops": 0,
+                "guardrail_stop_reasons": {},
+                "terminal_failures": 0,
+                "failure_taxonomy": {},
             },
         )
         rs = bucket["run_status"]
@@ -2834,6 +3470,31 @@ async def handle_autonomous_ops_status(request: web.Request) -> web.Response:
         rs[r.status] = rs.get(r.status, 0) + 1
         cs[r.current_stage] = cs.get(r.current_stage, 0) + 1
         bucket["updated_at"] = max(float(bucket["updated_at"]), float(r.updated_at))
+        artifacts = r.artifacts if isinstance(r.artifacts, dict) else {}
+        report = artifacts.get("report") if isinstance(artifacts.get("report"), dict) else {}
+        guardrail_obj = report.get("guardrail_stop") if isinstance(report, dict) else {}
+        if isinstance(guardrail_obj, dict):
+            reason = str(guardrail_obj.get("reason") or "").strip() or "unknown"
+            guardrail_stops_total += 1
+            guardrail_stops_by_reason[reason] = int(guardrail_stops_by_reason.get(reason, 0)) + 1
+            bucket["guardrail_stops"] = int(bucket.get("guardrail_stops", 0)) + 1
+            reason_counts = bucket.get("guardrail_stop_reasons")
+            if not isinstance(reason_counts, dict):
+                reason_counts = {}
+            reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+            bucket["guardrail_stop_reasons"] = reason_counts
+
+        terminal_failure = _classify_terminal_failure(r)
+        if isinstance(terminal_failure, dict):
+            category = str(terminal_failure.get("category") or "").strip().lower() or "runtime"
+            terminal_failures_total += 1
+            failure_taxonomy[category] = int(failure_taxonomy.get(category, 0)) + 1
+            bucket["terminal_failures"] = int(bucket.get("terminal_failures", 0)) + 1
+            per_project_tax = bucket.get("failure_taxonomy")
+            if not isinstance(per_project_tax, dict):
+                per_project_tax = {}
+            per_project_tax[category] = int(per_project_tax.get(category, 0)) + 1
+            bucket["failure_taxonomy"] = per_project_tax
         if r.status in {"queued", "in_progress"}:
             bucket["active_runs"] = int(bucket.get("active_runs", 0)) + 1
             stuck_for = max(0.0, float(now_ts) - float(r.updated_at))
@@ -2847,6 +3508,12 @@ async def handle_autonomous_ops_status(request: web.Request) -> web.Response:
                         "current_stage": r.current_stage,
                         "updated_at": r.updated_at,
                         "no_progress_seconds": stuck_for,
+                        "guardrail_stop_reason": str(guardrail_obj.get("reason") or "").strip()
+                        if isinstance(guardrail_obj, dict)
+                        else None,
+                        "terminal_failure_category": str(terminal_failure.get("category") or "").strip()
+                        if isinstance(terminal_failure, dict)
+                        else None,
                     }
                 )
             if stuck_for >= float(stuck_threshold):
@@ -2885,6 +3552,7 @@ async def handle_autonomous_ops_status(request: web.Request) -> web.Response:
     loop_stale = False
     loop_stale_seconds = 0.0
     loop_state_status = ""
+    release_matrix = _read_release_matrix_snapshot()
     if isinstance(loop_state, dict):
         loop_state_status = str(loop_state.get("status") or "").strip().lower()
         hb = loop_state.get("updated_at", loop_state.get("finished_at", loop_state.get("started_at", 0.0)))
@@ -2921,6 +3589,16 @@ async def handle_autonomous_ops_status(request: web.Request) -> web.Response:
                 "tasks_by_status": _count_by(tasks, "status"),
                 "runs_by_status": _count_by(runs, "status"),
                 "runs_by_stage": _count_by(runs, "current_stage"),
+                "guardrail_stops_total": guardrail_stops_total,
+                "guardrail_stops_by_reason": guardrail_stops_by_reason,
+                "terminal_failures_total": terminal_failures_total,
+                "failure_taxonomy": failure_taxonomy,
+                "release_matrix_status": release_matrix.get("status"),
+                "release_matrix_must_passed": release_matrix.get("must_passed"),
+                "release_matrix_must_total": release_matrix.get("must_total"),
+                "release_matrix_must_failed": release_matrix.get("must_failed"),
+                "release_matrix_must_missing": release_matrix.get("must_missing"),
+                "release_matrix_generated_at": release_matrix.get("generated_at"),
             },
             "alerts": {
                 "stuck_threshold_seconds": stuck_threshold,
@@ -2935,6 +3613,7 @@ async def handle_autonomous_ops_status(request: web.Request) -> web.Response:
             },
             "projects": per_project,
             "active_runs": active_runs_details[:50] if include_runs else [],
+            "release_matrix": release_matrix,
             "runtime": {
                 "docker_lane": docker_lane,
             },
@@ -3192,6 +3871,8 @@ def register_routes(app: web.Application) -> None:
     if APP_KEY_AUTONOMOUS_STORE not in app:
         app[APP_KEY_AUTONOMOUS_STORE] = AutonomousPipelineStore()
 
+    app.router.add_get("/api/autonomous/backlog/intake/template", handle_backlog_intake_template)
+    app.router.add_post("/api/autonomous/backlog/intake/validate", handle_backlog_intake_validate)
     app.router.add_get("/api/projects/{project_id}/autonomous/backlog", handle_backlog_list)
     app.router.add_post("/api/projects/{project_id}/autonomous/backlog", handle_backlog_create)
     app.router.add_patch("/api/projects/{project_id}/autonomous/backlog/{task_id}", handle_backlog_update)

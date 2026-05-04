@@ -270,48 +270,6 @@ class _GitHubClient:
         )
         return self._handle_response(response)
 
-    def list_issue_comments(
-        self,
-        owner: str,
-        repo: str,
-        issue_number: int,
-        page: int = 1,
-        limit: int = 30,
-    ) -> dict[str, Any]:
-        """List issue comments (also works for PR conversation comments)."""
-        owner = _sanitize_path_param(owner, "owner")
-        repo = _sanitize_path_param(repo, "repo")
-        params = {
-            "per_page": min(limit, 100),
-            "page": max(1, page),
-        }
-
-        response = httpx.get(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/comments",
-            headers=self._headers,
-            params=params,
-            timeout=30.0,
-        )
-        return self._handle_response(response)
-
-    def create_issue_comment(
-        self,
-        owner: str,
-        repo: str,
-        issue_number: int,
-        body: str,
-    ) -> dict[str, Any]:
-        """Create an issue comment (also works for PR conversation comments)."""
-        owner = _sanitize_path_param(owner, "owner")
-        repo = _sanitize_path_param(repo, "repo")
-        response = httpx.post(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/comments",
-            headers=self._headers,
-            json={"body": body},
-            timeout=30.0,
-        )
-        return self._handle_response(response)
-
     # --- Pull Requests ---
 
     def list_pull_requests(
@@ -379,112 +337,6 @@ class _GitHubClient:
 
         response = httpx.post(
             f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls",
-            headers=self._headers,
-            json=payload,
-            timeout=30.0,
-        )
-        return self._handle_response(response)
-
-    def list_pull_request_reviews(
-        self,
-        owner: str,
-        repo: str,
-        pull_number: int,
-        page: int = 1,
-        limit: int = 30,
-    ) -> dict[str, Any]:
-        """List reviews on a pull request."""
-        owner = _sanitize_path_param(owner, "owner")
-        repo = _sanitize_path_param(repo, "repo")
-        params = {
-            "per_page": min(limit, 100),
-            "page": max(1, page),
-        }
-
-        response = httpx.get(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
-            headers=self._headers,
-            params=params,
-            timeout=30.0,
-        )
-        return self._handle_response(response)
-
-    def list_pull_request_review_comments(
-        self,
-        owner: str,
-        repo: str,
-        pull_number: int,
-        page: int = 1,
-        limit: int = 30,
-    ) -> dict[str, Any]:
-        """List inline review comments on a pull request."""
-        owner = _sanitize_path_param(owner, "owner")
-        repo = _sanitize_path_param(repo, "repo")
-        params = {
-            "per_page": min(limit, 100),
-            "page": max(1, page),
-        }
-
-        response = httpx.get(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/comments",
-            headers=self._headers,
-            params=params,
-            timeout=30.0,
-        )
-        return self._handle_response(response)
-
-    def create_pull_request_review(
-        self,
-        owner: str,
-        repo: str,
-        pull_number: int,
-        body: str | None = None,
-        event: str | None = None,
-        commit_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Create a pull request review (COMMENT/APPROVE/REQUEST_CHANGES)."""
-        owner = _sanitize_path_param(owner, "owner")
-        repo = _sanitize_path_param(repo, "repo")
-        payload: dict[str, Any] = {}
-        if body is not None:
-            payload["body"] = body
-        if event is not None:
-            payload["event"] = event
-        if commit_id is not None:
-            payload["commit_id"] = commit_id
-
-        response = httpx.post(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
-            headers=self._headers,
-            json=payload,
-            timeout=30.0,
-        )
-        return self._handle_response(response)
-
-    def create_pull_request_review_comment(
-        self,
-        owner: str,
-        repo: str,
-        pull_number: int,
-        body: str,
-        commit_id: str,
-        path: str,
-        line: int,
-        side: str = "RIGHT",
-    ) -> dict[str, Any]:
-        """Create an inline pull request review comment."""
-        owner = _sanitize_path_param(owner, "owner")
-        repo = _sanitize_path_param(repo, "repo")
-        payload: dict[str, Any] = {
-            "body": body,
-            "commit_id": commit_id,
-            "path": path,
-            "line": line,
-            "side": side,
-        }
-
-        response = httpx.post(
-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/comments",
             headers=self._headers,
             json=payload,
             timeout=30.0,
@@ -755,26 +607,14 @@ def register_tools(
 
     def _get_token(account: str = "") -> str | None:
         """Get GitHub token from credential manager or environment."""
-        env_token = os.getenv("GITHUB_TOKEN")
         if credentials is not None:
-            try:
-                if account:
-                    token = credentials.get_by_alias("github", account)
-                    if token:
-                        return token
-                else:
-                    token = credentials.get("github")
-                    if token is not None and not isinstance(token, str):
-                        raise TypeError(
-                            f"Expected string from credentials.get('github'), got {type(token).__name__}"
-                        )
-                    if token:
-                        return token
-            except Exception:
-                # Credential store can fail to decrypt stale entries if key rotated.
-                # Fall back to env token so runtime can continue.
-                pass
-        return env_token
+            if account:
+                return credentials.get_by_alias("github", account)
+            token = credentials.get("github")
+            if token is not None and not isinstance(token, str):
+                raise TypeError(f"Expected string from credentials.get('github'), got {type(token).__name__}")
+            return token
+        return os.getenv("GITHUB_TOKEN")
 
     def _get_client(account: str = "") -> _GitHubClient | dict[str, str]:
         """Get a GitHub client, or return an error dict if no credentials."""
@@ -1008,55 +848,6 @@ def register_tools(
         except httpx.RequestError as e:
             return {"error": _sanitize_error_message(e)}
 
-    @mcp.tool()
-    def github_list_issue_comments(
-        owner: str,
-        repo: str,
-        issue_number: int,
-        page: int = 1,
-        limit: int = 30,
-        account: str = "",
-    ) -> dict:
-        """
-        List issue comments.
-
-        Note: Pull requests are issues in GitHub, so this also returns
-        PR conversation comments (top-level comments, not inline code comments).
-        """
-        client = _get_client(account)
-        if isinstance(client, dict):
-            return client
-        try:
-            return client.list_issue_comments(owner, repo, issue_number, page, limit)
-        except httpx.TimeoutException:
-            return {"error": "Request timed out"}
-        except httpx.RequestError as e:
-            return {"error": _sanitize_error_message(e)}
-
-    @mcp.tool()
-    def github_create_issue_comment(
-        owner: str,
-        repo: str,
-        issue_number: int,
-        body: str,
-        account: str = "",
-    ) -> dict:
-        """
-        Create an issue comment.
-
-        Note: Pull requests are issues in GitHub, so this can be used to
-        post a top-level PR conversation comment.
-        """
-        client = _get_client(account)
-        if isinstance(client, dict):
-            return client
-        try:
-            return client.create_issue_comment(owner, repo, issue_number, body)
-        except httpx.TimeoutException:
-            return {"error": "Request timed out"}
-        except httpx.RequestError as e:
-            return {"error": _sanitize_error_message(e)}
-
     # --- Pull Requests ---
 
     @mcp.tool()
@@ -1150,102 +941,6 @@ def register_tools(
             return client
         try:
             return client.create_pull_request(owner, repo, title, head, base, body, draft)
-        except httpx.TimeoutException:
-            return {"error": "Request timed out"}
-        except httpx.RequestError as e:
-            return {"error": _sanitize_error_message(e)}
-
-    @mcp.tool()
-    def github_list_pull_request_reviews(
-        owner: str,
-        repo: str,
-        pull_number: int,
-        page: int = 1,
-        limit: int = 30,
-        account: str = "",
-    ) -> dict:
-        """
-        List pull request reviews (APPROVED/CHANGES_REQUESTED/COMMENTED).
-        """
-        client = _get_client(account)
-        if isinstance(client, dict):
-            return client
-        try:
-            return client.list_pull_request_reviews(owner, repo, pull_number, page, limit)
-        except httpx.TimeoutException:
-            return {"error": "Request timed out"}
-        except httpx.RequestError as e:
-            return {"error": _sanitize_error_message(e)}
-
-    @mcp.tool()
-    def github_list_pull_request_review_comments(
-        owner: str,
-        repo: str,
-        pull_number: int,
-        page: int = 1,
-        limit: int = 30,
-        account: str = "",
-    ) -> dict:
-        """
-        List inline review comments on a pull request (code-level comments).
-        """
-        client = _get_client(account)
-        if isinstance(client, dict):
-            return client
-        try:
-            return client.list_pull_request_review_comments(owner, repo, pull_number, page, limit)
-        except httpx.TimeoutException:
-            return {"error": "Request timed out"}
-        except httpx.RequestError as e:
-            return {"error": _sanitize_error_message(e)}
-
-    @mcp.tool()
-    def github_create_pull_request_review(
-        owner: str,
-        repo: str,
-        pull_number: int,
-        body: str | None = None,
-        event: str | None = None,
-        commit_id: str | None = None,
-        account: str = "",
-    ) -> dict:
-        """
-        Create a pull request review.
-
-        event can be COMMENT, APPROVE, or REQUEST_CHANGES.
-        """
-        client = _get_client(account)
-        if isinstance(client, dict):
-            return client
-        try:
-            return client.create_pull_request_review(owner, repo, pull_number, body, event, commit_id)
-        except httpx.TimeoutException:
-            return {"error": "Request timed out"}
-        except httpx.RequestError as e:
-            return {"error": _sanitize_error_message(e)}
-
-    @mcp.tool()
-    def github_create_pull_request_review_comment(
-        owner: str,
-        repo: str,
-        pull_number: int,
-        body: str,
-        commit_id: str,
-        path: str,
-        line: int,
-        side: str = "RIGHT",
-        account: str = "",
-    ) -> dict:
-        """
-        Create an inline pull request review comment.
-        """
-        client = _get_client(account)
-        if isinstance(client, dict):
-            return client
-        try:
-            return client.create_pull_request_review_comment(
-                owner, repo, pull_number, body, commit_id, path, line, side
-            )
         except httpx.TimeoutException:
             return {"error": "Request timed out"}
         except httpx.RequestError as e:
@@ -1494,9 +1189,7 @@ def register_tools(
         if isinstance(client, dict):
             return client
         try:
-            return client.create_release(
-                owner, repo, tag_name, name, body, draft, prerelease, target_commitish
-            )
+            return client.create_release(owner, repo, tag_name, name, body, draft, prerelease, target_commitish)
         except httpx.TimeoutException:
             return {"error": "Request timed out"}
         except httpx.RequestError as e:

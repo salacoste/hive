@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -185,6 +186,8 @@ class ColonyRuntime:
         protocols_prompt: str = "",
         skill_dirs: list[str] | None = None,
         pipeline_stages: list | None = None,
+        queen_id: str | None = None,
+        colony_name: str | None = None,
     ):
         from framework.pipeline.runner import PipelineRunner
         from framework.skills.manager import SkillsManager
@@ -193,14 +196,27 @@ class ColonyRuntime:
         self._goal = goal
         self._config = config or ColonyConfig()
         self._runtime_log_store = runtime_log_store
+        self._queen_id: str | None = queen_id
+        # ``colony_id`` is the event-bus scope (session.id in DM sessions);
+        # ``colony_name`` is the on-disk identity under ~/.hive/colonies/.
+        # They coincide for forked colonies but diverge for queen DM
+        # sessions, so separate them explicitly.
+        self._colony_name: str | None = colony_name
 
         if pipeline_stages:
             self._pipeline = PipelineRunner(pipeline_stages)
         else:
             self._pipeline = self._load_pipeline_from_config()
 
-        if skills_manager_config is not None:
-            self._skills_manager = SkillsManager(skills_manager_config)
+        # Resolve per-colony override paths so UI toggles can reach this
+        # runtime. Callers that build their own SkillsManagerConfig stay
+        # in charge; bare construction auto-wires the standard paths.
+        _effective_cfg = skills_manager_config
+        if _effective_cfg is None and not (skills_catalog_prompt or protocols_prompt):
+            _effective_cfg = self._build_default_skills_config(colony_name, queen_id)
+
+        if _effective_cfg is not None:
+            self._skills_manager = SkillsManager(_effective_cfg)
             self._skills_manager.load()
         elif skills_catalog_prompt or protocols_prompt:
             import warnings
@@ -241,6 +257,19 @@ class ColonyRuntime:
         self._llm = llm
         self._tools = tools or []
         self._tool_executor = tool_executor
+
+        # Per-colony MCP tool allowlist — applied when spawning workers. A
+        # value of ``None`` means "allow every MCP tool" (default), an empty
+        # list disables every MCP tool, and a list of names only enables
+        # those. Lifecycle / synthetic tools always pass through the filter
+        # because their names are absent from ``_mcp_tool_names_all``. The
+        # allowlist is re-read on every ``spawn`` so a PATCH that mutates
+        # this attribute via ``set_tool_allowlist`` takes effect on the
+        # NEXT worker spawn without a runtime restart. In-flight workers
+        # keep the tool list they booted with — workers have no dynamic
+        # tools provider today.
+        self._enabled_mcp_tools: list[str] | None = None
+        self._mcp_tool_names_all: set[str] = set()
 
         # Worker management
         self._workers: dict[str, Worker] = {}
@@ -383,6 +412,128 @@ class ColonyRuntime:
         if not stages_config:
             return PipelineRunner([])
         return build_pipeline_from_config(stages_config)
+
+    @staticmethod
+    def _build_default_skills_config(
+        colony_name: str | None,
+        queen_id: str | None,
+    ) -> SkillsManagerConfig:
+        """Assemble a ``SkillsManagerConfig`` that wires in the per-colony /
+        per-queen override files and the ``queen_ui`` / ``colony_ui`` scope
+        dirs based on the standard ``~/.hive`` layout.
+
+        ``colony_name`` must be an actual on-disk colony name
+        (``~/.hive/colonies/{name}/``). DM sessions where the ``colony_id``
+        is a session UUID should pass ``None`` so we don't create a stray
+        override file under a session identifier.
+        """
+        from framework.config import COLONIES_DIR, QUEENS_DIR
+        from framework.skills.discovery import ExtraScope
+        from framework.skills.manager import SkillsManagerConfig
+
+        extras: list[ExtraScope] = []
+        queen_overrides_path: Path | None = None
+        if queen_id:
+            queen_home = QUEENS_DIR / queen_id
+            queen_overrides_path = queen_home / "skills_overrides.json"
+            extras.append(ExtraScope(directory=queen_home / "skills", label="queen_ui", priority=2))
+
+        colony_overrides_path: Path | None = None
+        if colony_name:
+            colony_home = COLONIES_DIR / colony_name
+            colony_overrides_path = colony_home / "skills_overrides.json"
+            # Colony-scope SKILL.md dir is the project-scope from discovery's
+            # point of view (colony_dir is the project_root). Add it also as
+            # a tagged ``colony_ui`` scope so UI-created entries resolve with
+            # correct provenance.
+            extras.append(
+                ExtraScope(
+                    directory=colony_home / ".hive" / "skills",
+                    label="colony_ui",
+                    priority=3,
+                )
+            )
+
+        return SkillsManagerConfig(
+            queen_id=queen_id,
+            queen_overrides_path=queen_overrides_path,
+            colony_name=colony_name,
+            colony_overrides_path=colony_overrides_path,
+            extra_scope_dirs=extras,
+            interactive=False,  # HTTP-driven runtimes never prompt for consent
+        )
+
+    @property
+    def queen_id(self) -> str | None:
+        """The queen that owns this runtime, if known."""
+        return self._queen_id
+
+    @property
+    def colony_name(self) -> str | None:
+        """The on-disk colony name (distinct from event-bus scope ``colony_id``)."""
+        return self._colony_name
+
+    @property
+    def skills_manager(self):
+        """Access the live :class:`SkillsManager` (for HTTP handlers)."""
+        return self._skills_manager
+
+    async def reload_skills(self) -> dict[str, Any]:
+        """Rebuild the catalog after an override change; in-flight workers
+        pick up the new catalog on their next iteration via
+        ``dynamic_skills_catalog_provider``.
+
+        Returns a small stats dict that HTTP handlers can echo back to
+        the UI ("applied — N skills now in catalog").
+        """
+        async with self._skills_manager.mutation_lock:
+            self._skills_manager.reload()
+            self.skill_dirs = self._skills_manager.allowlisted_dirs
+            self.batch_init_nudge = self._skills_manager.batch_init_nudge
+            self.context_warn_ratio = self._skills_manager.context_warn_ratio
+            catalog_prompt = self._skills_manager.skills_catalog_prompt
+            return {
+                "catalog_chars": len(catalog_prompt),
+                "skill_dirs": list(self.skill_dirs),
+            }
+
+    # ── Per-colony tool allowlist ───────────────────────────────
+
+    def set_tool_allowlist(
+        self,
+        enabled_mcp_tools: list[str] | None,
+        mcp_tool_names_all: set[str] | None = None,
+    ) -> None:
+        """Configure the per-colony MCP tool allowlist.
+
+        Called at construction time (from SessionManager) and again from
+        the ``/api/colony/{name}/tools`` PATCH handler when a user edits
+        the allowlist. The change applies to the NEXT worker spawn — we
+        never mutate the tool list of a worker that is already running
+        (workers have no dynamic tools provider, so hot-reloading their
+        tool set would diverge from the list the LLM was already using).
+        """
+        self._enabled_mcp_tools = list(enabled_mcp_tools) if enabled_mcp_tools is not None else None
+        if mcp_tool_names_all is not None:
+            self._mcp_tool_names_all = set(mcp_tool_names_all)
+
+    def _apply_tool_allowlist(self, tools: list) -> list:
+        """Filter ``tools`` against the colony's MCP allowlist.
+
+        Lifecycle / synthetic tools (those whose names are NOT in
+        ``_mcp_tool_names_all``) are never gated. MCP tools are kept only
+        when ``_enabled_mcp_tools`` is None (default allow) or contains
+        their name. Input list order is preserved so downstream cache
+        keys and logs stay stable.
+        """
+        if self._enabled_mcp_tools is None:
+            return tools
+        allowed = set(self._enabled_mcp_tools)
+        return [
+            t
+            for t in tools
+            if getattr(t, "name", None) not in self._mcp_tool_names_all or getattr(t, "name", None) in allowed
+        ]
 
     # ── Lifecycle ───────────────────────────────────────────────
 
@@ -658,6 +809,14 @@ class ColonyRuntime:
         spawn_tools = tools if tools is not None else self._tools
         spawn_executor = tool_executor or self._tool_executor
 
+        # Apply the per-colony MCP tool allowlist (if any). Done HERE —
+        # after spawn_tools is resolved but before it's frozen into the
+        # worker's AgentContext — so the next spawn reflects any PATCH
+        # that happened since the last spawn. A value of ``None`` on
+        # ``_enabled_mcp_tools`` is a no-op so the default path is
+        # unchanged.
+        spawn_tools = self._apply_tool_allowlist(spawn_tools)
+
         # Colony progress tracker: when the caller supplied a db_path
         # in input_data, this worker is part of a SQLite task queue
         # and must see the hive.colony-progress-tracker skill body in
@@ -740,6 +899,17 @@ class ColonyRuntime:
                 conversation_store=worker_conv_store,
             )
 
+            # Workers pick up UI-driven override changes via this provider,
+            # which reads the live catalog on each iteration. The db_path
+            # pre-activated catalog stays static because its contents are
+            # built for *this* worker's task (a tombstone toggle from the
+            # UI should not yank it mid-run).
+            _db_path_pre_activated = bool(isinstance(input_data, dict) and input_data.get("db_path"))
+            # Default-bind the manager into the closure so each loop iteration
+            # captures the same manager instance — pyflakes B023 would flag a
+            # free-variable capture here.
+            _provider = None if _db_path_pre_activated else (lambda mgr=self._skills_manager: mgr.skills_catalog_prompt)
+
             agent_context = AgentContext(
                 runtime=self._make_runtime_adapter(worker_id),
                 agent_id=worker_id,
@@ -753,6 +923,7 @@ class ColonyRuntime:
                 skills_catalog_prompt=_spawn_catalog,
                 protocols_prompt=self.protocols_prompt,
                 skill_dirs=_spawn_skill_dirs,
+                dynamic_skills_catalog_provider=_provider,
                 execution_id=worker_id,
                 stream_id=explicit_stream_id or f"worker:{worker_id}",
             )
@@ -997,6 +1168,7 @@ class ColonyRuntime:
             conversation_store=overseer_conv_store,
         )
 
+        _overseer_skills_mgr = self._skills_manager
         overseer_ctx = AgentContext(
             runtime=self._make_runtime_adapter(overseer_id),
             agent_id=overseer_id,
@@ -1010,6 +1182,7 @@ class ColonyRuntime:
             skills_catalog_prompt=self.skills_catalog_prompt,
             protocols_prompt=self.protocols_prompt,
             skill_dirs=self.skill_dirs,
+            dynamic_skills_catalog_provider=lambda: _overseer_skills_mgr.skills_catalog_prompt,
             execution_id=overseer_id,
             stream_id="overseer",
         )
@@ -1418,8 +1591,11 @@ class ColonyRuntime:
         future = asyncio.run_coroutine_threadsafe(self.cancel_all_tasks_async(), loop)
         try:
             return future.result(timeout=5)
+        except FutureTimeoutError:
+            logger.debug("cancel_all_tasks: timed out waiting for cancellation acknowledgement")
+            return False
         except Exception:
-            logger.warning("cancel_all_tasks: timed out or failed")
+            logger.warning("cancel_all_tasks: failed", exc_info=True)
             return False
 
     async def cancel_execution(self, trigger_id: str, worker_id: str) -> bool:

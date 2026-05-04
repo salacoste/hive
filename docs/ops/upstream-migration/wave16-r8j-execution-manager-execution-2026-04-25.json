@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T10:42:08Z",
+  "wave": "Wave16-R8J",
+  "title": "Execution manager warning-noise lane execution",
+  "scope": [
+    "core/framework/host/execution_manager.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local branch downgrades cancellation-grace timeout log level from warning to info",
+      "stream_id context in message improves observability while reducing warning noise",
+      "aligned with prior runtime warning-noise hardening policy"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; local warning-noise behavior retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"autonomous or execution\" -q",
+        "result": "pass",
+        "summary": "83 passed, 110 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      }
+    ],
+    "gate_reference": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "latest run ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R8J lane closed with explicit warning-noise keep-local guard",
+      "next checkpoint should classify remaining local-additive residuals"
+    ]
+  }
+}

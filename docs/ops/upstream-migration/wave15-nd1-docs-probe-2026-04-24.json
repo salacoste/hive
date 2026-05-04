@@ -1,0 +1,33 @@
+{
+  "date": "2026-04-24",
+  "generated_at_utc": "2026-04-24T13:52:23.621549+00:00",
+  "base_ref": "HEAD",
+  "upstream_ref": "upstream/main",
+  "batch_id": "ND-1-docs-lane",
+  "files": [
+    {
+      "path": "docs/skill-registry-prd.md",
+      "upstream_status": "M",
+      "local_worktree_status": "M docs/skill-registry-prd.md",
+      "upstream_added_lines": 7,
+      "upstream_deleted_lines": 5
+    },
+    {
+      "path": "docs/releases/v0.10.3.md",
+      "upstream_status": "A",
+      "local_worktree_status": "?? docs/releases/v0.10.3.md",
+      "upstream_added_lines": 39,
+      "upstream_deleted_lines": 0
+    },
+    {
+      "path": "docs/releases/v0.10.4.md",
+      "upstream_status": "A",
+      "local_worktree_status": "?? docs/releases/v0.10.4.md",
+      "upstream_added_lines": 77,
+      "upstream_deleted_lines": 0
+    }
+  ],
+  "patch_path": "docs/ops/upstream-migration/wave15-nd1-docs.patch",
+  "git_apply_check_exit_code": 1,
+  "git_apply_check_stderr": "error: docs/releases/v0.10.3.md: already exists in working directory\nerror: docs/releases/v0.10.4.md: already exists in working directory\nerror: patch failed: docs/skill-registry-prd.md:189\nerror: docs/skill-registry-prd.md: patch does not apply"
+}

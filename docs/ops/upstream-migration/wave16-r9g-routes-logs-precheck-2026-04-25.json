@@ -1,0 +1,37 @@
+{
+  "generated_at_utc": "2026-04-25T11:39:15Z",
+  "wave": "Wave16-R9G",
+  "title": "Routes logs behavior lane precheck",
+  "scope": [
+    "core/framework/server/routes_logs.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/server/routes_logs.py",
+      "add": 12,
+      "del": 6,
+      "total": 18
+    }
+  },
+  "delta_summary": [
+    "runtime selection hardened to support both colony_runtime and graph_runtime",
+    "node logs route includes backward-compatible graph-scoped endpoint plus colony-scoped endpoint"
+  ],
+  "risk_signals": [
+    {
+      "type": "api-compat",
+      "evidence": "upstream variant lacks graph-scoped node logs route used by existing Web UI/tests",
+      "impact": "potential 404/regression for existing frontend and API consumers"
+    },
+    {
+      "type": "runtime-topology",
+      "evidence": "upstream reads session.colony_runtime only",
+      "impact": "log route can fail in sessions running on graph_runtime shape"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"logs\" -q",
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q"
+  ],
+  "decision_gate": "prefer keep_local if compatibility/runtime-hardening benefits are confirmed by tests"
+}

@@ -1,0 +1,52 @@
+{
+  "generated_at_utc": "2026-04-25T00:05:23Z",
+  "item": 286,
+  "lane": "ND-5B",
+  "title": "Server mini-lane reconcile + execution",
+  "scope": [
+    "core/framework/server/README.md",
+    "core/framework/server/routes_events.py"
+  ],
+  "inputs": {
+    "patch": "docs/ops/upstream-migration/wave15-nd5b-server-mini.patch",
+    "probe": "docs/ops/upstream-migration/wave15-nd5b-server-mini-probe-2026-04-24.json",
+    "replay_plan": "docs/ops/upstream-migration/wave15-nd5b-server-mini-replay-plan-2026-04-24.md",
+    "reconcile_analysis": "docs/ops/upstream-migration/wave15-nd5b-server-mini-reconcile-analysis-2026-04-24.md"
+  },
+  "reconcile_decisions": [
+    {
+      "file": "core/framework/server/README.md",
+      "decision": "keep_local",
+      "reason": "local docs already reflect AppKey-based manager access (request.app[APP_KEY_MANAGER]) and avoid legacy app key string pattern"
+    },
+    {
+      "file": "core/framework/server/routes_events.py",
+      "decision": "partial_adopt",
+      "change": "restore EventType.TRIGGER_FIRED.value into SSE replay set (_REPLAY_TYPES)",
+      "reason": "align trigger replay behavior with upstream while keeping local event streaming contracts"
+    }
+  ],
+  "execution": {
+    "code_change": {
+      "file": "core/framework/server/routes_events.py",
+      "summary": "Added EventType.TRIGGER_FIRED.value to _REPLAY_TYPES"
+    },
+    "targeted_validation": {
+      "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"events or health\" -q",
+      "result": "pass",
+      "summary": "8 passed, 185 deselected"
+    },
+    "full_gate_validation": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "ND-5B reconcile decisions fixed and validated",
+      "backlog can move to next bounded lane"
+    ]
+  }
+}

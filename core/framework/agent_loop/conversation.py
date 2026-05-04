@@ -56,6 +56,13 @@ class Message:
     # from a crashed or watchdog-cancelled stream. Signals that the original
     # turn never finished — the model may or may not choose to redo it.
     truncated: bool = False
+    # Optional parent session id when a message is inherited across session
+    # boundaries (e.g. compact-and-fork / colony fork summary handoff).
+    inherited_from: str | None = None
+    # True when a user-role message was synthesized from trigger activation
+    # rather than typed by a human. Keeps UI/event rendering stable for
+    # trigger banners without changing LLM role semantics.
+    is_trigger: bool = False
 
     def to_llm_dict(self) -> dict[str, Any]:
         """Convert to OpenAI-format message dict."""
@@ -121,6 +128,10 @@ class Message:
             d["is_system_nudge"] = self.is_system_nudge
         if self.truncated:
             d["truncated"] = self.truncated
+        if self.inherited_from is not None:
+            d["inherited_from"] = self.inherited_from
+        if self.is_trigger:
+            d["is_trigger"] = self.is_trigger
         return d
 
     @classmethod
@@ -140,6 +151,8 @@ class Message:
             run_id=data.get("run_id"),
             is_system_nudge=data.get("is_system_nudge", False),
             truncated=data.get("truncated", False),
+            inherited_from=data.get("inherited_from"),
+            is_trigger=data.get("is_trigger", False),
         )
 
 
@@ -485,6 +498,7 @@ class NodeConversation:
         is_client_input: bool = False,
         image_content: list[dict[str, Any]] | None = None,
         is_system_nudge: bool = False,
+        is_trigger: bool = False,
     ) -> Message:
         msg = Message(
             seq=self._next_seq,
@@ -496,6 +510,7 @@ class NodeConversation:
             is_client_input=is_client_input,
             image_content=image_content,
             is_system_nudge=is_system_nudge,
+            is_trigger=is_trigger,
         )
         self._messages.append(msg)
         self._next_seq += 1

@@ -7,7 +7,7 @@ locations. Resolves name collisions deterministically.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from framework.skills.parser import ParsedSkill, parse_skill_md
@@ -30,14 +30,38 @@ _SKIP_DIRS = frozenset(
 )
 
 # Scope priority (higher = takes precedence)
+# ``preset`` sits between framework and user: bundled alongside the
+# framework distribution, but off by default — capability packs the user
+# opts into per queen/colony rather than globally-enabled infra.
 _SCOPE_PRIORITY = {
     "framework": 0,
-    "user": 1,
-    "project": 2,
+    "preset": 1,
+    "user": 2,
+    "queen_ui": 3,
+    "colony_ui": 4,
+    "project": 5,
 }
 
 # Within the same scope, Hive-specific paths override cross-client paths.
 # We encode this by scanning cross-client first, then Hive-specific (later wins).
+
+
+@dataclass
+class ExtraScope:
+    """Additional scope dir to scan beyond the standard five.
+
+    Used by :class:`framework.skills.manager.SkillsManager` to surface
+    per-queen (``queen_ui``) and per-colony (``colony_ui``) skill
+    directories created through the UI. The ``label`` feeds
+    :attr:`ParsedSkill.source_scope` so downstream consumers (trust
+    gate, UI provenance resolver) can distinguish scope origins.
+    """
+
+    directory: Path
+    label: str
+    # Kept for forward-compat with the priority table; discovery itself
+    # relies on scan order for last-wins resolution.
+    priority: int = 0
 
 
 @dataclass
@@ -49,6 +73,10 @@ class DiscoveryConfig:
     skip_framework_scope: bool = False
     max_depth: int = 4
     max_dirs: int = 2000
+    # Additional scope dirs scanned between user and project scopes,
+    # in the order they are provided. Use ``ExtraScope`` to tag each
+    # with its logical label (``queen_ui`` / ``colony_ui``).
+    extra_scopes: list[ExtraScope] = field(default_factory=list)
 
 
 class SkillDiscovery:
@@ -82,12 +110,21 @@ class SkillDiscovery:
         all_skills: list[ParsedSkill] = []
         self._scanned_dirs = []
 
-        # Framework scope (lowest precedence)
+        # Framework scope (lowest precedence) — always-on infra skills.
         if not self._config.skip_framework_scope:
             framework_dir = Path(__file__).parent / "_default_skills"
             if framework_dir.is_dir():
                 self._scanned_dirs.append(framework_dir)
                 all_skills.extend(self._scan_scope(framework_dir, "framework"))
+
+            # Preset scope — bundled capability packs that ship with the
+            # framework but default to OFF. User opts in per queen/colony
+            # via the Skills Library. ``skip_framework_scope`` covers both
+            # bundled directories since they live side-by-side on disk.
+            preset_dir = Path(__file__).parent / "_preset_skills"
+            if preset_dir.is_dir():
+                self._scanned_dirs.append(preset_dir)
+                all_skills.extend(self._scan_scope(preset_dir, "preset"))
 
         # User scope
         if not self._config.skip_user_scope:
@@ -104,6 +141,13 @@ class SkillDiscovery:
             if user_hive.is_dir():
                 self._scanned_dirs.append(user_hive)
                 all_skills.extend(self._scan_scope(user_hive, "user"))
+
+        # Extra scopes (queen_ui / colony_ui), scanned between user and project
+        # so colony overrides beat queen overrides, and both beat user-scope.
+        for extra in self._config.extra_scopes:
+            if extra.directory.is_dir():
+                self._scanned_dirs.append(extra.directory)
+                all_skills.extend(self._scan_scope(extra.directory, extra.label))
 
         # Project scope (highest precedence)
         if self._config.project_root:
@@ -189,6 +233,18 @@ class SkillDiscovery:
         for skill in skills:
             if skill.name in seen:
                 existing = seen[skill.name]
+                # Expected bundled override: preset skills intentionally sit
+                # above framework defaults and may share names. Treat these as
+                # deterministic precedence, not operational warnings.
+                if self._is_expected_bundled_collision(existing, skill):
+                    logger.debug(
+                        "Skill collision (expected bundled override): '%s' -> %s overrides %s",
+                        skill.name,
+                        skill.location,
+                        existing.location,
+                    )
+                    seen[skill.name] = skill
+                    continue
                 log_skill_error(
                     logger,
                     "warning",
@@ -200,3 +256,9 @@ class SkillDiscovery:
             seen[skill.name] = skill
 
         return list(seen.values())
+
+    @staticmethod
+    def _is_expected_bundled_collision(existing: ParsedSkill, incoming: ParsedSkill) -> bool:
+        """Return True when collision is the intended framework→preset override."""
+        scopes = {existing.source_scope, incoming.source_scope}
+        return scopes == {"framework", "preset"}

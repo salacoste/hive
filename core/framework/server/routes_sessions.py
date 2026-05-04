@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import mimetypes
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,11 @@ from framework.server.app import (
 from framework.server.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_EVENTS_HISTORY_LIMIT = 2000
+MAX_EVENTS_HISTORY_LIMIT = 10000
+MAX_SESSION_FILE_LIST_ENTRIES = 5000
+MAX_SESSION_FILE_PREVIEW_BYTES = 256 * 1024
 
 
 def _get_manager(request: web.Request) -> SessionManager:
@@ -67,6 +73,23 @@ def _resolve_session_storage_folder(
     return folder
 
 
+def _resolve_session_file_path(session_folder: Path, relative_path: str) -> Path:
+    """Resolve a user-provided session-relative path safely."""
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        raise ValueError("Query parameter 'path' is required")
+
+    candidate = Path(relative_path.strip())
+    if candidate.is_absolute():
+        raise ValueError("Path must be relative to the session folder")
+
+    resolved = (session_folder / candidate).resolve()
+    try:
+        resolved.relative_to(session_folder)
+    except ValueError as exc:
+        raise ValueError("Path escapes the session folder") from exc
+    return resolved
+
+
 def _session_to_live_dict(session) -> dict:
     """Serialize a live Session to the session-primary JSON shape."""
     from framework.llm.capabilities import supports_image_tool_results
@@ -77,6 +100,9 @@ def _session_to_live_dict(session) -> dict:
     return {
         "session_id": session.id,
         "project_id": getattr(session, "project_id", "default"),
+        "queen_id": getattr(session, "queen_name", None),
+        "queen_name": getattr(session, "queen_name", None),
+        "colony_id": getattr(session, "colony_id", None),
         "graph_id": session.graph_id,
         "graph_name": info.name if info else session.graph_id,
         "has_worker": session.graph_runtime is not None,
@@ -640,11 +666,29 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
     the UI state on resume.
     """
     session_id = request.match_info["session_id"]
+    raw_limit = request.query.get("limit")
+    if raw_limit is None or str(raw_limit).strip() == "":
+        limit = DEFAULT_EVENTS_HISTORY_LIMIT
+    else:
+        try:
+            parsed = int(str(raw_limit).strip())
+        except ValueError:
+            return web.json_response({"error": "limit must be an integer"}, status=400)
+        limit = max(1, min(MAX_EVENTS_HISTORY_LIMIT, parsed))
 
     queen_dir = Path.home() / ".hive" / "queen" / "session" / session_id
     events_path = queen_dir / "events.jsonl"
     if not events_path.exists():
-        return web.json_response({"events": [], "session_id": session_id})
+        return web.json_response(
+            {
+                "events": [],
+                "session_id": session_id,
+                "total": 0,
+                "returned": 0,
+                "truncated": False,
+                "limit": limit,
+            }
+        )
 
     events: list[dict] = []
     try:
@@ -658,9 +702,32 @@ async def handle_session_events_history(request: web.Request) -> web.Response:
                 except json.JSONDecodeError:
                     continue
     except OSError:
-        return web.json_response({"events": [], "session_id": session_id})
+        return web.json_response(
+            {
+                "events": [],
+                "session_id": session_id,
+                "total": 0,
+                "returned": 0,
+                "truncated": False,
+                "limit": limit,
+            }
+        )
 
-    return web.json_response({"events": events, "session_id": session_id})
+    total = len(events)
+    returned_events = events[-limit:] if total > limit else events
+    returned = len(returned_events)
+    truncated = returned < total
+
+    return web.json_response(
+        {
+            "events": returned_events,
+            "session_id": session_id,
+            "total": total,
+            "returned": returned,
+            "truncated": truncated,
+            "limit": limit,
+        }
+    )
 
 
 async def handle_session_history(request: web.Request) -> web.Response:
@@ -687,6 +754,10 @@ async def handle_session_history(request: web.Request) -> web.Response:
                 s["agent_path"] = str(live.worker_path)
             if not s.get("project_id"):
                 s["project_id"] = getattr(live, "project_id", None)
+            if not s.get("queen_id"):
+                s["queen_id"] = getattr(live, "queen_name", None)
+            if not s.get("colony_id"):
+                s["colony_id"] = getattr(live, "colony_id", None)
 
     if project_id:
         disk_sessions = [s for s in disk_sessions if s.get("project_id") == project_id]
@@ -865,6 +936,150 @@ async def handle_export_session_folder(request: web.Request) -> web.StreamRespon
                 archive_path.unlink()
 
 
+async def handle_list_session_files(request: web.Request) -> web.Response:
+    """GET /api/sessions/{session_id}/files — list files inside session storage folder."""
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
+    session_id = request.match_info["session_id"]
+
+    try:
+        folder = _resolve_session_storage_folder(manager, session_id)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    if not folder.exists() or not folder.is_dir():
+        return web.json_response({"error": f"Session folder not found: {folder}"}, status=404)
+
+    entries: list[dict[str, object]] = []
+    total = 0
+    for entry in sorted(folder.rglob("*"), key=lambda p: str(p.relative_to(folder))):
+        total += 1
+        if len(entries) >= MAX_SESSION_FILE_LIST_ENTRIES:
+            continue
+        rel = entry.relative_to(folder).as_posix()
+        stat = entry.stat()
+        entries.append(
+            {
+                "path": rel,
+                "type": "dir" if entry.is_dir() else "file",
+                "size": stat.st_size if entry.is_file() else None,
+                "modified": int(stat.st_mtime),
+            }
+        )
+
+    return web.json_response(
+        {
+            "session_id": session_id,
+            "root": str(folder),
+            "entries": entries,
+            "total": total,
+            "returned": len(entries),
+            "truncated": total > len(entries),
+            "limit": MAX_SESSION_FILE_LIST_ENTRIES,
+        }
+    )
+
+
+async def handle_preview_session_file(request: web.Request) -> web.Response:
+    """GET /api/sessions/{session_id}/files/preview?path=... — text preview for a file."""
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
+    session_id = request.match_info["session_id"]
+    rel_path = request.query.get("path", "")
+
+    try:
+        folder = _resolve_session_storage_folder(manager, session_id)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    if not folder.exists() or not folder.is_dir():
+        return web.json_response({"error": f"Session folder not found: {folder}"}, status=404)
+
+    try:
+        file_path = _resolve_session_file_path(folder, rel_path)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    if not file_path.exists():
+        return web.json_response({"error": f"File not found: {rel_path}"}, status=404)
+    if file_path.is_dir():
+        return web.json_response({"error": "Path points to a directory"}, status=400)
+
+    try:
+        raw = file_path.read_bytes()
+    except Exception as exc:
+        return web.json_response({"error": f"Failed to read file: {exc}"}, status=500)
+
+    binary = b"\x00" in raw
+    content = ""
+    truncated = False
+    encoding = "utf-8"
+    if not binary:
+        chunk = raw[:MAX_SESSION_FILE_PREVIEW_BYTES]
+        truncated = len(raw) > len(chunk)
+        try:
+            content = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            binary = True
+            content = ""
+
+    return web.json_response(
+        {
+            "session_id": session_id,
+            "path": file_path.relative_to(folder).as_posix(),
+            "size": len(raw),
+            "binary": binary,
+            "encoding": encoding if not binary else None,
+            "content": content if not binary else None,
+            "truncated": truncated if not binary else False,
+            "preview_limit_bytes": MAX_SESSION_FILE_PREVIEW_BYTES,
+        }
+    )
+
+
+async def handle_download_session_file(request: web.Request) -> web.StreamResponse:
+    """GET /api/sessions/{session_id}/files/download?path=... — download one file."""
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
+    session_id = request.match_info["session_id"]
+    rel_path = request.query.get("path", "")
+
+    try:
+        folder = _resolve_session_storage_folder(manager, session_id)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    if not folder.exists() or not folder.is_dir():
+        return web.json_response({"error": f"Session folder not found: {folder}"}, status=404)
+
+    try:
+        file_path = _resolve_session_file_path(folder, rel_path)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    if not file_path.exists():
+        return web.json_response({"error": f"File not found: {rel_path}"}, status=404)
+    if file_path.is_dir():
+        return web.json_response({"error": "Path points to a directory"}, status=400)
+
+    content_type, _ = mimetypes.guess_type(file_path.name)
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    headers = {
+        "Content-Type": content_type,
+        "Content-Disposition": f'attachment; filename="{file_path.name}"',
+        "Content-Length": str(file_path.stat().st_size),
+    }
+    response = web.StreamResponse(status=200, headers=headers)
+    await response.prepare(request)
+    with file_path.open("rb") as f:
+        while True:
+            chunk = f.read(256 * 1024)
+            if not chunk:
+                break
+            await response.write(chunk)
+    await response.write_eof()
+    return response
+
+
 # ------------------------------------------------------------------
 # Route registration
 # ------------------------------------------------------------------
@@ -891,6 +1106,9 @@ def register_routes(app: web.Application) -> None:
     # Session info
     app.router.add_post("/api/sessions/{session_id}/reveal", handle_reveal_session_folder)
     app.router.add_get("/api/sessions/{session_id}/export", handle_export_session_folder)
+    app.router.add_get("/api/sessions/{session_id}/files", handle_list_session_files)
+    app.router.add_get("/api/sessions/{session_id}/files/preview", handle_preview_session_file)
+    app.router.add_get("/api/sessions/{session_id}/files/download", handle_download_session_file)
     app.router.add_get("/api/sessions/{session_id}/stats", handle_session_stats)
     app.router.add_get("/api/sessions/{session_id}/entry-points", handle_session_entry_points)
     app.router.add_patch(

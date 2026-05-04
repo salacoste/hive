@@ -1,0 +1,39 @@
+{
+  "generated_at_utc": "2026-04-25T10:36:19Z",
+  "wave": "Wave16-R8H",
+  "title": "Queen mcp_registry include naming execution",
+  "scope": [
+    "core/framework/agents/queen/mcp_registry.json"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local include list uses canonical hive-tools name",
+      "this stays consistent with loader/runner default server naming and avoids queen include drift"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; local include naming retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      }
+    ],
+    "gate_reference": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "latest run ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R8H lane closed with naming-contract guard",
+      "next step: refresh residual shortlist after completion of docs/config naming micro-lanes"
+    ]
+  }
+}

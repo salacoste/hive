@@ -197,9 +197,26 @@ def _get_env_int(name: str, default: int, minimum: int = 0) -> int:
 RATE_LIMIT_MAX_RETRIES = _get_env_int("HIVE_LLM_RATE_LIMIT_MAX_RETRIES", 3, minimum=0)
 RATE_LIMIT_BACKOFF_BASE = 2  # seconds
 RATE_LIMIT_MAX_DELAY = 120  # seconds - cap to prevent absurd waits
+CLAUDE_RATE_LIMIT_BACKOFF_BASE = _get_env_int(
+    "HIVE_LLM_CLAUDE_RATE_LIMIT_BACKOFF_BASE",
+    8,
+    minimum=1,
+)
+CLAUDE_RATE_LIMIT_MAX_DELAY = _get_env_int(
+    "HIVE_LLM_CLAUDE_RATE_LIMIT_MAX_DELAY",
+    300,
+    minimum=1,
+)
 LLM_MAX_CONCURRENT_REQUESTS = _get_env_int("HIVE_LLM_MAX_CONCURRENT_REQUESTS", 4, minimum=1)
+CLAUDE_MAX_CONCURRENT_REQUESTS = _get_env_int(
+    "HIVE_LLM_CLAUDE_MAX_CONCURRENT_REQUESTS",
+    1,
+    minimum=1,
+)
 _SYNC_LLM_REQUEST_SEMAPHORE = threading.BoundedSemaphore(LLM_MAX_CONCURRENT_REQUESTS)
+_SYNC_CLAUDE_REQUEST_SEMAPHORE = threading.BoundedSemaphore(CLAUDE_MAX_CONCURRENT_REQUESTS)
 _ASYNC_LLM_REQUEST_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
+_ASYNC_CLAUDE_REQUEST_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 _ASYNC_LLM_REQUEST_SEMAPHORES_LOCK = threading.Lock()
 MINIMAX_API_BASE = "https://api.minimax.io/v1"
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
@@ -338,6 +355,33 @@ def _estimate_tokens(model: str, messages: list[dict]) -> tuple[int, str]:
     return total_chars // 4, "estimate"
 
 
+def _summarize_request_for_log(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build a compact request summary for diagnostics without logging full payloads."""
+    messages_raw = payload.get("messages")
+    messages: list[dict[str, Any]] = (
+        [m for m in messages_raw if isinstance(m, dict)] if isinstance(messages_raw, list) else []
+    )
+    message_count = len(messages)
+    non_system = [m for m in messages if m.get("role") != "system"]
+    first_non_system_role = non_system[0].get("role") if non_system else None
+    last_non_system_role = non_system[-1].get("role") if non_system else None
+    tools_raw = payload.get("tools")
+    tool_count = len(tools_raw) if isinstance(tools_raw, list) else 0
+
+    return {
+        "model": payload.get("model"),
+        "api_base": payload.get("api_base"),
+        "message_count": message_count,
+        "non_system_message_count": len(non_system),
+        "first_non_system_role": first_non_system_role,
+        "last_non_system_role": last_non_system_role,
+        "system_only": message_count > 0 and len(non_system) == 0,
+        "tool_count": tool_count,
+        "stream": bool(payload.get("stream")),
+        "max_tokens": payload.get("max_tokens"),
+    }
+
+
 def _retry_budget_for_model(model: str, default_retries: int) -> int:
     """Return retry budget for model, with optional Claude-specific cap."""
     model_l = (model or "").lower()
@@ -350,6 +394,11 @@ def _retry_budget_for_model(model: str, default_retries: int) -> int:
         minimum=0,
     )
     return min(default_retries, claude_cap)
+
+
+def _is_claude_like_model(model: str) -> bool:
+    model_l = (model or "").lower()
+    return "claude" in model_l or "anthropic/" in model_l
 
 
 def _needs_json_object_prompt_hint(response_format: dict[str, Any] | None) -> bool:
@@ -479,6 +528,7 @@ def _compute_retry_delay(
     exception: BaseException | None = None,
     backoff_base: int = RATE_LIMIT_BACKOFF_BASE,
     max_delay: int = RATE_LIMIT_MAX_DELAY,
+    model: str | None = None,
 ) -> float:
     """Compute retry delay, preferring server-provided Retry-After headers.
 
@@ -490,6 +540,10 @@ def _compute_retry_delay(
 
     All values are capped at max_delay seconds.
     """
+    if _is_claude_like_model(model or ""):
+        backoff_base = max(backoff_base, CLAUDE_RATE_LIMIT_BACKOFF_BASE)
+        max_delay = max(max_delay, CLAUDE_RATE_LIMIT_MAX_DELAY)
+
     if exception is not None:
         response = getattr(exception, "response", None)
         if response is not None:
@@ -542,10 +596,108 @@ def _get_async_llm_semaphore() -> asyncio.Semaphore:
         return sem
 
 
+def _get_async_claude_semaphore() -> asyncio.Semaphore:
+    """Return a loop-bound Claude-only semaphore for async calls."""
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    with _ASYNC_LLM_REQUEST_SEMAPHORES_LOCK:
+        sem = _ASYNC_CLAUDE_REQUEST_SEMAPHORES.get(loop_id)
+        if sem is None:
+            sem = asyncio.Semaphore(CLAUDE_MAX_CONCURRENT_REQUESTS)
+            _ASYNC_CLAUDE_REQUEST_SEMAPHORES[loop_id] = sem
+        return sem
+
+
+def _bounded_semaphore_stats(sem: threading.BoundedSemaphore, limit: int) -> dict[str, int | None]:
+    """Best-effort stats for threading.BoundedSemaphore."""
+    available = getattr(sem, "_value", None)
+    if isinstance(available, int):
+        in_flight = max(0, limit - available)
+        return {
+            "limit": limit,
+            "in_flight": in_flight,
+            "available": available,
+            "queued": None,  # threading semaphores do not expose waiter count
+        }
+    return {
+        "limit": limit,
+        "in_flight": None,
+        "available": None,
+        "queued": None,
+    }
+
+
+def _async_semaphore_map_stats(
+    semaphores: dict[int, asyncio.Semaphore],
+    limit: int,
+) -> dict[str, Any]:
+    """Aggregate per-loop stats for asyncio semaphores."""
+    loops: list[dict[str, int]] = []
+    total_in_flight = 0
+    total_queued = 0
+    for loop_id, sem in semaphores.items():
+        available = getattr(sem, "_value", None)
+        waiters = len(getattr(sem, "_waiters", ()) or ())
+        if isinstance(available, int):
+            in_flight = max(0, limit - available)
+        else:
+            in_flight = 0
+        total_in_flight += in_flight
+        total_queued += waiters
+        loops.append(
+            {
+                "loop_id": int(loop_id),
+                "in_flight": in_flight,
+                "queued": waiters,
+                "available": int(available) if isinstance(available, int) else -1,
+            }
+        )
+    return {
+        "limit_per_loop": limit,
+        "loops": loops,
+        "total_in_flight": total_in_flight,
+        "total_queued": total_queued,
+    }
+
+
+def get_llm_queue_status() -> dict[str, Any]:
+    """Return runtime LLM queue/backoff status for observability endpoints."""
+    with _ASYNC_LLM_REQUEST_SEMAPHORES_LOCK:
+        async_global = dict(_ASYNC_LLM_REQUEST_SEMAPHORES)
+        async_claude = dict(_ASYNC_CLAUDE_REQUEST_SEMAPHORES)
+    return {
+        "limits": {
+            "global_concurrency": LLM_MAX_CONCURRENT_REQUESTS,
+            "claude_concurrency": CLAUDE_MAX_CONCURRENT_REQUESTS,
+        },
+        "backoff": {
+            "default_base_seconds": RATE_LIMIT_BACKOFF_BASE,
+            "default_max_seconds": RATE_LIMIT_MAX_DELAY,
+            "claude_base_seconds": CLAUDE_RATE_LIMIT_BACKOFF_BASE,
+            "claude_max_seconds": CLAUDE_RATE_LIMIT_MAX_DELAY,
+        },
+        "sync": {
+            "global": _bounded_semaphore_stats(
+                _SYNC_LLM_REQUEST_SEMAPHORE,
+                LLM_MAX_CONCURRENT_REQUESTS,
+            ),
+            "claude": _bounded_semaphore_stats(
+                _SYNC_CLAUDE_REQUEST_SEMAPHORE,
+                CLAUDE_MAX_CONCURRENT_REQUESTS,
+            ),
+        },
+        "async": {
+            "global": _async_semaphore_map_stats(async_global, LLM_MAX_CONCURRENT_REQUESTS),
+            "claude": _async_semaphore_map_stats(async_claude, CLAUDE_MAX_CONCURRENT_REQUESTS),
+        },
+    }
+
+
 @contextmanager
 def _sync_llm_request_slot(model: str):
     """Queue sync requests when concurrent LLM call budget is exhausted."""
     sem = _SYNC_LLM_REQUEST_SEMAPHORE
+    claude_sem = _SYNC_CLAUDE_REQUEST_SEMAPHORE if _is_claude_like_model(model) else None
     acquired = sem.acquire(blocking=False)
     if not acquired:
         logger.warning(
@@ -554,9 +706,22 @@ def _sync_llm_request_slot(model: str):
             model,
         )
         sem.acquire()
+    acquired_claude = False
+    if claude_sem is not None:
+        acquired_claude = claude_sem.acquire(blocking=False)
+        if not acquired_claude:
+            logger.warning(
+                "[llm-queue] Claude queue saturated (%d in-flight). Queueing sync Claude request for %s.",
+                CLAUDE_MAX_CONCURRENT_REQUESTS,
+                model,
+            )
+            claude_sem.acquire()
+            acquired_claude = True
     try:
         yield
     finally:
+        if claude_sem is not None and acquired_claude:
+            claude_sem.release()
         sem.release()
 
 
@@ -573,9 +738,23 @@ async def _async_llm_request_slot(model: str):
             model,
         )
     await sem.acquire()
+    claude_sem = None
+    if _is_claude_like_model(model):
+        claude_sem = _get_async_claude_semaphore()
+        if claude_sem.locked():
+            waiters = len(getattr(claude_sem, "_waiters", ()) or ())
+            logger.warning(
+                "[llm-queue] Claude queue saturated (%d in-flight, %d queued). Queueing async Claude request for %s.",
+                CLAUDE_MAX_CONCURRENT_REQUESTS,
+                waiters,
+                model,
+            )
+        await claude_sem.acquire()
     try:
         yield
     finally:
+        if claude_sem is not None:
+            claude_sem.release()
         sem.release()
 
 
@@ -882,7 +1061,7 @@ class LiteLLMProvider(LLMProvider):
                             f"choices={len(response.choices) if response.choices else 0})"
                         )
                         return response
-                    wait = _compute_retry_delay(attempt)
+                    wait = _compute_retry_delay(attempt, model=str(model))
                     logger.warning(
                         f"[retry] {model} returned empty response "
                         f"(finish_reason={finish_reason}, "
@@ -913,7 +1092,7 @@ class LiteLLMProvider(LLMProvider):
                         f"Full request dumped to: {dump_path}"
                     )
                     raise
-                wait = _compute_retry_delay(attempt, exception=e)
+                wait = _compute_retry_delay(attempt, exception=e, model=str(model))
                 logger.warning(
                     f"[retry] {model} rate limited (429): {e!s}. "
                     f"~{token_count} tokens ({token_method}). "
@@ -1091,7 +1270,7 @@ class LiteLLMProvider(LLMProvider):
                             f"choices={len(response.choices) if response.choices else 0})"
                         )
                         return response
-                    wait = _compute_retry_delay(attempt)
+                    wait = _compute_retry_delay(attempt, model=str(model))
                     logger.warning(
                         f"[async-retry] {model} returned empty response "
                         f"(finish_reason={finish_reason}, "
@@ -1121,7 +1300,7 @@ class LiteLLMProvider(LLMProvider):
                         f"Full request dumped to: {dump_path}"
                     )
                     raise
-                wait = _compute_retry_delay(attempt, exception=e)
+                wait = _compute_retry_delay(attempt, exception=e, model=str(model))
                 logger.warning(
                     f"[async-retry] {model} rate limited (429): {e!s}. "
                     f"~{token_count} tokens ({token_method}). "
@@ -1175,8 +1354,6 @@ class LiteLLMProvider(LLMProvider):
                 full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
         elif _needs_json_object_prompt_hint(response_format):
             _ensure_json_object_prompt_hint(full_messages)
-        elif _needs_json_object_prompt_hint(response_format):
-            _ensure_json_object_prompt_hint(full_messages)
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -1215,17 +1392,30 @@ class LiteLLMProvider(LLMProvider):
         )
 
     def _tool_to_openai_format(self, tool: Tool) -> dict[str, Any]:
-        """Convert Tool to OpenAI function calling format."""
+        """Convert Tool schema to provider-native tool format.
+
+        Historical name is kept for compatibility with existing tests/callers.
+        Anthropic-compatible models (including Claude proxies) receive native
+        ``input_schema`` tools to avoid proxy-side validation errors for
+        OpenAI-only ``type=function`` wrappers.
+        """
+        schema = {
+            "type": "object",
+            "properties": tool.parameters.get("properties", {}),
+            "required": tool.parameters.get("required", []),
+        }
+        if self._is_anthropic_model():
+            return {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": schema,
+            }
         return {
             "type": "function",
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": tool.parameters.get("properties", {}),
-                    "required": tool.parameters.get("required", []),
-                },
+                "parameters": schema,
             },
         }
 
@@ -2210,7 +2400,7 @@ class LiteLLMProvider(LLMProvider):
 
             except RateLimitError as e:
                 if attempt < rate_limit_retries:
-                    wait = _compute_retry_delay(attempt, exception=e)
+                    wait = _compute_retry_delay(attempt, exception=e, model=self.model)
                     logger.warning(
                         f"[stream-retry] {self.model} rate limited (429): {e!s}. "
                         f"Retrying in {wait:.1f}s "
@@ -2263,7 +2453,7 @@ class LiteLLMProvider(LLMProvider):
                         yield event
                     return
                 if _is_stream_transient_error(e) and attempt < transient_retries:
-                    wait = _compute_retry_delay(attempt, exception=e)
+                    wait = _compute_retry_delay(attempt, exception=e, model=self.model)
                     logger.warning(
                         f"[stream-retry] {self.model} transient error "
                         f"({type(e).__name__}): {e!s}. "

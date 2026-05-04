@@ -1,0 +1,58 @@
+{
+  "generated_at_utc": "2026-04-24T14:58:06Z",
+  "lane": "ND-3C",
+  "title": "Productivity providers bounded replay",
+  "scope_files": [
+    "tools/src/aden_tools/tools/calendar_tool/calendar_tool.py",
+    "tools/src/aden_tools/tools/github_tool/github_tool.py",
+    "tools/src/aden_tools/tools/gmail_tool/gmail_tool.py",
+    "tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py",
+    "tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py",
+    "tools/tests/tools/test_github_tool.py"
+  ],
+  "apply": {
+    "command": "git apply docs/ops/upstream-migration/wave15-nd3c-productivity.patch",
+    "result": "ok"
+  },
+  "scope_verification": {
+    "command": "git diff --numstat -- <ND-3C files>",
+    "files": [
+      {
+        "path": "tools/src/aden_tools/tools/calendar_tool/calendar_tool.py",
+        "added": 1,
+        "deleted": 3
+      },
+      {
+        "path": "tools/src/aden_tools/tools/github_tool/github_tool.py",
+        "added": 8,
+        "deleted": 315
+      },
+      {
+        "path": "tools/src/aden_tools/tools/gmail_tool/gmail_tool.py",
+        "added": 1,
+        "deleted": 3
+      },
+      {
+        "path": "tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py",
+        "added": 1,
+        "deleted": 3
+      },
+      {
+        "path": "tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py",
+        "added": 1,
+        "deleted": 3
+      },
+      {
+        "path": "tools/tests/tools/test_github_tool.py",
+        "added": 0,
+        "deleted": 214
+      }
+    ]
+  },
+  "validation": {
+    "targeted_tests_command": "uv run --package tools pytest tools/tests/tools/test_github_tool.py -q",
+    "targeted_tests_result": "38 passed",
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  }
+}

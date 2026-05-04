@@ -1,0 +1,24 @@
+{
+  "generated_at_utc": "2026-04-26T13:27:07Z",
+  "wave": "Wave16-R10L",
+  "title": "Model catalog consumer contract lane precheck",
+  "scope": [
+    "core/framework/llm/model_catalog.json",
+    "core/framework/llm/provider.py",
+    "core/framework/server/routes_config.py",
+    "core/tests/test_model_catalog.py",
+    "core/tests/test_litellm_provider.py",
+    "core/tests/test_routes_config_appkey_contract.py"
+  ],
+  "delta_summary": [
+    "R10K reconciled stale model-catalog expectations to current local curated baseline",
+    "next bounded step is consumer-contract verification across provider selection and routes-config model application paths",
+    "lane remains non-destructive and test-bundle based"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_model_catalog.py -q",
+    "uv run --package framework pytest core/tests/test_litellm_provider.py -q",
+    "uv run --package framework pytest core/tests/test_routes_config_appkey_contract.py -q"
+  ],
+  "decision_gate": "close lane only after model-catalog + provider + routes-config consumer contracts are green under the reconciled baseline"
+}

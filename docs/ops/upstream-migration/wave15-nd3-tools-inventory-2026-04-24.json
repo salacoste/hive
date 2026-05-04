@@ -1,0 +1,333 @@
+{
+  "generated_at_utc": "2026-04-24T14:30:04Z",
+  "base": "HEAD",
+  "compare": "upstream/main",
+  "prefix": "tools",
+  "files_total": 29,
+  "by_status": {
+    "M": 22,
+    "A": 5,
+    "D": 2
+  },
+  "files": [
+    {
+      "status": "M",
+      "path": "tools/Dockerfile",
+      "source_path": "tools/Dockerfile",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "27f94d0d6451a03fb6121b8c807feffa6f1aed0b5f5db6822a19c738ba0d440d",
+      "upstream_sha256": "700f7e68c6b355e07203067b2f74c6c37aafd6ec3731b7531aee389a62cf1989",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/coder_tools_server.py",
+      "source_path": "tools/coder_tools_server.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "2cae31f3c02e95629b3a7d7a3ce01170bc31fbf76ceb922d39544117b2e345fa",
+      "upstream_sha256": "f13ae509228cde25fba587214ae396090d1170f0a0111cd8f8c7e6d1bc7fcb93",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/mcp_servers.json",
+      "source_path": "tools/mcp_servers.json",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "6472d6c7bc8ba2de0438fafdff88d18e2d5f6acfc81861082f19d193a874423a",
+      "upstream_sha256": "ecd9e596d64739e3ed8175671c61dc6e23e34143b3cb6534e29592c7c8d07f76",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/credentials/__init__.py",
+      "source_path": "tools/src/aden_tools/credentials/__init__.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "ea572de9602142934b6d262b599a77e42c985f78aa759844621a42fe02f6c846",
+      "upstream_sha256": "ea572de9602142934b6d262b599a77e42c985f78aa759844621a42fe02f6c846",
+      "content_equal_to_upstream": true
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/credentials/health_check.py",
+      "source_path": "tools/src/aden_tools/credentials/health_check.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "52df662c5a3ddc42d96e68e54619cb99ed31cc2dca2f9f5ac1a3c43b62659809",
+      "upstream_sha256": "9f3795330551b4aa239aaa8ebb991641f6eaaaac0b5736f87fa7fbe7d06e5dcc",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "A",
+      "path": "tools/src/aden_tools/credentials/prometheus.py",
+      "source_path": "tools/src/aden_tools/credentials/prometheus.py",
+      "exists_local": true,
+      "tracked_local": false,
+      "upstream_exists": true,
+      "local_sha256": "668c7692ab6dc496076ae7ad0f119d5d7b6e0c874f903988e5e325fed867caa4",
+      "upstream_sha256": "7f81d22ee403e0cb86e2da8f5c41afe7a64e23c7b9c6467f4f38a006ae24e09c",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/tools/__init__.py",
+      "source_path": "tools/src/aden_tools/tools/__init__.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "0426a44fdc5a20c34b7181ae60e51ba23b5aaef3283c2186c727dafeec90e9a4",
+      "upstream_sha256": "1b3cdd9549d9c05f49e95bd5cd6de1710b966c18817158a3528bc1e829c41614",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/tools/calendar_tool/calendar_tool.py",
+      "source_path": "tools/src/aden_tools/tools/calendar_tool/calendar_tool.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "f4c264f906f0c565fe2be2e54cb21251d9cf97ff367d5bdb99319507895ba102",
+      "upstream_sha256": "60511a08aba0a04ab3f301742ff491337d60c4b31d327d9cac327b093c8e55c9",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/tools/github_tool/github_tool.py",
+      "source_path": "tools/src/aden_tools/tools/github_tool/github_tool.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "004654ba4b994dddea7728480699fd6dac8d7275769f9c42c29d2a463435eea5",
+      "upstream_sha256": "4fc9c25557abed46edea0c97b1f169ea535b0f21e464f18ccbbc27408007d79e",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/tools/gmail_tool/gmail_tool.py",
+      "source_path": "tools/src/aden_tools/tools/gmail_tool/gmail_tool.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "08c91b86bd6c84d1dbe077b75086f7e720d0f60c407fcd245e2b1d021b9ceb19",
+      "upstream_sha256": "e006249180b92889608f60dcb30b92a718a86f677ac4eb3ea9aac95a06e06e81",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "D",
+      "path": "tools/src/aden_tools/tools/google_auth.py",
+      "source_path": "tools/src/aden_tools/tools/google_auth.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": false,
+      "local_sha256": "ebb04655e596eb6c0f06c7ca52169872f95369685370b9f6632fded4bd81c145",
+      "upstream_sha256": null,
+      "content_equal_to_upstream": null
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py",
+      "source_path": "tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "fc2200b931149c1711e6671b24d9383cc89d3b4c3a0d35322f7ad5a6b804523e",
+      "upstream_sha256": "13d642e4f12a69b5743035c35583d3f5feec27c0794a2d3e2cbcb19c148b6495",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py",
+      "source_path": "tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "e008b496a696fa966b9430bcda910071e52f2b8b7443158a3a764f9f5c1b45b4",
+      "upstream_sha256": "f36bdbfcca4b1774dcb1f45004991e6bca2d0f5eb2db93f024df27756ffd326b",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "A",
+      "path": "tools/src/aden_tools/tools/prometheus_tool/README.md",
+      "source_path": "tools/src/aden_tools/tools/prometheus_tool/README.md",
+      "exists_local": false,
+      "tracked_local": false,
+      "upstream_exists": true,
+      "local_sha256": null,
+      "upstream_sha256": "7bfb093aba7ecf0f0d8715a1210012c2eaa6e46fffec56f22b1819ad15322c33",
+      "content_equal_to_upstream": null
+    },
+    {
+      "status": "A",
+      "path": "tools/src/aden_tools/tools/prometheus_tool/__init__.py",
+      "source_path": "tools/src/aden_tools/tools/prometheus_tool/__init__.py",
+      "exists_local": true,
+      "tracked_local": false,
+      "upstream_exists": true,
+      "local_sha256": "a76c304b701e499d87b6d695fa4b2d21b25468b70504db6f2b183c219b03d5ca",
+      "upstream_sha256": "a76c304b701e499d87b6d695fa4b2d21b25468b70504db6f2b183c219b03d5ca",
+      "content_equal_to_upstream": true
+    },
+    {
+      "status": "A",
+      "path": "tools/src/aden_tools/tools/prometheus_tool/prometheus_tool.py",
+      "source_path": "tools/src/aden_tools/tools/prometheus_tool/prometheus_tool.py",
+      "exists_local": true,
+      "tracked_local": false,
+      "upstream_exists": true,
+      "local_sha256": "23325ca9dd9e10224860267bc86865b5f6560ed689876046822c41008a8c7a74",
+      "upstream_sha256": "3e4a2caa4b13e64bc36c8e20355a55410b5ea385ebf7d1253b0989a038d3dc6d",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/gcu/__init__.py",
+      "source_path": "tools/src/gcu/__init__.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "2331c858f81a2f21602fbe411b91955217232c9c7ba1cc8a77841a68cb454090",
+      "upstream_sha256": "e5e534f56a012db51d2b9b28a6726ec0bb1cbf608a6febb2b4a12b0fe56a5a2b",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/gcu/browser/__init__.py",
+      "source_path": "tools/src/gcu/browser/__init__.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "38159daa5ee4de2c2ed05345d893c8abf3f7895edbc49d51dad0d6082ca7eb1b",
+      "upstream_sha256": "e53b81e33b6b059152ecb64c577156f8bcda9dbc86093deb73ef63f7918692dd",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/gcu/browser/bridge.py",
+      "source_path": "tools/src/gcu/browser/bridge.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "5b38b36f8303b87d3673a7eca7da207b2ade300e85442d32d08662e3625607ba",
+      "upstream_sha256": "faca99bcf9496d0a27310c09e554a942edbac957117c3163b4760dbc90ebbe4d",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/gcu/browser/tools/inspection.py",
+      "source_path": "tools/src/gcu/browser/tools/inspection.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "38a3a66c1afa2b9c97688dfc591cd15c0aeeb9f2b3fd2ef4aeca141ac4d72b72",
+      "upstream_sha256": "911ad2afa427181ee879ddce9ddd708050e8b5f29124c681901862edf82204b4",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/gcu/browser/tools/interactions.py",
+      "source_path": "tools/src/gcu/browser/tools/interactions.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "0c0fdfe49e5cd66e9816f5c3d17abde2e2f6d439c765cf531fce6db4bbc7480a",
+      "upstream_sha256": "912e5796e2a57ff1234029c49fe8a8b8100518ab4f639922f12b1bf8554c62be",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/src/gcu/browser/tools/tabs.py",
+      "source_path": "tools/src/gcu/browser/tools/tabs.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "0e7130ae127564128c95c90862a11e54020bdffa4fb179cb68a405b75297af99",
+      "upstream_sha256": "1e3e7594026336964d31656de00fa65bf6b9d1757d7e7a148b716e25fd035841",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/tests/test_browser_tools_comprehensive.py",
+      "source_path": "tools/tests/test_browser_tools_comprehensive.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "0126808b51d8f2d98b2b29884c2adb53f90f1a689ab83dd69142656cc4588b36",
+      "upstream_sha256": "5a896560e266499fca2578f5cc5ce592309216cb38dc827989175b36397bef4a",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/tests/test_coder_tools_server.py",
+      "source_path": "tools/tests/test_coder_tools_server.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "22303465d988409d033b2d3fa44abd2f2252b3f6f1987456c9d4b6b0b121cc63",
+      "upstream_sha256": "3161821277abe98bd1ced56175411cebf23824cb1f4624dea27c376fb04ab7a2",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "M",
+      "path": "tools/tests/test_health_checks.py",
+      "source_path": "tools/tests/test_health_checks.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "3f16703db1aff8eb688aa7968c953f451600183cc21d5712e1a335e65dd9a300",
+      "upstream_sha256": "3f16703db1aff8eb688aa7968c953f451600183cc21d5712e1a335e65dd9a300",
+      "content_equal_to_upstream": true
+    },
+    {
+      "status": "M",
+      "path": "tools/tests/tools/test_github_tool.py",
+      "source_path": "tools/tests/tools/test_github_tool.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "03fcdd7a8e789f1e1a3ebe4ad84eb8064cb3f4f3a2e4d946454d411f4294bc48",
+      "upstream_sha256": "083480344309450b520b7ca819c95f8981d8a13750a9d3b500f4f1d49b56c96d",
+      "content_equal_to_upstream": false
+    },
+    {
+      "status": "D",
+      "path": "tools/tests/tools/test_google_auth.py",
+      "source_path": "tools/tests/tools/test_google_auth.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": false,
+      "local_sha256": "18f07694e46b9d3841779bf9ad64378099b7fca124722f50974f710701e467b2",
+      "upstream_sha256": null,
+      "content_equal_to_upstream": null
+    },
+    {
+      "status": "A",
+      "path": "tools/tests/tools/test_prometheus_tool.py",
+      "source_path": "tools/tests/tools/test_prometheus_tool.py",
+      "exists_local": false,
+      "tracked_local": false,
+      "upstream_exists": true,
+      "local_sha256": null,
+      "upstream_sha256": "90f13caa054115f51c4d0b0d4f29243c9483e1b746f7edff7f6008b2f118129b",
+      "content_equal_to_upstream": null
+    },
+    {
+      "status": "M",
+      "path": "tools/tests/tools/test_wandb_tool.py",
+      "source_path": "tools/tests/tools/test_wandb_tool.py",
+      "exists_local": true,
+      "tracked_local": true,
+      "upstream_exists": true,
+      "local_sha256": "166d1863390c65f96dddc71f4e906480942f9b5403cd58327bfe2a38b3d67e52",
+      "upstream_sha256": "a2ab2dd79d707dbc1dc21ae15a8f699315993aa9519fb9e293d799de76ffc9ba",
+      "content_equal_to_upstream": false
+    }
+  ]
+}

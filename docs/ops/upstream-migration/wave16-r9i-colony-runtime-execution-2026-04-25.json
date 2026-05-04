@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-25T11:45:02Z",
+  "wave": "Wave16-R9I",
+  "title": "Colony runtime behavior lane execution",
+  "scope": [
+    "core/framework/host/colony_runtime.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local cancellation diagnostics distinguish timeout from generic failure",
+      "timeout downgraded to debug reduces warning noise during expected shutdown windows",
+      "runtime/overseer/parallel-worker and API validation bundles remain green"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local colony_runtime cancellation diagnostics"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py core/tests/test_run_parallel_workers_tool.py -q",
+        "result": "pass",
+        "summary": "16 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution or logs\" -q",
+        "result": "pass",
+        "summary": "37 passed, 156 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9I lane closed with explicit keep-local decision",
+      "next candidate lane: core/framework/host/event_bus.py"
+    ]
+  }
+}

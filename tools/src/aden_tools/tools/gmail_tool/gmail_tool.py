@@ -21,8 +21,6 @@ from typing import TYPE_CHECKING, Literal
 import httpx
 from fastmcp import FastMCP
 
-from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
-
 if TYPE_CHECKING:
     from aden_tools.credentials import CredentialStoreAdapter
 
@@ -60,7 +58,7 @@ def register_tools(
             if account:
                 return credentials.get_by_alias("google", account)
             return credentials.get("google")
-        return get_google_access_token_from_env_or_file()
+        return os.getenv("GOOGLE_ACCESS_TOKEN")
 
     def _gmail_request(method: str, path: str, access_token: str, **kwargs: object) -> httpx.Response:
         """Make an authenticated Gmail API request."""

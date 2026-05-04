@@ -1,0 +1,35 @@
+{
+  "generated_at_utc": "2026-04-25T10:34:10Z",
+  "wave": "Wave16-R8G",
+  "title": "Server README AppKey docs-sync lane precheck",
+  "scope": [
+    "core/framework/server/README.md"
+  ],
+  "observed_delta": {
+    "numstat": {"add": 1, "del": 1},
+    "summary": [
+      "manager access pattern documentation updated from request.app['manager'] to request.app[APP_KEY_MANAGER]"
+    ]
+  },
+  "candidate_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "doc line should match local AppKey-based runtime contract",
+      "reverting to raw string form would create doc/runtime mismatch"
+    ]
+  },
+  "validation": {
+    "checks": [
+      {
+        "command": "git diff upstream/main -- core/framework/server/README.md",
+        "result": "reviewed"
+      },
+      {
+        "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+        "result": "pass",
+        "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0 (latest run)"
+      }
+    ]
+  },
+  "status": "precheck_complete"
+}

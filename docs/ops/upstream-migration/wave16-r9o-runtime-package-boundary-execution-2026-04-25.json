@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T13:21:19Z",
+  "wave": "Wave16-R9O",
+  "title": "Runtime package boundary lane execution",
+  "scope": [
+    "core/framework/runtime/__init__.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local `framework.runtime` package export keeps Runtime import surface stable",
+      "additive initializer is low risk and improves caller compatibility",
+      "targeted runtime/server bundles and export checks are green"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9O lane (runtime package boundary retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_runtime.py -q",
+        "result": "pass",
+        "summary": "15 passed, 2 skipped"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'autonomous or execution' -q",
+        "result": "pass",
+        "summary": "83 passed, 110 deselected"
+      },
+      {
+        "command": "uv run --package framework python - <<'PY' ... import framework.runtime export check ... PY",
+        "result": "pass",
+        "summary": "runtime_export_ok, __all__=['Runtime']"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9O lane closed with explicit keep-local decision",
+      "next residual lane: event-loop package boundary (`core/framework/graph/event_loop/__init__.py`)"
+    ]
+  }
+}

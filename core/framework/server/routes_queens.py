@@ -23,8 +23,62 @@ from framework.agents.queen.queen_profiles import (
     update_queen_profile,
 )
 from framework.config import QUEENS_DIR
+from framework.server.app import APP_KEY_MANAGER
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_initial_phase(initial_phase: str | None) -> str | None:
+    """Map legacy API phase names to QueenPhaseState phase names."""
+    if not initial_phase:
+        return None
+    phase = str(initial_phase).strip().lower()
+    if not phase:
+        return None
+    aliases = {
+        "independent": "planning",
+        "working": "staging",
+    }
+    mapped = aliases.get(phase, phase)
+    if mapped in {"planning", "building", "staging", "running", "editing"}:
+        return mapped
+    return None
+
+
+async def _apply_initial_phase(session: Any, initial_phase: str | None) -> None:
+    """Best-effort phase switch for newly created queen sessions."""
+    target = _normalize_initial_phase(initial_phase)
+    if not target:
+        return
+    phase_state = getattr(session, "phase_state", None)
+    if phase_state is None:
+        return
+    try:
+        if target == "planning":
+            await phase_state.switch_to_planning(source="api")
+        elif target == "building":
+            await phase_state.switch_to_building(source="api")
+        elif target == "staging":
+            await phase_state.switch_to_staging(source="api")
+        elif target == "running":
+            await phase_state.switch_to_running(source="api")
+        elif target == "editing":
+            await phase_state.switch_to_editing(source="api")
+    except Exception:
+        logger.debug("Failed to switch initial phase for session %s", session.id, exc_info=True)
+
+
+async def _read_json_object(request: web.Request) -> tuple[dict[str, Any] | None, web.Response | None]:
+    """Read a JSON object body with consistent 400 responses."""
+    if not request.can_read_body:
+        return {}, None
+    try:
+        body = await request.json()
+    except Exception:
+        return None, web.json_response({"error": "Invalid JSON body"}, status=400)
+    if not isinstance(body, dict):
+        return None, web.json_response({"error": "Body must be a JSON object"}, status=400)
+    return body, None
 
 
 def _read_queen_session_meta(queen_id: str, session_id: str) -> dict[str, Any]:
@@ -44,7 +98,7 @@ def _session_belongs_to_queen(manager, session_id: str, queen_id: str) -> bool:
     """Check live or persisted ownership for a queen session."""
     live_session = manager.get_session(session_id)
     if live_session is not None:
-        return live_session.queen_name == queen_id
+        return getattr(live_session, "queen_name", None) == queen_id
 
     from framework.server.session_manager import _find_queen_session_dir
 
@@ -78,13 +132,14 @@ async def _create_bound_queen_session(
             from framework.server.app import validate_agent_path
 
             resolved_agent_path = str(validate_agent_path(agent_path))
-            return await manager.create_session_with_worker_colony(
+            session = await manager.create_session_with_worker_graph(
                 resolved_agent_path,
                 queen_resume_from=resume_from,
                 initial_prompt=initial_prompt,
-                queen_name=queen_id,
-                initial_phase=initial_phase,
             )
+            setattr(session, "queen_name", queen_id)
+            await _apply_initial_phase(session, initial_phase)
+            return session
         except Exception:
             logger.debug(
                 "Failed to restore worker-backed queen session %s for %s; falling back to queen-only",
@@ -93,12 +148,13 @@ async def _create_bound_queen_session(
                 exc_info=True,
             )
 
-    return await manager.create_session(
+    session = await manager.create_session(
         queen_resume_from=resume_from,
         initial_prompt=initial_prompt,
-        queen_name=queen_id,
-        initial_phase=initial_phase,
     )
+    setattr(session, "queen_name", queen_id)
+    await _apply_initial_phase(session, initial_phase)
+    return session
 
 
 async def handle_list_profiles(request: web.Request) -> web.Response:
@@ -232,7 +288,7 @@ async def handle_queen_session(request: web.Request) -> web.Response:
     from framework.server.session_manager import SessionManager
 
     queen_id = request.match_info["queen_id"]
-    manager: SessionManager = request.app["manager"]
+    manager: SessionManager = request.app[APP_KEY_MANAGER]
 
     ensure_default_queens()
     try:
@@ -240,7 +296,10 @@ async def handle_queen_session(request: web.Request) -> web.Response:
     except FileNotFoundError:
         return web.json_response({"error": f"Queen '{queen_id}' not found"}, status=404)
 
-    body = await request.json() if request.can_read_body else {}
+    body, error = await _read_json_object(request)
+    if error is not None:
+        return error
+    assert body is not None
     initial_prompt = body.get("initial_prompt")
     initial_phase = body.get("initial_phase")
 
@@ -249,7 +308,11 @@ async def handle_queen_session(request: web.Request) -> web.Response:
     # queen_name == queen_id, but it has a worker loaded (colony_id /
     # worker_path set) and is the colony's chat, not the queen's DM.
     for session in manager.list_sessions():
-        if session.queen_name == queen_id and session.colony_id is None and session.worker_path is None:
+        if (
+            getattr(session, "queen_name", None) == queen_id
+            and getattr(session, "colony_id", None) is None
+            and getattr(session, "worker_path", None) is None
+        ):
             return web.json_response(
                 {
                     "session_id": session.id,
@@ -309,9 +372,9 @@ async def handle_queen_session(request: web.Request) -> web.Response:
     else:
         session = await manager.create_session(
             initial_prompt=initial_prompt,
-            queen_name=queen_id,
-            initial_phase=initial_phase,
         )
+        setattr(session, "queen_name", queen_id)
+        await _apply_initial_phase(session, initial_phase)
         status = "created"
 
     return web.json_response(
@@ -326,7 +389,7 @@ async def handle_queen_session(request: web.Request) -> web.Response:
 async def handle_select_queen_session(request: web.Request) -> web.Response:
     """POST /api/queen/{queen_id}/session/select -- resume a specific queen session."""
     queen_id = request.match_info["queen_id"]
-    manager = request.app["manager"]
+    manager = request.app[APP_KEY_MANAGER]
 
     ensure_default_queens()
     try:
@@ -334,7 +397,10 @@ async def handle_select_queen_session(request: web.Request) -> web.Response:
     except FileNotFoundError:
         return web.json_response({"error": f"Queen '{queen_id}' not found"}, status=404)
 
-    body = await request.json() if request.can_read_body else {}
+    body, error = await _read_json_object(request)
+    if error is not None:
+        return error
+    assert body is not None
     target_session_id = body.get("session_id")
     if not isinstance(target_session_id, str) or not target_session_id.strip():
         return web.json_response({"error": "session_id is required"}, status=400)
@@ -379,7 +445,7 @@ async def handle_select_queen_session(request: web.Request) -> web.Response:
 async def handle_new_queen_session(request: web.Request) -> web.Response:
     """POST /api/queen/{queen_id}/session/new -- create a fresh queen session."""
     queen_id = request.match_info["queen_id"]
-    manager = request.app["manager"]
+    manager = request.app[APP_KEY_MANAGER]
 
     ensure_default_queens()
     try:
@@ -387,15 +453,18 @@ async def handle_new_queen_session(request: web.Request) -> web.Response:
     except FileNotFoundError:
         return web.json_response({"error": f"Queen '{queen_id}' not found"}, status=404)
 
-    body = await request.json() if request.can_read_body else {}
+    body, error = await _read_json_object(request)
+    if error is not None:
+        return error
+    assert body is not None
     initial_prompt = body.get("initial_prompt")
     initial_phase = body.get("initial_phase") or "independent"
 
     session = await manager.create_session(
         initial_prompt=initial_prompt,
-        queen_name=queen_id,
-        initial_phase=initial_phase,
     )
+    setattr(session, "queen_name", queen_id)
+    await _apply_initial_phase(session, initial_phase)
     return web.json_response(
         {
             "session_id": session.id,

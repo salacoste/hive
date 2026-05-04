@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T00:35:05Z",
+  "wave": "Wave16-R11M",
+  "title": "Autonomous tick-active-stream + heartbeat + report edge continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "tick handling around active-stream and worker-completed edges remains consistent with heartbeat/report updates",
+      "heartbeat update continuity remains stable across active execution paths without report/read-model regressions",
+      "no regressions observed in targeted tick-active-stream/heartbeat/report edge bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_returns_await_execution_for_active_execution_run or pipeline_loop_tick_updates_execution_heartbeat_while_running or pipeline_loop_tick_ignores_queen_active_stream_when_worker_completed or pipeline_loop_tick_resolves_from_worker_completed_when_session_not_loaded or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11M lane closed as keep-local with green tick-active-stream/heartbeat/report edge bundle",
+      "next lane continues run-cycle input-validation + report continuity"
+    ]
+  }
+}

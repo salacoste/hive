@@ -160,6 +160,77 @@ class SessionManager:
     # Session lifecycle
     # ------------------------------------------------------------------
 
+    def build_llm(
+        self,
+        *,
+        model: str | None = None,
+        model_profile: str | None = None,
+    ) -> Any:
+        """Build an LLM provider using the same routing policy as sessions.
+
+        This powers one-shot server flows (for example ``/api/messages/classify``)
+        without forcing a full session bootstrap.
+        """
+        from framework.config import RuntimeConfig, get_hive_config
+        from framework.model_routing import resolve_model_chain, resolve_model_connection
+
+        resolved_profile = model_profile or self._model_profile or "heavy"
+        default_chain = resolve_model_chain(profile=resolved_profile)
+        default_model = default_chain[0] if default_chain else RuntimeConfig().model
+        rc = RuntimeConfig(model=model or self._model or default_model)
+
+        llm_config = get_hive_config().get("llm", {})
+        if llm_config.get("use_antigravity_subscription"):
+            from framework.llm.antigravity import AntigravityProvider
+
+            return AntigravityProvider(model=rc.model)
+
+        from framework.llm.litellm import LiteLLMProvider
+
+        llm = LiteLLMProvider(
+            model=rc.model,
+            api_key=rc.api_key,
+            api_base=rc.api_base,
+            **rc.extra_kwargs,
+        )
+
+        chain = resolve_model_chain(explicit_model=rc.model, profile=resolved_profile)
+        if len(chain) <= 1:
+            return llm
+
+        from framework.llm.fallback import FallbackLLMProvider
+
+        providers = [llm]
+        seen_provider_signatures: set[tuple[str, str]] = {
+            (
+                str(getattr(llm, "model", "")).strip().lower(),
+                str(getattr(llm, "api_base", "") or "").strip().rstrip("/"),
+            )
+        }
+        cfg = get_hive_config()
+        for backup_model in chain[1:]:
+            conn = resolve_model_connection(backup_model, cfg)
+            api_key_env = conn.get("api_key_env_var")
+            api_base = conn.get("api_base")
+            api_base_env = conn.get("api_base_env_var")
+            if api_base_env and not api_base:
+                api_base = os.environ.get(str(api_base_env))
+            api_key = os.environ.get(str(api_key_env)) if api_key_env else None
+            candidate = LiteLLMProvider(
+                model=backup_model,
+                api_key=api_key,
+                api_base=api_base,
+            )
+            signature = (
+                str(getattr(candidate, "model", "")).strip().lower(),
+                str(getattr(candidate, "api_base", "") or "").strip().rstrip("/"),
+            )
+            if signature in seen_provider_signatures:
+                continue
+            seen_provider_signatures.add(signature)
+            providers.append(candidate)
+        return FallbackLLMProvider(providers)
+
     async def _create_session_core(
         self,
         session_id: str | None = None,
@@ -171,7 +242,7 @@ class SessionManager:
 
         Internal helper — use create_session() or create_session_with_worker_graph().
         """
-        from framework.config import RuntimeConfig, get_hive_config
+        from framework.config import RuntimeConfig
         from framework.runtime.event_bus import EventBus
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -182,64 +253,15 @@ class SessionManager:
                 raise ValueError(f"Session '{resolved_id}' already exists")
 
         # Load LLM config from ~/.hive/configuration.json
-        from framework.model_routing import resolve_model_chain, resolve_model_connection
+        from framework.model_routing import resolve_model_chain
 
         resolved_profile = model_profile or self._model_profile or "heavy"
         default_chain = resolve_model_chain(profile=resolved_profile)
         default_model = default_chain[0] if default_chain else RuntimeConfig().model
         rc = RuntimeConfig(model=model or self._model or default_model)
 
-        # Session owns these — shared with queen and worker
-        llm_config = get_hive_config().get("llm", {})
-        if llm_config.get("use_antigravity_subscription"):
-            from framework.llm.antigravity import AntigravityProvider
-
-            llm = AntigravityProvider(model=rc.model)
-        else:
-            from framework.llm.litellm import LiteLLMProvider
-
-            llm = LiteLLMProvider(
-                model=rc.model,
-                api_key=rc.api_key,
-                api_base=rc.api_base,
-                **rc.extra_kwargs,
-            )
-
-            # Apply profile fallback chain for server-owned session LLM.
-            chain = resolve_model_chain(explicit_model=rc.model, profile=resolved_profile)
-            if len(chain) > 1:
-                from framework.llm.fallback import FallbackLLMProvider
-
-                providers = [llm]
-                seen_provider_signatures: set[tuple[str, str]] = {
-                    (
-                        str(getattr(llm, "model", "")).strip().lower(),
-                        str(getattr(llm, "api_base", "") or "").strip().rstrip("/"),
-                    )
-                }
-                cfg = get_hive_config()
-                for backup_model in chain[1:]:
-                    conn = resolve_model_connection(backup_model, cfg)
-                    api_key_env = conn.get("api_key_env_var")
-                    api_base = conn.get("api_base")
-                    api_base_env = conn.get("api_base_env_var")
-                    if api_base_env and not api_base:
-                        api_base = os.environ.get(str(api_base_env))
-                    api_key = os.environ.get(str(api_key_env)) if api_key_env else None
-                    candidate = LiteLLMProvider(
-                        model=backup_model,
-                        api_key=api_key,
-                        api_base=api_base,
-                    )
-                    signature = (
-                        str(getattr(candidate, "model", "")).strip().lower(),
-                        str(getattr(candidate, "api_base", "") or "").strip().rstrip("/"),
-                    )
-                    if signature in seen_provider_signatures:
-                        continue
-                    seen_provider_signatures.add(signature)
-                    providers.append(candidate)
-                llm = FallbackLLMProvider(providers)
+        # Session owns this provider — shared with queen and worker.
+        llm = self.build_llm(model=rc.model, model_profile=resolved_profile)
         event_bus = EventBus()
 
         session = Session(
@@ -714,6 +736,12 @@ class SessionManager:
                 str(session.worker_path) if session.worker_path else str(agent_path)
             )
             existing_meta["project_id"] = session.project_id
+            queen_id = getattr(session, "queen_name", None)
+            if queen_id:
+                existing_meta["queen_id"] = str(queen_id)
+            colony_id = getattr(session, "colony_id", None)
+            if colony_id:
+                existing_meta["colony_id"] = str(colony_id)
             meta_path.write_text(json.dumps(existing_meta), encoding="utf-8")
         except OSError:
             pass
@@ -1035,6 +1063,12 @@ class SessionManager:
                 if session.worker_path is not None:
                     _new_meta["agent_path"] = str(session.worker_path)
                 _new_meta["project_id"] = session.project_id
+                queen_id = getattr(session, "queen_name", None)
+                if queen_id:
+                    _new_meta["queen_id"] = str(queen_id)
+                colony_id = getattr(session, "colony_id", None)
+                if colony_id:
+                    _new_meta["colony_id"] = str(colony_id)
                 _existing_meta.update(_new_meta)
                 _meta_path.write_text(json.dumps(_existing_meta), encoding="utf-8")
             except OSError:
@@ -1421,6 +1455,8 @@ class SessionManager:
         agent_name: str | None = None
         agent_path: str | None = None
         project_id: str | None = None
+        queen_id: str | None = None
+        colony_id: str | None = None
         meta_path = queen_dir / "meta.json"
         if meta_path.exists():
             try:
@@ -1428,6 +1464,8 @@ class SessionManager:
                 agent_name = meta.get("agent_name")
                 agent_path = meta.get("agent_path")
                 project_id = meta.get("project_id")
+                queen_id = meta.get("queen_id")
+                colony_id = meta.get("colony_id")
                 created_at = meta.get("created_at") or created_at
             except (json.JSONDecodeError, OSError):
                 pass
@@ -1441,6 +1479,8 @@ class SessionManager:
             "agent_name": agent_name,
             "agent_path": agent_path,
             "project_id": project_id,
+            "queen_id": queen_id,
+            "colony_id": colony_id,
         }
 
     @staticmethod
@@ -1470,6 +1510,8 @@ class SessionManager:
             agent_name: str | None = None
             agent_path: str | None = None
             project_id: str | None = None
+            queen_id: str | None = None
+            colony_id: str | None = None
             meta_path = d / "meta.json"
             if meta_path.exists():
                 try:
@@ -1477,6 +1519,8 @@ class SessionManager:
                     agent_name = meta.get("agent_name")
                     agent_path = meta.get("agent_path")
                     project_id = meta.get("project_id")
+                    queen_id = meta.get("queen_id")
+                    colony_id = meta.get("colony_id")
                     created_at = meta.get("created_at") or created_at
                 except (json.JSONDecodeError, OSError):
                     pass
@@ -1547,6 +1591,8 @@ class SessionManager:
                     "agent_name": agent_name,
                     "agent_path": agent_path,
                     "project_id": project_id,
+                    "queen_id": queen_id,
+                    "colony_id": colony_id,
                     "last_message": last_message,
                     "message_count": message_count,
                 }

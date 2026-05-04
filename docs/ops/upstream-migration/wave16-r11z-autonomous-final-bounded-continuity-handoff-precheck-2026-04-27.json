@@ -1,0 +1,24 @@
+{
+  "generated_at_utc": "2026-04-27T01:40:20Z",
+  "wave": "Wave16-R11Z",
+  "title": "Autonomous final bounded continuity handoff lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify final bounded continuity across run-cycle, tick, evaluate, auto-next, and report endpoints before handoff",
+    "prepare closure evidence for next wave transition"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_run_cycle_summary_outcomes",
+    "pipeline_loop_tick_all_endpoint",
+    "pipeline_loop_tick_resolves_execution_failed_from_event_log",
+    "pipeline_dispatch_next_rejects_when_active_run_exists",
+    "pipeline_evaluate_endpoint_uses_checks_and_updates_report",
+    "pipeline_evaluate_github_includes_pr_review_feedback_in_report",
+    "pipeline_auto_next_endpoint",
+    "pipeline_auto_next_rejects_execution_stage",
+    "pipeline_report_endpoint"
+  ]
+}

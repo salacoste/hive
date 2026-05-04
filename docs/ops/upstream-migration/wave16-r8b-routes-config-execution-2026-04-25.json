@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T10:04:51Z",
+  "wave": "Wave16-R8B",
+  "title": "Routes config AppKey contract reconciliation",
+  "scope": [
+    "core/framework/server/routes_config.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local branch uses typed aiohttp AppKey access for manager and credential store",
+      "this preserves Wave16-R6 warning-noise hardening and avoids string-key drift",
+      "upstream file still references raw string app keys and would reintroduce avoidable warning surface"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; local AppKey-backed routes_config implementation retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"credentials or provider or model or config\" -q",
+        "result": "pass",
+        "summary": "13 passed, 180 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      },
+      {
+        "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+        "result": "pass",
+        "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R8B lane completed without code churn",
+      "next candidate lane: routes_logs keep-local guard (upstream indentation/runtime-store regression)"
+    ]
+  }
+}

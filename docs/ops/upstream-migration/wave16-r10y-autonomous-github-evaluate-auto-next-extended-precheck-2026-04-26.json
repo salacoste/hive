@@ -1,0 +1,18 @@
+{
+  "generated_at_utc": "2026-04-26T15:59:37Z",
+  "wave": "Wave16-R10Y",
+  "title": "Autonomous GitHub evaluate + auto-next extended continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "delta_summary": [
+    "R10X closed execution dispatch lifecycle continuity checks",
+    "next bounded step verifies extended GitHub evaluate and auto-next policy continuity (review feedback, summary comment, no-checks modes)",
+    "lane remains non-destructive and endpoint-contract focused"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_endpoint or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_rejects_execution_stage or pipeline_auto_next_deferred_without_token_in_manual_mode' -q"
+  ],
+  "decision_gate": "close lane only after extended GitHub evaluate/auto-next policy tests remain green across review-feedback, no-checks, and manual-pending variants"
+}

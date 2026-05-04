@@ -1,0 +1,52 @@
+{
+  "generated_at_utc": "2026-04-25T13:30:24Z",
+  "wave": "Wave16-R9S",
+  "title": "Loader CLI APP_KEY manager contract lane precheck",
+  "scope": [
+    "core/framework/loader/cli.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/loader/cli.py",
+      "add": 2,
+      "del": 2,
+      "total": 4
+    }
+  },
+  "delta_summary": [
+    "local serve path imports APP_KEY_MANAGER from server app",
+    "manager lookup uses typed AppKey (`app[APP_KEY_MANAGER]`) instead of raw string key"
+  ],
+  "risk_signals": [
+    {
+      "type": "appkey-contract-consistency",
+      "evidence": "server layer standardized on APP_KEY_* accessors for aiohttp AppKey compatibility",
+      "impact": "upstream replay to string key may reintroduce warnings/noise and contract drift"
+    },
+    {
+      "type": "legacy-test-drift",
+      "evidence": "core/tests/test_colony_fork_flow.py collection currently imports missing `_queen_session_dir`",
+      "impact": "this test cannot be used as validation signal for loader-cli lane until separately reconciled"
+    }
+  ],
+  "validation_progress": [
+    {
+      "command": "uv run --package framework pytest core/tests/test_runner_cli_frontend.py -q",
+      "result": "pass",
+      "summary": "3 passed"
+    },
+    {
+      "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'execution or health' -q",
+      "result": "pass",
+      "summary": "33 passed, 160 deselected"
+    },
+    {
+      "command": "uv run --package framework pytest core/tests/test_colony_fork_flow.py -q",
+      "result": "collection_error",
+      "summary": "ImportError: cannot import name '_queen_session_dir' from framework.server.session_manager"
+    }
+  ],
+  "next": [
+    "complete R9S execution artifact after bounded decision on legacy test-drift handling"
+  ]
+}

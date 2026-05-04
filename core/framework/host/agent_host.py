@@ -9,6 +9,7 @@ import asyncio
 import logging
 import time
 import uuid
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -16,20 +17,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from framework.graph.checkpoint_config import CheckpointConfig
-from framework.graph.executor import ExecutionResult
-from framework.runtime.event_bus import EventBus
-from framework.runtime.execution_stream import EntryPointSpec, ExecutionStream
-from framework.runtime.outcome_aggregator import OutcomeAggregator
-from framework.runtime.runtime_log_store import RuntimeLogStore
-from framework.runtime.shared_state import SharedBufferManager
+from framework.host.event_bus import EventBus
+from framework.host.execution_manager import EntryPointSpec, ExecutionManager
+from framework.host.outcome_aggregator import OutcomeAggregator
+from framework.host.shared_state import SharedBufferManager
+from framework.orchestrator.checkpoint_config import CheckpointConfig
+from framework.orchestrator.orchestrator import ExecutionResult
 from framework.storage.concurrent import ConcurrentStorage
 from framework.storage.session_store import SessionStore
+from framework.tracker.runtime_log_store import RuntimeLogStore
 
 if TYPE_CHECKING:
-    from framework.graph.edge import GraphSpec
-    from framework.graph.goal import Goal
     from framework.llm.provider import LLMProvider, Tool
+    from framework.orchestrator.edge import GraphSpec
+    from framework.orchestrator.goal import Goal
+    from framework.pipeline.stage import PipelineStage
     from framework.skills.manager import SkillsManagerConfig
 
 logger = logging.getLogger(__name__)
@@ -37,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class AgentRuntimeConfig:
-    """Configuration for AgentRuntime."""
+    """Configuration for AgentHost."""
 
     max_concurrent_executions: int = 100
     cache_ttl: float = 60.0
@@ -62,14 +64,14 @@ class _GraphRegistration:
     graph: "GraphSpec"
     goal: "Goal"
     entry_points: dict[str, EntryPointSpec]
-    streams: dict[str, ExecutionStream]  # ep_id -> stream (NOT namespaced)
+    streams: dict[str, ExecutionManager]  # ep_id -> stream (NOT namespaced)
     storage_subpath: str  # relative to session root, e.g. "graphs/email_agent"
     event_subscriptions: list[str] = field(default_factory=list)
     timer_tasks: list[asyncio.Task] = field(default_factory=list)
     timer_next_fire: dict[str, float] = field(default_factory=dict)
 
 
-class AgentRuntime:
+class AgentHost:
     """
     Top-level runtime that manages agent lifecycle and concurrent executions.
 
@@ -142,6 +144,7 @@ class AgentRuntime:
         skills_catalog_prompt: str = "",
         protocols_prompt: str = "",
         skill_dirs: list[str] | None = None,
+        pipeline_stages: "list[PipelineStage] | None" = None,
     ):
         """
         Initialize agent runtime.
@@ -171,6 +174,7 @@ class AgentRuntime:
             skills_catalog_prompt: Deprecated. Pre-rendered skills catalog.
             protocols_prompt: Deprecated. Pre-rendered operational protocols.
         """
+        from framework.pipeline.runner import PipelineRunner
         from framework.skills.manager import SkillsManager
 
         self.graph = graph
@@ -179,6 +183,13 @@ class AgentRuntime:
         self._runtime_log_store = runtime_log_store
         self._checkpoint_config = checkpoint_config
         self.accounts_prompt = accounts_prompt
+
+        # Pipeline middleware: runs before every trigger() dispatch.
+        # Accepts either pre-built stage objects or loads from config.
+        if pipeline_stages:
+            self._pipeline = PipelineRunner(pipeline_stages)
+        else:
+            self._pipeline = self._load_pipeline_from_config()
 
         # --- Skill lifecycle: runtime owns the SkillsManager ---
         if skills_manager_config is not None:
@@ -195,9 +206,7 @@ class AgentRuntime:
                 DeprecationWarning,
                 stacklevel=2,
             )
-            self._skills_manager = SkillsManager.from_precomputed(
-                skills_catalog_prompt, protocols_prompt
-            )
+            self._skills_manager = SkillsManager.from_precomputed(skills_catalog_prompt, protocols_prompt)
         else:
             # Bare constructor: auto-load defaults
             self._skills_manager = SkillsManager()
@@ -238,15 +247,13 @@ class AgentRuntime:
         self._tools = tools or []
         self._tool_executor = tool_executor
         self._accounts_prompt = accounts_prompt
-        self._dynamic_memory_provider_factory: Callable[[str], Callable[[], str] | None] | None = (
-            None
-        )
+        self._dynamic_memory_provider_factory: Callable[[str], Callable[[], str] | None] | None = None
         self._accounts_data = accounts_data
         self._tool_provider_map = tool_provider_map
 
         # Entry points and streams (primary graph)
         self._entry_points: dict[str, EntryPointSpec] = {}
-        self._streams: dict[str, ExecutionStream] = {}
+        self._streams: dict[str, ExecutionManager] = {}
 
         # Webhook server (created on start if webhook_routes configured)
         self._webhook_server: Any = None
@@ -270,7 +277,7 @@ class AgentRuntime:
         self.intro_message: str = ""
 
     # ------------------------------------------------------------------
-    # Skill prompt accessors (read by ExecutionStream constructors)
+    # Skill prompt accessors (read by ExecutionManager constructors)
     # ------------------------------------------------------------------
 
     @property
@@ -335,9 +342,14 @@ class AgentRuntime:
             # Start storage
             await self._storage.start()
 
-            # Create streams for each entry point
+            # Initialize pipeline stages FIRST -- they inject LLM, tools,
+            # credentials, and skills into the host before streams are created.
+            await self._pipeline.initialize_all()
+            self._apply_pipeline_results()
+
+            # Create streams for each entry point (uses pipeline results)
             for ep_id, spec in self._entry_points.items():
-                stream = ExecutionStream(
+                stream = ExecutionManager(
                     stream_id=ep_id,
                     entry_spec=spec,
                     graph=self.graph,
@@ -370,7 +382,7 @@ class AgentRuntime:
 
             # Start webhook server if routes are configured
             if self._config.webhook_routes:
-                from framework.runtime.webhook_server import (
+                from framework.host.webhook_server import (
                     WebhookRoute,
                     WebhookServer,
                     WebhookServerConfig,
@@ -394,7 +406,7 @@ class AgentRuntime:
                 await self._webhook_server.start()
 
             # Subscribe event-driven entry points to EventBus
-            from framework.runtime.event_bus import EventType as _ET
+            from framework.host.event_bus import EventType as _ET
 
             for ep_id, spec in self._entry_points.items():
                 if spec.trigger_type != "event":
@@ -404,8 +416,7 @@ class AgentRuntime:
                 event_types = [_ET(et) for et in tc.get("event_types", [])]
                 if not event_types:
                     logger.warning(
-                        f"Entry point '{ep_id}' has trigger_type='event' "
-                        "but no event_types in trigger_config"
+                        f"Entry point '{ep_id}' has trigger_type='event' but no event_types in trigger_config"
                     )
                     continue
 
@@ -435,9 +446,7 @@ class AgentRuntime:
                             # Run in the same session as the primary entry
                             # point so memory (e.g. user-defined rules) is
                             # shared and logs land in one session directory.
-                            session_state = self._get_primary_session_state(
-                                exclude_entry_point=entry_point_id
-                            )
+                            session_state = self._get_primary_session_state(exclude_entry_point=entry_point_id)
                         exec_id = await self.trigger(
                             entry_point_id,
                             {"event": event.to_dict()},
@@ -458,316 +467,303 @@ class AgentRuntime:
                 self._event_subscriptions.append(sub_id)
 
             # Start timer-driven entry points
-            for ep_id, spec in self._entry_points.items():
-                if spec.trigger_type != "timer":
+            await self._start_timers()
+
+            # Start skill hot-reload watcher (no-op if watchfiles not installed)
+            await self._skills_manager.start_watching()
+
+            self._running = True
+            self._timers_paused = False
+            n_stages = len(self._pipeline.stages)
+            logger.info(
+                "AgentHost started with %d streams, %d pipeline stages",
+                len(self._streams),
+                n_stages,
+            )
+
+    async def _start_timers(self) -> None:
+        """Start timer-driven entry points (extracted from start())."""
+        for ep_id, spec in self._entry_points.items():
+            if spec.trigger_type != "timer":
+                continue
+
+            tc = spec.trigger_config
+            cron_expr = tc.get("cron")
+            _raw_interval = tc.get("interval_minutes")
+            interval = float(_raw_interval) if _raw_interval is not None else None
+            run_immediately = tc.get("run_immediately", False)
+
+            if cron_expr:
+                # Cron expression mode — takes priority over interval_minutes
+                try:
+                    from croniter import croniter
+                except ImportError as e:
+                    raise RuntimeError(
+                        "croniter is required for cron-based entry points. Install it with: uv pip install croniter"
+                    ) from e
+
+                try:
+                    if not croniter.is_valid(cron_expr):
+                        raise ValueError(f"Invalid cron expression: {cron_expr}")
+                except ValueError as e:
+                    logger.warning(
+                        "Entry point '%s' has invalid cron config: %s",
+                        ep_id,
+                        e,
+                    )
                     continue
 
-                tc = spec.trigger_config
-                cron_expr = tc.get("cron")
-                _raw_interval = tc.get("interval_minutes")
-                interval = float(_raw_interval) if _raw_interval is not None else None
-                run_immediately = tc.get("run_immediately", False)
-
-                if cron_expr:
-                    # Cron expression mode — takes priority over interval_minutes
-                    try:
+                def _make_cron_timer(
+                    entry_point_id: str,
+                    expr: str,
+                    immediate: bool,
+                    idle_timeout: float = 300,
+                ):
+                    async def _cron_loop():
                         from croniter import croniter
-                    except ImportError as e:
-                        raise RuntimeError(
-                            "croniter is required for cron-based entry points. "
-                            "Install it with: uv pip install croniter"
-                        ) from e
 
-                    try:
-                        if not croniter.is_valid(cron_expr):
-                            raise ValueError(f"Invalid cron expression: {cron_expr}")
-                    except ValueError as e:
-                        logger.warning(
-                            "Entry point '%s' has invalid cron config: %s",
-                            ep_id,
-                            e,
-                        )
-                        continue
+                        _persistent_session_id: str | None = None
+                        if not immediate:
+                            cron = croniter(expr, datetime.now())
+                            next_dt = cron.get_next(datetime)
+                            sleep_secs = (next_dt - datetime.now()).total_seconds()
+                            self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
+                            await asyncio.sleep(max(0, sleep_secs))
+                        while self._running:
+                            # Calculate next fire time upfront (used by skip paths too)
+                            cron = croniter(expr, datetime.now())
+                            next_dt = cron.get_next(datetime)
+                            sleep_secs = (next_dt - datetime.now()).total_seconds()
 
-                    def _make_cron_timer(
-                        entry_point_id: str,
-                        expr: str,
-                        immediate: bool,
-                        idle_timeout: float = 300,
-                    ):
-                        async def _cron_loop():
-                            from croniter import croniter
-
-                            _persistent_session_id: str | None = None
-                            if not immediate:
-                                cron = croniter(expr, datetime.now())
-                                next_dt = cron.get_next(datetime)
-                                sleep_secs = (next_dt - datetime.now()).total_seconds()
-                                self._timer_next_fire[entry_point_id] = (
-                                    time.monotonic() + sleep_secs
-                                )
-                                await asyncio.sleep(max(0, sleep_secs))
-                            while self._running:
-                                # Calculate next fire time upfront (used by skip paths too)
-                                cron = croniter(expr, datetime.now())
-                                next_dt = cron.get_next(datetime)
-                                sleep_secs = (next_dt - datetime.now()).total_seconds()
-
-                                # Gate: skip tick if timers are explicitly paused
-                                if self._timers_paused:
-                                    logger.debug(
-                                        "Cron '%s': paused, skipping tick",
-                                        entry_point_id,
-                                    )
-                                    self._timer_next_fire[entry_point_id] = (
-                                        time.monotonic() + sleep_secs
-                                    )
-                                    await asyncio.sleep(max(0, sleep_secs))
-                                    continue
-
-                                # Gate: skip tick if ANY stream is actively working.
-                                # If the execution is idle (no LLM/tool activity
-                                # beyond idle_timeout) let the timer proceed —
-                                # execute() will cancel the stale execution.
-                                _any_active = False
-                                _min_idle = float("inf")
-                                for _s in self._streams.values():
-                                    if _s.active_execution_ids:
-                                        _any_active = True
-                                        _idle = _s.agent_idle_seconds
-                                        if _idle < _min_idle:
-                                            _min_idle = _idle
-                                logger.info(
-                                    "Cron '%s': gate — active=%s, idle=%.1fs, timeout=%ds",
+                            # Gate: skip tick if timers are explicitly paused
+                            if self._timers_paused:
+                                logger.debug(
+                                    "Cron '%s': paused, skipping tick",
                                     entry_point_id,
-                                    _any_active,
-                                    _min_idle,
-                                    idle_timeout,
                                 )
-                                if _any_active and _min_idle < idle_timeout:
-                                    logger.info(
-                                        "Cron '%s': agent actively working, skipping tick",
-                                        entry_point_id,
-                                    )
-                                    self._timer_next_fire[entry_point_id] = (
-                                        time.monotonic() + sleep_secs
-                                    )
-                                    await asyncio.sleep(max(0, sleep_secs))
-                                    continue
-
-                                self._timer_next_fire.pop(entry_point_id, None)
-                                try:
-                                    ep_spec = self._entry_points.get(entry_point_id)
-                                    is_isolated = ep_spec and ep_spec.isolation_level == "isolated"
-                                    if is_isolated:
-                                        if _persistent_session_id:
-                                            session_state = {
-                                                "resume_session_id": _persistent_session_id
-                                            }
-                                        else:
-                                            session_state = None
-                                    else:
-                                        session_state = self._get_primary_session_state(
-                                            exclude_entry_point=entry_point_id
-                                        )
-                                        # Gate: skip tick if no active session
-                                        if session_state is None:
-                                            logger.debug(
-                                                "Cron '%s': no active session, skipping",
-                                                entry_point_id,
-                                            )
-                                            self._timer_next_fire[entry_point_id] = (
-                                                time.monotonic() + sleep_secs
-                                            )
-                                            await asyncio.sleep(max(0, sleep_secs))
-                                            continue
-
-                                    exec_id = await self.trigger(
-                                        entry_point_id,
-                                        {
-                                            "event": {
-                                                "source": "timer",
-                                                "reason": "scheduled",
-                                            }
-                                        },
-                                        session_state=session_state,
-                                    )
-                                    if not _persistent_session_id and is_isolated:
-                                        _persistent_session_id = exec_id
-                                    logger.info(
-                                        "Cron fired for entry point '%s' (expr: %s)",
-                                        entry_point_id,
-                                        expr,
-                                    )
-                                except Exception:
-                                    logger.error(
-                                        "Cron trigger failed for '%s'",
-                                        entry_point_id,
-                                        exc_info=True,
-                                    )
-                                # Calculate next fire from now
-                                cron = croniter(expr, datetime.now())
-                                next_dt = cron.get_next(datetime)
-                                sleep_secs = (next_dt - datetime.now()).total_seconds()
-                                self._timer_next_fire[entry_point_id] = (
-                                    time.monotonic() + sleep_secs
-                                )
+                                self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
                                 await asyncio.sleep(max(0, sleep_secs))
+                                continue
 
-                        return _cron_loop
+                            # Gate: skip tick if ANY stream is actively working.
+                            # If the execution is idle (no LLM/tool activity
+                            # beyond idle_timeout) let the timer proceed —
+                            # execute() will cancel the stale execution.
+                            _any_active = False
+                            _min_idle = float("inf")
+                            for _s in self._streams.values():
+                                if _s.active_execution_ids:
+                                    _any_active = True
+                                    _idle = _s.agent_idle_seconds
+                                    if _idle < _min_idle:
+                                        _min_idle = _idle
+                            logger.info(
+                                "Cron '%s': gate — active=%s, idle=%.1fs, timeout=%ds",
+                                entry_point_id,
+                                _any_active,
+                                _min_idle,
+                                idle_timeout,
+                            )
+                            if _any_active and _min_idle < idle_timeout:
+                                logger.info(
+                                    "Cron '%s': agent actively working, skipping tick",
+                                    entry_point_id,
+                                )
+                                self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
+                                await asyncio.sleep(max(0, sleep_secs))
+                                continue
 
-                    task = asyncio.create_task(
-                        _make_cron_timer(
-                            ep_id,
-                            cron_expr,
-                            run_immediately,
-                            idle_timeout=float(tc.get("idle_timeout_seconds", 300)),
-                        )()
-                    )
-                    self._timer_tasks.append(task)
-                    logger.info(
-                        "Started cron timer for entry point '%s' with expression '%s'%s",
+                            self._timer_next_fire.pop(entry_point_id, None)
+                            try:
+                                ep_spec = self._entry_points.get(entry_point_id)
+                                is_isolated = ep_spec and ep_spec.isolation_level == "isolated"
+                                if is_isolated:
+                                    if _persistent_session_id:
+                                        session_state = {"resume_session_id": _persistent_session_id}
+                                    else:
+                                        session_state = None
+                                else:
+                                    session_state = self._get_primary_session_state(exclude_entry_point=entry_point_id)
+                                    # Gate: skip tick if no active session
+                                    if session_state is None:
+                                        logger.debug(
+                                            "Cron '%s': no active session, skipping",
+                                            entry_point_id,
+                                        )
+                                        self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
+                                        await asyncio.sleep(max(0, sleep_secs))
+                                        continue
+
+                                exec_id = await self.trigger(
+                                    entry_point_id,
+                                    {
+                                        "event": {
+                                            "source": "timer",
+                                            "reason": "scheduled",
+                                        }
+                                    },
+                                    session_state=session_state,
+                                )
+                                if not _persistent_session_id and is_isolated:
+                                    _persistent_session_id = exec_id
+                                logger.info(
+                                    "Cron fired for entry point '%s' (expr: %s)",
+                                    entry_point_id,
+                                    expr,
+                                )
+                            except Exception:
+                                logger.error(
+                                    "Cron trigger failed for '%s'",
+                                    entry_point_id,
+                                    exc_info=True,
+                                )
+                            # Calculate next fire from now
+                            cron = croniter(expr, datetime.now())
+                            next_dt = cron.get_next(datetime)
+                            sleep_secs = (next_dt - datetime.now()).total_seconds()
+                            self._timer_next_fire[entry_point_id] = time.monotonic() + sleep_secs
+                            await asyncio.sleep(max(0, sleep_secs))
+
+                    return _cron_loop
+
+                task = asyncio.create_task(
+                    _make_cron_timer(
                         ep_id,
                         cron_expr,
-                        " (immediate first run)" if run_immediately else "",
-                    )
+                        run_immediately,
+                        idle_timeout=float(tc.get("idle_timeout_seconds", 300)),
+                    )()
+                )
+                self._timer_tasks.append(task)
+                logger.info(
+                    "Started cron timer for entry point '%s' with expression '%s'%s",
+                    ep_id,
+                    cron_expr,
+                    " (immediate first run)" if run_immediately else "",
+                )
 
-                elif interval and interval > 0:
-                    # Fixed interval mode (original behavior)
-                    def _make_timer(
-                        entry_point_id: str,
-                        mins: float,
-                        immediate: bool,
-                        idle_timeout: float = 300,
-                    ):
-                        async def _timer_loop():
-                            interval_secs = mins * 60
-                            _persistent_session_id: str | None = None
-                            if not immediate:
-                                self._timer_next_fire[entry_point_id] = (
-                                    time.monotonic() + interval_secs
-                                )
-                                await asyncio.sleep(interval_secs)
-                            while self._running:
-                                # Gate: skip tick if timers are explicitly paused
-                                if self._timers_paused:
-                                    logger.debug(
-                                        "Timer '%s': paused, skipping tick",
-                                        entry_point_id,
-                                    )
-                                    self._timer_next_fire[entry_point_id] = (
-                                        time.monotonic() + interval_secs
-                                    )
-                                    await asyncio.sleep(interval_secs)
-                                    continue
-
-                                # Gate: skip tick if agent is actively working.
-                                # Gate: skip tick if ANY stream is actively working.
-                                _any_active = False
-                                _min_idle = float("inf")
-                                for _s in self._streams.values():
-                                    if _s.active_execution_ids:
-                                        _any_active = True
-                                        _idle = _s.agent_idle_seconds
-                                        if _idle < _min_idle:
-                                            _min_idle = _idle
-                                logger.info(
-                                    "Timer '%s': gate — active=%s, idle=%.1fs, timeout=%ds",
+            elif interval and interval > 0:
+                # Fixed interval mode (original behavior)
+                def _make_timer(
+                    entry_point_id: str,
+                    mins: float,
+                    immediate: bool,
+                    idle_timeout: float = 300,
+                ):
+                    async def _timer_loop():
+                        interval_secs = mins * 60
+                        _persistent_session_id: str | None = None
+                        if not immediate:
+                            self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
+                            await asyncio.sleep(interval_secs)
+                        while self._running:
+                            # Gate: skip tick if timers are explicitly paused
+                            if self._timers_paused:
+                                logger.debug(
+                                    "Timer '%s': paused, skipping tick",
                                     entry_point_id,
-                                    _any_active,
-                                    _min_idle,
-                                    idle_timeout,
                                 )
-                                if _any_active and _min_idle < idle_timeout:
-                                    logger.info(
-                                        "Timer '%s': agent actively working, skipping tick",
-                                        entry_point_id,
-                                    )
-                                    self._timer_next_fire[entry_point_id] = (
-                                        time.monotonic() + interval_secs
-                                    )
-                                    await asyncio.sleep(interval_secs)
-                                    continue
-
-                                self._timer_next_fire.pop(entry_point_id, None)
-                                try:
-                                    ep_spec = self._entry_points.get(entry_point_id)
-                                    is_isolated = ep_spec and ep_spec.isolation_level == "isolated"
-                                    if is_isolated:
-                                        if _persistent_session_id:
-                                            session_state = {
-                                                "resume_session_id": _persistent_session_id
-                                            }
-                                        else:
-                                            session_state = None
-                                    else:
-                                        session_state = self._get_primary_session_state(
-                                            exclude_entry_point=entry_point_id
-                                        )
-                                        # Gate: skip tick if no active session
-                                        if session_state is None:
-                                            logger.debug(
-                                                "Timer '%s': no active session, skipping",
-                                                entry_point_id,
-                                            )
-                                            self._timer_next_fire[entry_point_id] = (
-                                                time.monotonic() + interval_secs
-                                            )
-                                            await asyncio.sleep(interval_secs)
-                                            continue
-
-                                    exec_id = await self.trigger(
-                                        entry_point_id,
-                                        {
-                                            "event": {
-                                                "source": "timer",
-                                                "reason": "scheduled",
-                                            }
-                                        },
-                                        session_state=session_state,
-                                    )
-                                    if not _persistent_session_id and is_isolated:
-                                        _persistent_session_id = exec_id
-                                    logger.info(
-                                        "Timer fired for entry point '%s' (next in %s min)",
-                                        entry_point_id,
-                                        mins,
-                                    )
-                                except Exception:
-                                    logger.error(
-                                        "Timer trigger failed for '%s'",
-                                        entry_point_id,
-                                        exc_info=True,
-                                    )
-                                self._timer_next_fire[entry_point_id] = (
-                                    time.monotonic() + interval_secs
-                                )
+                                self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
                                 await asyncio.sleep(interval_secs)
+                                continue
 
-                        return _timer_loop
+                            # Gate: skip tick if agent is actively working.
+                            # Gate: skip tick if ANY stream is actively working.
+                            _any_active = False
+                            _min_idle = float("inf")
+                            for _s in self._streams.values():
+                                if _s.active_execution_ids:
+                                    _any_active = True
+                                    _idle = _s.agent_idle_seconds
+                                    if _idle < _min_idle:
+                                        _min_idle = _idle
+                            logger.info(
+                                "Timer '%s': gate — active=%s, idle=%.1fs, timeout=%ds",
+                                entry_point_id,
+                                _any_active,
+                                _min_idle,
+                                idle_timeout,
+                            )
+                            if _any_active and _min_idle < idle_timeout:
+                                logger.info(
+                                    "Timer '%s': agent actively working, skipping tick",
+                                    entry_point_id,
+                                )
+                                self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
+                                await asyncio.sleep(interval_secs)
+                                continue
 
-                    task = asyncio.create_task(
-                        _make_timer(
-                            ep_id,
-                            interval,
-                            run_immediately,
-                            idle_timeout=float(tc.get("idle_timeout_seconds", 300)),
-                        )()
-                    )
-                    self._timer_tasks.append(task)
-                    logger.info(
-                        "Started timer for entry point '%s' every %s min%s",
+                            self._timer_next_fire.pop(entry_point_id, None)
+                            try:
+                                ep_spec = self._entry_points.get(entry_point_id)
+                                is_isolated = ep_spec and ep_spec.isolation_level == "isolated"
+                                if is_isolated:
+                                    if _persistent_session_id:
+                                        session_state = {"resume_session_id": _persistent_session_id}
+                                    else:
+                                        session_state = None
+                                else:
+                                    session_state = self._get_primary_session_state(exclude_entry_point=entry_point_id)
+                                    # Gate: skip tick if no active session
+                                    if session_state is None:
+                                        logger.debug(
+                                            "Timer '%s': no active session, skipping",
+                                            entry_point_id,
+                                        )
+                                        self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
+                                        await asyncio.sleep(interval_secs)
+                                        continue
+
+                                exec_id = await self.trigger(
+                                    entry_point_id,
+                                    {
+                                        "event": {
+                                            "source": "timer",
+                                            "reason": "scheduled",
+                                        }
+                                    },
+                                    session_state=session_state,
+                                )
+                                if not _persistent_session_id and is_isolated:
+                                    _persistent_session_id = exec_id
+                                logger.info(
+                                    "Timer fired for entry point '%s' (next in %s min)",
+                                    entry_point_id,
+                                    mins,
+                                )
+                            except Exception:
+                                logger.error(
+                                    "Timer trigger failed for '%s'",
+                                    entry_point_id,
+                                    exc_info=True,
+                                )
+                            self._timer_next_fire[entry_point_id] = time.monotonic() + interval_secs
+                            await asyncio.sleep(interval_secs)
+
+                    return _timer_loop
+
+                task = asyncio.create_task(
+                    _make_timer(
                         ep_id,
                         interval,
-                        " (immediate first run)" if run_immediately else "",
-                    )
+                        run_immediately,
+                        idle_timeout=float(tc.get("idle_timeout_seconds", 300)),
+                    )()
+                )
+                self._timer_tasks.append(task)
+                logger.info(
+                    "Started timer for entry point '%s' every %s min%s",
+                    ep_id,
+                    interval,
+                    " (immediate first run)" if run_immediately else "",
+                )
 
-                else:
-                    logger.warning(
-                        "Entry point '%s' has trigger_type='timer' "
-                        "but no 'cron' or valid 'interval_minutes' in trigger_config",
-                        ep_id,
-                    )
+            else:
+                logger.warning(
+                    "Entry point '%s' has trigger_type='timer' "
+                    "but no 'cron' or valid 'interval_minutes' in trigger_config",
+                    ep_id,
+                )
 
             # Register primary graph
             self._graphs[self._graph_id] = _GraphRegistration(
@@ -780,10 +776,6 @@ class AgentRuntime:
                 timer_tasks=list(self._timer_tasks),
                 timer_next_fire=self._timer_next_fire,
             )
-
-            self._running = True
-            self._timers_paused = False
-            logger.info(f"AgentRuntime started with {len(self._streams)} streams")
 
     async def stop(self) -> None:
         """Stop the agent runtime and all streams."""
@@ -818,11 +810,14 @@ class AgentRuntime:
             self._streams.clear()
             self._graphs.clear()
 
+            # Stop skill hot-reload watcher
+            await self._skills_manager.stop_watching()
+
             # Stop storage
             await self._storage.stop()
 
             self._running = False
-            logger.info("AgentRuntime stopped")
+            logger.info("AgentHost stopped")
 
     def pause_timers(self) -> None:
         """Pause all timer-driven entry points.
@@ -841,7 +836,7 @@ class AgentRuntime:
         self,
         entry_point_id: str,
         graph_id: str | None = None,
-    ) -> ExecutionStream | None:
+    ) -> ExecutionManager | None:
         """Find the stream for an entry point, searching the active graph first.
 
         Lookup order:
@@ -864,6 +859,56 @@ class AgentRuntime:
 
         # Primary graph (also stored in self._streams)
         return self._streams.get(entry_point_id)
+
+    def _apply_pipeline_results(self) -> None:
+        """Read typed attributes from pipeline stages after initialization."""
+        for stage in self._pipeline.stages:
+            name = stage.__class__.__name__
+
+            if stage.tool_registry is not None:
+                tools = list(stage.tool_registry.get_tools().values())
+                if tools:
+                    self._tools = tools
+                    self._tool_executor = stage.tool_registry.get_executor()
+                    logger.info("Pipeline: %d tools from %s", len(tools), name)
+
+            if stage.llm is not None and self._llm is None:
+                self._llm = stage.llm
+                logger.info("Pipeline: LLM from %s", name)
+
+            if stage.accounts_prompt:
+                self._accounts_prompt = stage.accounts_prompt
+                self._accounts_data = stage.accounts_data
+                self._tool_provider_map = stage.tool_provider_map
+
+            if stage.skills_manager is not None:
+                self._skills_manager = stage.skills_manager
+
+    @staticmethod
+    def _load_pipeline_from_config():
+        """Build pipeline from ``~/.hive/configuration.json`` ``pipeline`` key.
+
+        Returns an empty pipeline if no config is set.
+        """
+        from framework.config import get_hive_config
+        from framework.pipeline.registry import build_pipeline_from_config
+        from framework.pipeline.runner import PipelineRunner
+
+        config = get_hive_config()
+        stages_config = config.get("pipeline", {}).get("stages", [])
+        if not stages_config:
+            return PipelineRunner([])
+        return build_pipeline_from_config(stages_config)
+
+    async def _reload_pipeline(self) -> None:
+        """Hot-reload pipeline from config.  Atomic swap."""
+        new_pipeline = self._load_pipeline_from_config()
+        await new_pipeline.initialize_all()
+        self._pipeline = new_pipeline
+        logger.info(
+            "Pipeline reloaded: %d stages",
+            len(new_pipeline.stages),
+        )
 
     def _prune_idempotency_keys(self) -> None:
         """Prune expired idempotency keys based on TTL and max size."""
@@ -915,7 +960,7 @@ class AgentRuntime:
             RuntimeError: If runtime not running
         """
         if not self._running:
-            raise RuntimeError("AgentRuntime is not running")
+            raise RuntimeError("AgentHost is not running")
 
         # Idempotency check: return cached execution_id for duplicate keys.
         if idempotency_key is not None:
@@ -928,6 +973,21 @@ class AgentRuntime:
                     cached,
                 )
                 return cached
+
+        # Run pipeline middleware (rate limiting, validation, cost guards, ...)
+        # Raises PipelineRejectedError if any stage rejects.
+        if self._pipeline.stages:
+            from framework.pipeline.stage import PipelineContext
+
+            pipeline_ctx = PipelineContext(
+                entry_point_id=entry_point_id,
+                input_data=input_data,
+                correlation_id=correlation_id,
+                session_state=session_state,
+            )
+            pipeline_ctx = await self._pipeline.run(pipeline_ctx)
+            # Stages may have transformed the input_data.
+            input_data = pipeline_ctx.input_data
 
         stream = self._resolve_stream(entry_point_id, graph_id)
         if stream is None:
@@ -1023,9 +1083,9 @@ class AgentRuntime:
         graph_log_store = RuntimeLogStore(graph_base / "runtime_logs")
 
         # Create streams for each entry point
-        streams: dict[str, ExecutionStream] = {}
+        streams: dict[str, ExecutionManager] = {}
         for ep_id, spec in entry_points.items():
-            stream = ExecutionStream(
+            stream = ExecutionManager(
                 stream_id=f"{graph_id}::{ep_id}",
                 entry_spec=spec,
                 graph=graph,
@@ -1055,7 +1115,7 @@ class AgentRuntime:
             streams[ep_id] = stream
 
         # Set up event-driven subscriptions
-        from framework.runtime.event_bus import EventType as _ET
+        from framework.host.event_bus import EventType as _ET
 
         event_subs: list[str] = []
         for ep_id, spec in entry_points.items():
@@ -1065,8 +1125,7 @@ class AgentRuntime:
             event_types = [_ET(et) for et in tc.get("event_types", [])]
             if not event_types:
                 logger.warning(
-                    "Entry point '%s::%s' has trigger_type='event' "
-                    "but no event_types in trigger_config",
+                    "Entry point '%s::%s' has trigger_type='event' but no event_types in trigger_config",
                     graph_id,
                     ep_id,
                 )
@@ -1214,24 +1273,18 @@ class AgentRuntime:
                                     break
                                 stream = reg.streams.get(local_ep)
                                 if not stream:
-                                    logger.warning(
-                                        "Timer: no stream '%s' in '%s', stopping", local_ep, gid
-                                    )
+                                    logger.warning("Timer: no stream '%s' in '%s', stopping", local_ep, gid)
                                     break
                                 # Isolated entry points get their own session;
                                 # shared ones join the primary session.
                                 ep_spec = reg.entry_points.get(local_ep)
                                 if ep_spec and ep_spec.isolation_level == "isolated":
                                     if _persistent_session_id:
-                                        session_state = {
-                                            "resume_session_id": _persistent_session_id
-                                        }
+                                        session_state = {"resume_session_id": _persistent_session_id}
                                     else:
                                         session_state = None
                                 else:
-                                    session_state = self._get_primary_session_state(
-                                        local_ep, source_graph_id=gid
-                                    )
+                                    session_state = self._get_primary_session_state(local_ep, source_graph_id=gid)
                                     # Gate: skip tick if no active session
                                     if session_state is None:
                                         logger.debug(
@@ -1248,11 +1301,7 @@ class AgentRuntime:
                                     session_state=session_state,
                                 )
                                 # Remember session ID for reuse on next tick
-                                if (
-                                    not _persistent_session_id
-                                    and ep_spec
-                                    and ep_spec.isolation_level == "isolated"
-                                ):
+                                if not _persistent_session_id and ep_spec and ep_spec.isolation_level == "isolated":
                                     _persistent_session_id = exec_id
                             except Exception:
                                 logger.error(
@@ -1353,6 +1402,26 @@ class AgentRuntime:
         return self._graph_id
 
     @property
+    def colony_id(self) -> str:
+        """Colony compatibility — returns the primary graph ID."""
+        return self._graph_id
+
+    def list_workers(self) -> list[str]:
+        """Colony compatibility — returns registered graph IDs."""
+        return self.list_graphs()
+
+    def get_worker_registration(self, graph_id: str):
+        """Colony compatibility — returns self for the matching graph."""
+        if graph_id in self._graphs:
+            return self
+        return None
+
+    @property
+    def streams(self) -> dict:
+        """Colony compatibility — returns _streams dict."""
+        return self._streams
+
+    @property
     def active_graph_id(self) -> str:
         """The currently focused graph (for TUI routing)."""
         return self._active_graph_id
@@ -1415,8 +1484,11 @@ class AgentRuntime:
         future = asyncio.run_coroutine_threadsafe(self.cancel_all_tasks_async(), loop)
         try:
             return future.result(timeout=5)
+        except FutureTimeoutError:
+            logger.debug("cancel_all_tasks: timed out waiting for cancellation acknowledgement")
+            return False
         except Exception:
-            logger.warning("cancel_all_tasks: timed out or failed")
+            logger.warning("cancel_all_tasks: failed", exc_info=True)
             return False
 
     async def cancel_all_tasks_async(self) -> bool:
@@ -1436,6 +1508,17 @@ class AgentRuntime:
                             task.cancel()
                             cancelled = True
         return cancelled
+
+    async def stop_all_workers(self) -> bool:
+        """Alias for ``cancel_all_tasks_async`` used by queen-lifecycle tools.
+
+        Queen tools (``stop_worker``, ``switch_to_reviewing``, etc.) call
+        ``runtime.stop_all_workers()`` which is the :class:`ColonyRuntime`
+        idiom. In the current architecture the session's runtime is an
+        :class:`AgentHost`, which stops workers by cancelling their
+        execution tasks. This alias bridges the two interfaces.
+        """
+        return await self.cancel_all_tasks_async()
 
     def _get_primary_session_state(
         self,
@@ -1479,9 +1562,7 @@ class AgentRuntime:
         src_graph_id = source_graph_id or self._graph_id
         src_reg = self._graphs.get(src_graph_id)
         ep_spec = (
-            src_reg.entry_points.get(exclude_entry_point)
-            if src_reg
-            else self._entry_points.get(exclude_entry_point)
+            src_reg.entry_points.get(exclude_entry_point) if src_reg else self._entry_points.get(exclude_entry_point)
         )
         if ep_spec:
             graph = src_reg.graph if src_reg else self.graph
@@ -1492,7 +1573,7 @@ class AgentRuntime:
         # Search primary graph's streams for an active session.
         # Skip isolated streams — they have their own session directories
         # and must never be used as a shared session.
-        all_streams: list[tuple[str, ExecutionStream]] = []
+        all_streams: list[tuple[str, ExecutionManager]] = []
         for _gid, reg in self._graphs.items():
             for ep_id, stream in reg.streams.items():
                 # Skip isolated entry points — they run in their own namespace
@@ -1515,9 +1596,7 @@ class AgentRuntime:
                         # Filter to only input keys so stale outputs
                         # from previous triggers don't leak through.
                         if allowed_keys is not None:
-                            buffer_data = {
-                                k: v for k, v in full_buffer.items() if k in allowed_keys
-                            }
+                            buffer_data = {k: v for k, v in full_buffer.items() if k in allowed_keys}
                         else:
                             buffer_data = full_buffer
                         if buffer_data:
@@ -1597,7 +1676,7 @@ class AgentRuntime:
         entry_point_id: str,
         execution_id: str,
         graph_id: str | None = None,
-    ) -> bool:
+    ) -> str:
         """
         Cancel a running execution.
 
@@ -1607,11 +1686,11 @@ class AgentRuntime:
             graph_id: Graph to search (defaults to active graph)
 
         Returns:
-            True if cancelled, False if not found
+            Cancellation outcome from the stream.
         """
         stream = self._resolve_stream(entry_point_id, graph_id)
         if stream is None:
-            return False
+            return "not_found"
         return await stream.cancel_execution(execution_id)
 
     # === QUERY OPERATIONS ===
@@ -1653,7 +1732,7 @@ class AgentRuntime:
                 return max(0.0, mono - time.monotonic())
         return None
 
-    def get_stream(self, entry_point_id: str) -> ExecutionStream | None:
+    def get_stream(self, entry_point_id: str) -> ExecutionManager | None:
         """Get a specific execution stream."""
         return self._streams.get(entry_point_id)
 
@@ -1818,96 +1897,3 @@ class AgentRuntime:
 
 
 # === CONVENIENCE FACTORY ===
-
-
-def create_agent_runtime(
-    graph: "GraphSpec",
-    goal: "Goal",
-    storage_path: str | Path,
-    entry_points: list[EntryPointSpec],
-    llm: "LLMProvider | None" = None,
-    tools: list["Tool"] | None = None,
-    tool_executor: Callable | None = None,
-    config: AgentRuntimeConfig | None = None,
-    runtime_log_store: Any = None,
-    enable_logging: bool = True,
-    checkpoint_config: CheckpointConfig | None = None,
-    graph_id: str | None = None,
-    accounts_prompt: str = "",
-    accounts_data: list[dict] | None = None,
-    tool_provider_map: dict[str, str] | None = None,
-    event_bus: "EventBus | None" = None,
-    skills_manager_config: "SkillsManagerConfig | None" = None,
-    # Deprecated — pass skills_manager_config instead.
-    skills_catalog_prompt: str = "",
-    protocols_prompt: str = "",
-    skill_dirs: list[str] | None = None,
-) -> AgentRuntime:
-    """
-    Create and configure an AgentRuntime with entry points.
-
-    Convenience factory that creates runtime and registers entry points.
-    Runtime logging is enabled by default for observability.
-
-    Args:
-        graph: Graph specification
-        goal: Goal driving execution
-        storage_path: Path for persistent storage
-        entry_points: Entry point specifications
-        llm: LLM provider
-        tools: Available tools
-        tool_executor: Tool executor function
-        config: Runtime configuration
-        runtime_log_store: Optional RuntimeLogStore for per-execution logging.
-            If None and enable_logging=True, creates one automatically.
-        enable_logging: Whether to enable runtime logging (default: True).
-            Set to False to disable logging entirely.
-        checkpoint_config: Optional checkpoint configuration for resumable sessions.
-            If None, uses default checkpointing behavior.
-        graph_id: Optional identifier for the primary graph (defaults to "primary").
-        accounts_data: Raw account data for per-node prompt generation.
-        tool_provider_map: Tool name to provider name mapping for account routing.
-        event_bus: Optional external EventBus to share with other components.
-        skills_catalog_prompt: Available skills catalog for system prompt.
-        protocols_prompt: Default skill operational protocols for system prompt.
-        skill_dirs: Skill base directories for Tier 3 resource access.
-        skills_manager_config: Skill configuration — the runtime owns
-            discovery, loading, and prompt renderation internally.
-        skills_catalog_prompt: Deprecated. Pre-rendered skills catalog.
-        protocols_prompt: Deprecated. Pre-rendered operational protocols.
-
-    Returns:
-        Configured AgentRuntime (not yet started)
-    """
-    # Auto-create runtime log store if logging is enabled and not provided
-    if enable_logging and runtime_log_store is None:
-        from framework.runtime.runtime_log_store import RuntimeLogStore
-
-        storage_path_obj = Path(storage_path) if isinstance(storage_path, str) else storage_path
-        runtime_log_store = RuntimeLogStore(storage_path_obj / "runtime_logs")
-
-    runtime = AgentRuntime(
-        graph=graph,
-        goal=goal,
-        storage_path=storage_path,
-        llm=llm,
-        tools=tools,
-        tool_executor=tool_executor,
-        config=config,
-        runtime_log_store=runtime_log_store,
-        checkpoint_config=checkpoint_config,
-        graph_id=graph_id,
-        accounts_prompt=accounts_prompt,
-        accounts_data=accounts_data,
-        tool_provider_map=tool_provider_map,
-        event_bus=event_bus,
-        skills_manager_config=skills_manager_config,
-        skills_catalog_prompt=skills_catalog_prompt,
-        protocols_prompt=protocols_prompt,
-        skill_dirs=skill_dirs,
-    )
-
-    for spec in entry_points:
-        runtime.register_entry_point(spec)
-
-    return runtime

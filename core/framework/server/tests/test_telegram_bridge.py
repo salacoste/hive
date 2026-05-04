@@ -51,6 +51,102 @@ def test_telegram_bridge_persists_known_chats(tmp_path: Path, monkeypatch: pytes
     assert "188207447" in restored._known_chats
 
 
+def test_telegram_bridge_persists_selected_bee(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state_path = tmp_path / "telegram-bridge-state.json"
+    monkeypatch.setenv("HIVE_TELEGRAM_STATE_PATH", str(state_path))
+
+    bridge = TelegramBridge(_DummyManager())
+    bridge._set_queen_for_chat("188207447", "queen_growth")
+
+    restored = TelegramBridge(_DummyManager())
+    restored._load_persistent_state()
+
+    assert restored._selected_queen_id("188207447") == "queen_growth"
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_bound_chat_by_resuming_same_session_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "telegram-bridge-state.json"
+    monkeypatch.setenv("HIVE_TELEGRAM_STATE_PATH", str(state_path))
+
+    class _RecordingEventBus:
+        def subscribe(self, event_types: list[EventType], handler: Any) -> str:
+            return f"sub-{len(event_types)}"
+
+    class _Session:
+        def __init__(self, sid: str) -> None:
+            self.id = sid
+            self.event_bus = _RecordingEventBus()
+            self.project_id = "default"
+            self.queen_name = None
+
+    class _Manager:
+        def __init__(self) -> None:
+            self._sessions: dict[str, Any] = {}
+            self.create_calls: list[dict[str, Any]] = []
+
+        def default_project_id(self) -> str:
+            return "default"
+
+        def list_projects(self) -> list[dict[str, str]]:
+            return [{"id": "default", "name": "Default"}]
+
+        def get_project(self, project_id: str) -> dict[str, str] | None:
+            if project_id == "default":
+                return {"id": "default", "name": "Default"}
+            return None
+
+        def list_sessions(self, project_id: str | None = None) -> list[Any]:
+            return [s for s in self._sessions.values() if project_id in {None, s.project_id}]
+
+        def get_session(self, session_id: str) -> Any | None:
+            return self._sessions.get(session_id)
+
+        async def create_session(
+            self,
+            project_id: str | None = None,
+            queen_resume_from: str | None = None,
+        ) -> Any:
+            self.create_calls.append(
+                {
+                    "project_id": project_id,
+                    "queen_resume_from": queen_resume_from,
+                }
+            )
+            sid = str(queen_resume_from or "session-fresh")
+            session = _Session(sid)
+            session.project_id = project_id or "default"
+            self._sessions[sid] = session
+            return session
+
+    # Process #1: bridge persists chat -> session binding.
+    manager_before = _Manager()
+    bridge_before = TelegramBridge(manager_before)
+    bridge_before._set_queen_for_chat("42", "queen_growth")
+    bridge_before._bind_chat("42", "session-restart-1")
+    assert state_path.exists()
+
+    # Process #2 (after restart): no live session in memory, binding restored
+    # from state file and resumed via queen_resume_from with same session id.
+    manager_after = _Manager()
+    bridge_after = TelegramBridge(manager_after)
+    bridge_after._load_persistent_state()
+    assert bridge_after._chat_session.get("42") == "session-restart-1"
+
+    sid, session = await bridge_after._ensure_bound_session("42")
+
+    assert sid == "session-restart-1"
+    assert bridge_after._chat_session.get("42") == "session-restart-1"
+    assert bridge_after._selected_queen_id("42") == "queen_growth"
+    assert getattr(session, "queen_name", None) == "queen_growth"
+    assert manager_after.create_calls == [
+        {"project_id": None, "queen_resume_from": "session-restart-1"},
+    ]
+
+
 @pytest.mark.asyncio
 async def test_menu_status_shortcut_dispatches_to_status_handler(monkeypatch: pytest.MonkeyPatch) -> None:
     bridge = TelegramBridge(_DummyManager())
@@ -64,6 +160,113 @@ async def test_menu_status_shortcut_dispatches_to_status_handler(monkeypatch: py
     handled = await bridge._handle_command("42", TelegramBridge.MENU_STATUS)
     assert handled is True
     assert called == ["42"]
+
+
+@pytest.mark.asyncio
+async def test_web_input_auto_rebinds_chat_by_project_and_queen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "telegram-bridge-state.json"
+    monkeypatch.setenv("HIVE_TELEGRAM_STATE_PATH", str(state_path))
+
+    class _Session:
+        def __init__(self, sid: str, *, project_id: str, queen_name: str) -> None:
+            self.id = sid
+            self.project_id = project_id
+            self.queen_name = queen_name
+
+    class _Manager:
+        def __init__(self) -> None:
+            self._sessions: dict[str, Any] = {
+                "session-old": _Session("session-old", project_id="default", queen_name="queen_growth"),
+                "session-new": _Session("session-new", project_id="default", queen_name="queen_growth"),
+            }
+
+        def default_project_id(self) -> str:
+            return "default"
+
+        def list_projects(self) -> list[dict[str, str]]:
+            return [{"id": "default", "name": "Default"}]
+
+        def get_session(self, session_id: str) -> Any | None:
+            return self._sessions.get(session_id)
+
+    bridge = TelegramBridge(_Manager())
+    bridge._set_queen_for_chat("42", "queen_growth")
+    bridge._bind_chat("42", "session-old")
+
+    sent: list[str] = []
+
+    async def _fake_send_text(
+        chat_id: str,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        sent.append(f"{chat_id}:{text}")
+
+    monkeypatch.setattr(bridge, "_send_text", _fake_send_text)
+
+    event = SimpleNamespace(
+        stream_id="queen",
+        data={"content": "fix applied", "source": "web"},
+    )
+    await bridge._on_client_input_received("session-new", event)
+
+    assert bridge._chat_session.get("42") == "session-new"
+    assert any(msg.startswith("42:🌐 Web user: fix applied") for msg in sent)
+
+
+@pytest.mark.asyncio
+async def test_bees_command_dispatches_to_bees_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    bridge = TelegramBridge(_DummyManager())
+    called: list[str] = []
+
+    async def _fake_send_bees(chat_id: str) -> None:
+        called.append(chat_id)
+
+    monkeypatch.setattr(bridge, "_send_bees", _fake_send_bees)
+
+    handled = await bridge._handle_command("42", "/bees")
+    assert handled is True
+    assert called == ["42"]
+
+
+@pytest.mark.asyncio
+async def test_bee_command_dispatches_activation(monkeypatch: pytest.MonkeyPatch) -> None:
+    bridge = TelegramBridge(_DummyManager())
+    called: list[tuple[str, str]] = []
+
+    async def _fake_activate(chat_id: str, queen_id: str) -> None:
+        called.append((chat_id, queen_id))
+
+    monkeypatch.setattr(bridge, "_is_known_queen_id", lambda qid: qid == "queen_growth")
+    monkeypatch.setattr(bridge, "_activate_queen_for_chat", _fake_activate)
+
+    handled = await bridge._handle_command("42", "/bee queen_growth")
+    assert handled is True
+    assert called == [("42", "queen_growth")]
+
+
+@pytest.mark.asyncio
+async def test_bee_command_without_arg_returns_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    bridge = TelegramBridge(_DummyManager())
+    sent: list[str] = []
+
+    async def _fake_send_text(
+        chat_id: str,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        sent.append(text)
+
+    monkeypatch.setattr(bridge, "_send_text", _fake_send_text)
+
+    handled = await bridge._handle_command("42", "/bee")
+    assert handled is True
+    assert sent == ["Usage: /bee <queen_id>"]
 
 
 @pytest.mark.asyncio
@@ -157,6 +360,21 @@ async def test_credentials_commands_dispatch_readiness(monkeypatch: pytest.Monke
     assert handled_full is True
     assert handled_menu is True
     assert called == ["42", "42", "42"]
+
+
+@pytest.mark.asyncio
+async def test_intake_template_command_dispatches(monkeypatch: pytest.MonkeyPatch) -> None:
+    bridge = TelegramBridge(_DummyManager())
+    called: list[str] = []
+
+    async def _fake_send(chat_id: str) -> None:
+        called.append(chat_id)
+
+    monkeypatch.setattr(bridge, "_send_intake_template", _fake_send)
+
+    handled = await bridge._handle_command("42", "/intake_template")
+    assert handled is True
+    assert called == ["42"]
 
 
 @pytest.mark.asyncio
@@ -720,6 +938,170 @@ async def test_question_answer_callback_clears_keyboard_and_echoes_selection(
     assert "Создать PR" in injected[0][1]
 
 
+@pytest.mark.asyncio
+async def test_inject_user_input_publishes_client_input_received_for_web_mirror() -> None:
+    class _RecordingEventBus:
+        def __init__(self) -> None:
+            self.published: list[Any] = []
+
+        def subscribe(self, event_types: list[EventType], handler: Any) -> str:
+            return f"sub-{len(event_types)}"
+
+        async def publish(self, event: Any) -> None:
+            self.published.append(event)
+
+    class _Session:
+        def __init__(self) -> None:
+            self.id = "session-1"
+            self.event_bus = _RecordingEventBus()
+            self.project_id = "default"
+            self.queen_name = "queen_technology"
+            self.graph_runtime = None
+            self.queen_task = None
+
+    class _Manager:
+        def __init__(self, session: _Session) -> None:
+            self._session = session
+
+        def default_project_id(self) -> str:
+            return "default"
+
+        def list_projects(self) -> list[dict[str, str]]:
+            return [{"id": "default", "name": "Default"}]
+
+        def get_session(self, session_id: str) -> Any | None:
+            if session_id == self._session.id:
+                return self._session
+            return None
+
+    class _Node:
+        def __init__(self) -> None:
+            self.injected: list[tuple[str, bool]] = []
+
+        async def inject_event(self, text: str, *, is_client_input: bool = False) -> None:
+            self.injected.append((text, is_client_input))
+
+    session = _Session()
+    manager = _Manager(session)
+    bridge = TelegramBridge(manager)
+    bridge._bind_chat("42", "session-1")
+
+    node = _Node()
+
+    async def _fake_await_queen_node(*args: Any, **kwargs: Any) -> Any:
+        return node
+
+    bridge._await_queen_node = _fake_await_queen_node  # type: ignore[method-assign]
+
+    await bridge._inject_user_input("42", "ping from telegram")
+
+    assert node.injected == [("ping from telegram", True)]
+    assert len(session.event_bus.published) == 1
+    evt = session.event_bus.published[0]
+    assert evt.type == EventType.CLIENT_INPUT_RECEIVED
+    assert evt.data.get("content") == "ping from telegram"
+    assert evt.data.get("source") == "telegram"
+    assert evt.data.get("chat_id") == "42"
+
+
+@pytest.mark.asyncio
+async def test_send_choice_callback_handles_no_worker_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RecordingEventBus:
+        def subscribe(self, event_types: list[EventType], handler: Any) -> str:
+            return f"sub-{len(event_types)}"
+
+        async def publish(self, event: Any) -> None:
+            return None
+
+    class _Session:
+        def __init__(self) -> None:
+            self.id = "session-noworker"
+            self.event_bus = _RecordingEventBus()
+            self.project_id = "default"
+            self.queen_name = "queen_technology"
+            self.graph_runtime = None
+            self.queen_task = None
+
+    class _Manager:
+        def __init__(self, session: _Session) -> None:
+            self._session = session
+            self.revive_calls = 0
+
+        def default_project_id(self) -> str:
+            return "default"
+
+        def list_projects(self) -> list[dict[str, str]]:
+            return [{"id": "default", "name": "Default"}]
+
+        def get_project(self, project_id: str) -> dict[str, str] | None:
+            if project_id == "default":
+                return {"id": "default", "name": "Default"}
+            return None
+
+        def get_session(self, session_id: str) -> Any | None:
+            if session_id == self._session.id:
+                return self._session
+            return None
+
+        async def revive_queen(self, session: Any) -> None:
+            self.revive_calls += 1
+
+    session = _Session()
+    manager = _Manager(session)
+    bridge = TelegramBridge(manager)
+    sent: list[str] = []
+    api_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def _fake_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        api_calls.append((method, payload))
+        return {"ok": True, "method": method, "payload": payload}
+
+    async def _fake_send_text(
+        chat_id: str,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        sent.append(text)
+
+    async def _fake_await_queen_node(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(bridge, "_api", _fake_api)
+    monkeypatch.setattr(bridge, "_send_text", _fake_send_text)
+    bridge._await_queen_node = _fake_await_queen_node  # type: ignore[method-assign]
+
+    bridge._bind_chat("42", "session-noworker")
+    bridge._pending_choice["42"] = {
+        "session_id": "session-noworker",
+        "options": ["Approve"],
+        "prompt": "Proceed?",
+        "expires_at": 9999999999.0,
+    }
+
+    callback_data = bridge._register_callback(
+        chat_id="42",
+        action="send_choice",
+        payload={"text": "Approve"},
+    )
+    await bridge._handle_callback_query(
+        {
+            "id": "cb-choice-no-worker",
+            "from": {"is_bot": False},
+            "message": {"chat": {"id": "42"}, "message_id": 606},
+            "data": callback_data,
+        }
+    )
+
+    assert "✅ Selected: Approve" in sent
+    assert "Queen is not ready yet. Try again in a moment." in sent
+    assert manager.revive_calls == 1
+    assert "42" not in bridge._pending_choice
+    assert any(call[0] == "editMessageReplyMarkup" for call in api_calls)
+
+
 def test_inline_markup_single_use_group_invalidates_sibling_callbacks() -> None:
     bridge = TelegramBridge(_DummyManager())
     markup = bridge._make_inline_markup(
@@ -874,6 +1256,114 @@ async def test_autodigest_proactive_skips_when_no_risky_outcomes(
 
 
 @pytest.mark.asyncio
+async def test_autodigest_includes_release_matrix_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate_path = tmp_path / "gate-latest.json"
+    gate_path.write_text(
+        (
+            "{"
+            '"generated_at":"2026-04-23T14:00:00",'
+            '"release_matrix":{"status":"fail","must_passed":5,"must_total":6}'
+            "}"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH", str(gate_path))
+    bridge = TelegramBridge(_DummyManager())
+
+    class _Resp:
+        status = 200
+
+        async def text(self) -> str:
+            return (
+                '{"status":"ok","summary":{"projects_total":1,"ok":1,"failed":0,'
+                '"outcomes":{"completed":1}},'
+                '"projects":[{"project_id":"app-a","outcome":"completed","terminal_status":"completed","pr_ready":true}],'
+                '"highlights":{"terminal_ready_projects":["app-a"],"blocked_projects":[],"manual_deferred_projects":[]}}'
+            )
+
+    class _Ctx:
+        async def __aenter__(self) -> _Resp:
+            return _Resp()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class _Client:
+        def post(self, url: str, json: dict[str, Any], timeout: int) -> _Ctx:
+            return _Ctx()
+
+    sent: list[str] = []
+
+    async def _fake_send_text(chat_id: str, text: str, *, reply_markup=None) -> None:
+        sent.append(text)
+
+    bridge._client = _Client()  # type: ignore[assignment]
+    monkeypatch.setattr(bridge, "_send_text", _fake_send_text)
+
+    ok = await bridge._send_autonomous_digest("42", proactive=False)
+    assert ok is True
+    assert len(sent) == 1
+    body = sent[0]
+    assert "release_matrix: fail (must 5/6)" in body
+    assert "release_matrix_at: 2026-04-23T14:00:00" in body
+
+
+@pytest.mark.asyncio
+async def test_autodigest_proactive_sends_when_matrix_is_risky(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate_path = tmp_path / "gate-latest.json"
+    gate_path.write_text(
+        (
+            "{"
+            '"generated_at":"2026-04-23T14:00:00",'
+            '"release_matrix":{"status":"fail","must_passed":5,"must_total":6}'
+            "}"
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH", str(gate_path))
+    bridge = TelegramBridge(_DummyManager())
+
+    class _Resp:
+        status = 200
+
+        async def text(self) -> str:
+            return (
+                '{"status":"ok","summary":{"projects_total":1,"ok":1,"failed":0,'
+                '"outcomes":{"idle":1}},"projects":[{"project_id":"default","outcome":"idle"}]}'
+            )
+
+    class _Ctx:
+        async def __aenter__(self) -> _Resp:
+            return _Resp()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class _Client:
+        def post(self, url: str, json: dict[str, Any], timeout: int) -> _Ctx:
+            return _Ctx()
+
+    sent: list[str] = []
+
+    async def _fake_send_text(chat_id: str, text: str, *, reply_markup=None) -> None:
+        sent.append(text)
+
+    bridge._client = _Client()  # type: ignore[assignment]
+    monkeypatch.setattr(bridge, "_send_text", _fake_send_text)
+
+    ok = await bridge._send_autonomous_digest("42", proactive=True)
+    assert ok is True
+    assert len(sent) == 1
+    assert "release_matrix: fail (must 5/6)" in sent[0]
+
+
+@pytest.mark.asyncio
 async def test_autodigest_action_oriented_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -926,6 +1416,51 @@ async def test_autodigest_action_oriented_format(
     assert "Next actions:" in body
 
 
+@pytest.mark.asyncio
+async def test_autodigest_includes_telegram_conflict_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    bridge = TelegramBridge(_DummyManager())
+    bridge._poll_conflict_409_count = 5
+    bridge._last_poll_conflict_409_at = 1_700_000_100.0
+    bridge._last_poll_conflict_recover_result = "delete_webhook_ok"
+    now = {"ts": 1_700_000_120.0}
+    monkeypatch.setattr("framework.server.telegram_bridge.time.time", lambda: now["ts"])
+
+    class _Resp:
+        status = 200
+
+        async def text(self) -> str:
+            return (
+                '{"status":"ok","summary":{"projects_total":1,"ok":1,"failed":0,'
+                '"outcomes":{"idle":1}},"projects":[{"project_id":"default","outcome":"idle"}]}'
+            )
+
+    class _Ctx:
+        async def __aenter__(self) -> _Resp:
+            return _Resp()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class _Client:
+        def post(self, url: str, json: dict[str, Any], timeout: int) -> _Ctx:
+            return _Ctx()
+
+    sent: list[str] = []
+
+    async def _fake_send_text(chat_id: str, text: str, *, reply_markup=None) -> None:
+        sent.append(text)
+
+    bridge._client = _Client()  # type: ignore[assignment]
+    monkeypatch.setattr(bridge, "_send_text", _fake_send_text)
+
+    ok = await bridge._send_autonomous_digest("42", proactive=False)
+    assert ok is True
+    assert len(sent) == 1
+    body = sent[0]
+    assert "telegram_conflicts_409: count=5" in body
+    assert "warning=telegram 409 conflicts rising" in body
+
+
 def test_single_consumer_poll_lock_prevents_second_owner(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -957,6 +1492,104 @@ def test_format_exception_details_includes_type_and_message() -> None:
     bridge = TelegramBridge(_DummyManager())
     detail = bridge._format_exception_details(RuntimeError("poll failed"))
     assert detail == "RuntimeError: poll failed"
+
+
+def test_status_includes_poll_conflict_telemetry_fields() -> None:
+    bridge = TelegramBridge(_DummyManager())
+    status = bridge.status()
+    assert status["poll_conflict_409_count"] == 0
+    assert status["last_poll_conflict_409_at"] is None
+    assert status["last_poll_conflict_recover_at"] is None
+    assert status["last_poll_conflict_recover_result"] is None
+    assert isinstance(status["auto_clear_webhook_on_409"], bool)
+    assert isinstance(status["conflict_recover_cooldown_seconds"], int)
+    assert isinstance(status["conflict_warn_threshold"], int)
+    assert isinstance(status["conflict_warn_window_seconds"], int)
+    assert status["poll_conflict_warning_active"] is False
+    assert status["last_poll_conflict_age_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_poll_conflict_recovery_delete_webhook_with_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    bridge = TelegramBridge(_DummyManager())
+    calls: list[tuple[str, dict[str, Any]]] = []
+    now = {"ts": 1_700_000_000.0}
+
+    async def _fake_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        calls.append((method, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge, "_api", _fake_api)
+    monkeypatch.setattr("framework.server.telegram_bridge.time.time", lambda: now["ts"])
+
+    detail = "RuntimeError: Telegram API getUpdates failed: {'ok': False, 'error_code': 409}"
+    await bridge._maybe_recover_poll_conflict(detail)
+    assert bridge._poll_conflict_409_count == 1
+    assert bridge._last_poll_conflict_recover_result == "delete_webhook_ok"
+    assert calls == [("deleteWebhook", {"drop_pending_updates": False})]
+
+    await bridge._maybe_recover_poll_conflict(detail)
+    assert bridge._poll_conflict_409_count == 2
+    assert bridge._last_poll_conflict_recover_result == "cooldown"
+    assert len(calls) == 1
+
+    now["ts"] += float(bridge._poll_conflict_recover_cooldown_seconds + 1)
+    await bridge._maybe_recover_poll_conflict(detail)
+    assert bridge._poll_conflict_409_count == 3
+    assert bridge._last_poll_conflict_recover_result == "delete_webhook_ok"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_poll_conflict_recovery_respects_disable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("HIVE_TELEGRAM_AUTO_CLEAR_WEBHOOK_ON_409", "0")
+    bridge = TelegramBridge(_DummyManager())
+
+    async def _fake_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        raise AssertionError("deleteWebhook should not be called when recovery is disabled")
+
+    monkeypatch.setattr(bridge, "_api", _fake_api)
+    detail = "RuntimeError: Telegram API getUpdates failed: {'ok': False, 'error_code': 409}"
+    await bridge._maybe_recover_poll_conflict(detail)
+    assert bridge._poll_conflict_409_count == 1
+    assert bridge._last_poll_conflict_recover_result == "disabled_by_env"
+
+
+@pytest.mark.asyncio
+async def test_operator_recover_resets_telemetry_without_client() -> None:
+    bridge = TelegramBridge(_DummyManager())
+    bridge._poll_conflict_409_count = 5
+    bridge._last_poll_conflict_409_at = 1700000000.0
+    bridge._last_poll_conflict_recover_at = 1700000001.0
+    bridge._last_poll_conflict_recover_result = "delete_webhook_ok"
+    bridge._last_poll_error = "RuntimeError: Telegram API getUpdates failed: {'error_code': 409}"
+
+    report = await bridge.operator_recover(
+        force_delete_webhook=False,
+        reset_conflict_telemetry=True,
+        clear_last_error=True,
+    )
+    assert report["ok"] is True
+    assert "reset_conflict_telemetry" in report["actions"]
+    assert bridge._poll_conflict_409_count == 0
+    assert bridge._last_poll_conflict_409_at is None
+    assert bridge._last_poll_conflict_recover_at is None
+    assert bridge._last_poll_conflict_recover_result is None
+    assert bridge._last_poll_error is None
+
+
+@pytest.mark.asyncio
+async def test_operator_recover_reports_error_when_delete_webhook_requested_without_client() -> None:
+    bridge = TelegramBridge(_DummyManager())
+    report = await bridge.operator_recover(
+        force_delete_webhook=True,
+        reset_conflict_telemetry=False,
+        clear_last_error=False,
+    )
+    assert report["ok"] is False
+    assert report["error"] == "bridge_client_not_initialized"
 
 
 @pytest.mark.asyncio
@@ -1088,4 +1721,197 @@ async def test_ensure_bound_session_subscribes_immediately_for_mirroring() -> No
         (EventType.LLM_TURN_COMPLETE,),
         (EventType.CLIENT_INPUT_REQUESTED,),
         (EventType.CLIENT_INPUT_RECEIVED,),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_bound_session_creates_new_session_with_selected_bee_for_first_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RecordingEventBus:
+        def subscribe(self, event_types: list[EventType], handler: Any) -> str:
+            return f"sub-{len(event_types)}"
+
+    class _Session:
+        def __init__(self, sid: str) -> None:
+            self.id = sid
+            self.event_bus = _RecordingEventBus()
+            self.project_id = "default"
+            self.queen_name = None
+
+    class _Manager:
+        def __init__(self) -> None:
+            self._sessions: dict[str, Any] = {}
+
+        def default_project_id(self) -> str:
+            return "default"
+
+        def list_projects(self) -> list[dict[str, str]]:
+            return [{"id": "default", "name": "Default"}]
+
+        def get_project(self, project_id: str) -> dict[str, str] | None:
+            if project_id == "default":
+                return {"id": "default", "name": "Default"}
+            return None
+
+        def list_sessions(self, project_id: str | None = None) -> list[Any]:
+            return []
+
+        async def create_session(self, project_id: str | None = None) -> Any:
+            sid = "session-new"
+            session = _Session(sid)
+            session.project_id = project_id or "default"
+            self._sessions[sid] = session
+            return session
+
+        def get_session(self, session_id: str) -> Any | None:
+            return self._sessions.get(session_id)
+
+    manager = _Manager()
+    bridge = TelegramBridge(manager)
+
+    async def _fake_choose(chat_id: str, *, first_user_message: str | None = None) -> str:
+        return "queen_growth"
+
+    monkeypatch.setattr(bridge, "_choose_queen_for_new_binding", _fake_choose)
+
+    sid, session = await bridge._ensure_bound_session("42", first_user_message="need growth plan")
+
+    assert sid == "session-new"
+    assert getattr(session, "queen_name", None) == "queen_growth"
+    assert bridge._chat_session.get("42") == "session-new"
+    assert bridge._selected_queen_id("42") == "queen_growth"
+
+
+@pytest.mark.asyncio
+async def test_ensure_bound_session_resumes_stale_binding_before_creating_new() -> None:
+    class _RecordingEventBus:
+        def subscribe(self, event_types: list[EventType], handler: Any) -> str:
+            return f"sub-{len(event_types)}"
+
+    class _Session:
+        def __init__(self, sid: str) -> None:
+            self.id = sid
+            self.event_bus = _RecordingEventBus()
+            self.project_id = "default"
+            self.queen_name = None
+
+    class _Manager:
+        def __init__(self) -> None:
+            self._sessions: dict[str, Any] = {}
+            self.create_calls: list[dict[str, Any]] = []
+
+        def default_project_id(self) -> str:
+            return "default"
+
+        def list_projects(self) -> list[dict[str, str]]:
+            return [{"id": "default", "name": "Default"}]
+
+        def get_project(self, project_id: str) -> dict[str, str] | None:
+            if project_id == "default":
+                return {"id": "default", "name": "Default"}
+            return None
+
+        def list_sessions(self, project_id: str | None = None) -> list[Any]:
+            return [s for s in self._sessions.values() if project_id in {None, s.project_id}]
+
+        def get_session(self, session_id: str) -> Any | None:
+            return self._sessions.get(session_id)
+
+        async def create_session(
+            self,
+            project_id: str | None = None,
+            queen_resume_from: str | None = None,
+        ) -> Any:
+            self.create_calls.append(
+                {
+                    "project_id": project_id,
+                    "queen_resume_from": queen_resume_from,
+                }
+            )
+            sid = str(queen_resume_from or "session-new")
+            session = _Session(sid)
+            session.project_id = project_id or "default"
+            self._sessions[sid] = session
+            return session
+
+    manager = _Manager()
+    bridge = TelegramBridge(manager)
+    bridge._set_queen_for_chat("42", "queen_growth")
+    bridge._bind_chat("42", "session-stale")
+
+    sid, session = await bridge._ensure_bound_session("42")
+
+    assert sid == "session-stale"
+    assert getattr(session, "queen_name", None) == "queen_growth"
+    assert bridge._chat_session.get("42") == "session-stale"
+    assert manager.create_calls == [
+        {"project_id": None, "queen_resume_from": "session-stale"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_bound_session_falls_back_to_new_when_resume_fails() -> None:
+    class _RecordingEventBus:
+        def subscribe(self, event_types: list[EventType], handler: Any) -> str:
+            return f"sub-{len(event_types)}"
+
+    class _Session:
+        def __init__(self, sid: str) -> None:
+            self.id = sid
+            self.event_bus = _RecordingEventBus()
+            self.project_id = "default"
+            self.queen_name = None
+
+    class _Manager:
+        def __init__(self) -> None:
+            self._sessions: dict[str, Any] = {}
+            self.create_calls: list[dict[str, Any]] = []
+
+        def default_project_id(self) -> str:
+            return "default"
+
+        def list_projects(self) -> list[dict[str, str]]:
+            return [{"id": "default", "name": "Default"}]
+
+        def get_project(self, project_id: str) -> dict[str, str] | None:
+            if project_id == "default":
+                return {"id": "default", "name": "Default"}
+            return None
+
+        def list_sessions(self, project_id: str | None = None) -> list[Any]:
+            return [s for s in self._sessions.values() if project_id in {None, s.project_id}]
+
+        def get_session(self, session_id: str) -> Any | None:
+            return self._sessions.get(session_id)
+
+        async def create_session(
+            self,
+            project_id: str | None = None,
+            queen_resume_from: str | None = None,
+        ) -> Any:
+            self.create_calls.append(
+                {
+                    "project_id": project_id,
+                    "queen_resume_from": queen_resume_from,
+                }
+            )
+            if queen_resume_from:
+                raise RuntimeError("resume failed")
+            session = _Session("session-fresh")
+            session.project_id = project_id or "default"
+            self._sessions[session.id] = session
+            return session
+
+    manager = _Manager()
+    bridge = TelegramBridge(manager)
+    bridge._bind_chat("42", "session-stale")
+
+    sid, _ = await bridge._ensure_bound_session("42")
+
+    assert sid == "session-fresh"
+    assert bridge._chat_session.get("42") == "session-fresh"
+    assert manager.create_calls == [
+        {"project_id": None, "queen_resume_from": "session-stale"},
+        {"project_id": "default", "queen_resume_from": None},
     ]

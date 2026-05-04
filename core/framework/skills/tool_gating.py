@@ -20,9 +20,17 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SKILLS_DIR = Path(__file__).parent / "_default_skills"
+# Bundled skills live in two sibling dirs: ``_default_skills`` (always-on
+# infra) and ``_preset_skills`` (capability packs, off by default but
+# still bundled). Tool-gated pre-activation walks both so ``browser_*``
+# tools still pull in the browser-automation preset even though it isn't
+# default-enabled in the catalog.
+_BUNDLED_DIRS: tuple[Path, ...] = (
+    Path(__file__).parent / "_default_skills",
+    Path(__file__).parent / "_preset_skills",
+)
 
-# (tool-name prefix, default skill directory name, display name)
+# (tool-name prefix, skill directory name, display name)
 _TOOL_GATED_SKILLS: list[tuple[str, str, str]] = [
     ("browser_", "browser-automation", "hive.browser-automation"),
 ]
@@ -31,12 +39,23 @@ _BODY_CACHE: dict[str, str] = {}
 
 
 def _load_body(dir_name: str) -> str:
-    """Load the markdown body of a framework default skill, cached."""
+    """Load the markdown body of a bundled skill, cached. Searches every
+    bundled directory (default + preset) so the mapping table doesn't
+    need to know which dir a skill lives in.
+    """
     if dir_name in _BODY_CACHE:
         return _BODY_CACHE[dir_name]
 
-    path = _DEFAULT_SKILLS_DIR / dir_name / "SKILL.md"
+    path: Path | None = None
+    for parent in _BUNDLED_DIRS:
+        candidate = parent / dir_name / "SKILL.md"
+        if candidate.exists():
+            path = candidate
+            break
     body = ""
+    if path is None:
+        _BODY_CACHE[dir_name] = body
+        return body
     try:
         raw = path.read_text(encoding="utf-8")
         # Strip YAML frontmatter (between the first two '---' fences)

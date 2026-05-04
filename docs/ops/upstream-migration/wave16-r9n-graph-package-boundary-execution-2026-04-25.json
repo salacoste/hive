@@ -1,0 +1,50 @@
+{
+  "generated_at_utc": "2026-04-25T13:17:38Z",
+  "wave": "Wave16-R9N",
+  "title": "Graph package boundary lane execution",
+  "scope": [
+    "core/framework/graph/__init__.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local `framework.graph` package exports provide a stable import boundary for runtime/server callers",
+      "additive package initializer is low-risk and avoids deep-module import coupling",
+      "targeted graph/runtime/server execution bundles are green"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9N lane (local package boundary retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_loop_node.py -q",
+        "result": "pass",
+        "summary": "65 passed, 4 skipped"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_runtime.py -q",
+        "result": "pass",
+        "summary": "15 passed, 2 skipped"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'execution or queen' -q",
+        "result": "pass",
+        "summary": "34 passed, 159 deselected"
+      },
+      {
+        "command": "uv run --package framework python - <<'PY' ... import framework.graph export check ... PY",
+        "result": "pass",
+        "summary": "graph_exports_ok=8, __all__ size=30"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9N lane closed with explicit keep-local decision",
+      "next residual lane: runtime package boundary (`core/framework/runtime/__init__.py`)"
+    ]
+  }
+}

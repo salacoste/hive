@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T10:26:01Z",
+  "wave": "Wave16-R8E",
+  "title": "Routes messages AppKey contract micro-lane execution",
+  "scope": [
+    "core/framework/server/routes_messages.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local route uses typed APP_KEY_MANAGER lookup instead of raw string key",
+      "this keeps AppKey hardening consistent with routes_config and loader/cli",
+      "no additional upstream behavior in this file beyond key-access style"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; local AppKey-backed implementation retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"message or classify\" -q",
+        "result": "pass",
+        "summary": "4 passed, 189 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      },
+      {
+        "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+        "result": "pass",
+        "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R8E lane closed with keep-local AppKey contract",
+      "next candidate lane: core/framework/loader/cli.py (same AppKey migration family)"
+    ]
+  }
+}

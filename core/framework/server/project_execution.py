@@ -17,7 +17,28 @@ DEFAULT_EXECUTION_TEMPLATE: dict[str, Any] = {
         "max_retries_per_stage": 1,
         "escalate_on": ["review", "validate"],
     },
+    "run_guardrails": {
+        "max_run_seconds": 1800,
+        "max_tool_calls_execution_stage": 150,
+        "max_loop_ticks_per_run": 24,
+        "stop_action": "failed",
+        "fail_on_unknown_action": True,
+        "container_only": True,
+    },
 }
+
+
+def _coerce_bool(value: Any, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{field_name} must be boolean")
 
 
 def _normalize_stage(item: object, *, idx: int) -> dict[str, str]:
@@ -89,6 +110,73 @@ def normalize_execution_template(
                         str(stage).strip().lower() for stage in raw_escalate if str(stage).strip()
                     ]
             out["retry_policy"] = rp
+
+    if "run_guardrails" in value:
+        raw_guardrails = value.get("run_guardrails")
+        if raw_guardrails is None:
+            if allow_null_fields:
+                out["run_guardrails"] = None
+            else:
+                raise ValueError("run_guardrails cannot be null")
+        else:
+            if not isinstance(raw_guardrails, dict):
+                raise ValueError("run_guardrails must be an object")
+            rg: dict[str, Any] = {}
+            if "max_run_seconds" in raw_guardrails:
+                rv = raw_guardrails.get("max_run_seconds")
+                if rv is None:
+                    rg["max_run_seconds"] = None
+                else:
+                    parsed = int(rv)
+                    if parsed < 60:
+                        raise ValueError("run_guardrails.max_run_seconds must be >= 60")
+                    rg["max_run_seconds"] = parsed
+            if "max_tool_calls_execution_stage" in raw_guardrails:
+                rv = raw_guardrails.get("max_tool_calls_execution_stage")
+                if rv is None:
+                    rg["max_tool_calls_execution_stage"] = None
+                else:
+                    parsed = int(rv)
+                    if parsed < 1:
+                        raise ValueError(
+                            "run_guardrails.max_tool_calls_execution_stage must be >= 1"
+                        )
+                    rg["max_tool_calls_execution_stage"] = parsed
+            if "max_loop_ticks_per_run" in raw_guardrails:
+                rv = raw_guardrails.get("max_loop_ticks_per_run")
+                if rv is None:
+                    rg["max_loop_ticks_per_run"] = None
+                else:
+                    parsed = int(rv)
+                    if parsed < 1:
+                        raise ValueError("run_guardrails.max_loop_ticks_per_run must be >= 1")
+                    rg["max_loop_ticks_per_run"] = parsed
+            if "stop_action" in raw_guardrails:
+                rv = raw_guardrails.get("stop_action")
+                if rv is None:
+                    rg["stop_action"] = None
+                else:
+                    text = str(rv).strip().lower()
+                    if text not in {"failed", "escalated"}:
+                        raise ValueError("run_guardrails.stop_action must be one of: failed, escalated")
+                    rg["stop_action"] = text
+            if "fail_on_unknown_action" in raw_guardrails:
+                rv = raw_guardrails.get("fail_on_unknown_action")
+                if rv is None:
+                    rg["fail_on_unknown_action"] = None
+                else:
+                    rg["fail_on_unknown_action"] = _coerce_bool(
+                        rv, field_name="run_guardrails.fail_on_unknown_action"
+                    )
+            if "container_only" in raw_guardrails:
+                rv = raw_guardrails.get("container_only")
+                if rv is None:
+                    rg["container_only"] = None
+                else:
+                    rg["container_only"] = _coerce_bool(
+                        rv, field_name="run_guardrails.container_only"
+                    )
+            out["run_guardrails"] = rg
 
     if "github" in value:
         raw_github = value.get("github")

@@ -1,0 +1,23 @@
+{
+  "generated_at_utc": "2026-04-27T10:07:13Z",
+  "wave": "Wave16-R12B",
+  "title": "Autonomous policy/review continuity expansion lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify policy and review-feedback continuity expansion for Wave16-R12",
+    "ensure report/read-model behavior remains stable across no-checks/manual-pending/deferred/reject branches"
+  ],
+  "targeted_tests": [
+    "pipeline_evaluate_github_includes_pr_review_feedback_in_report",
+    "pipeline_evaluate_github_can_post_review_summary_comment",
+    "pipeline_auto_next_no_checks_manual_pending_policy",
+    "pipeline_auto_next_deferred_without_token_in_manual_mode",
+    "pipeline_auto_next_rejects_execution_stage",
+    "pipeline_evaluate_endpoint_accepts_status_field",
+    "pipeline_loop_tick_dispatches_next_when_idle",
+    "pipeline_report_endpoint"
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "generated_at_utc": "2026-04-25T13:05:57Z",
+  "wave": "Wave16-R9L",
+  "title": "Queen memory v2 behavior lane precheck",
+  "scope": [
+    "core/framework/agents/queen/queen_memory_v2.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/agents/queen/queen_memory_v2.py",
+      "add": 16,
+      "del": 4,
+      "total": 20
+    }
+  },
+  "delta_summary": [
+    "keeps colony memory namespace under `colony_memory` with session-id normalization to safe slugs",
+    "retains backward-compatible `init_memory_dir(..., migrate_legacy=...)` signature expected by orchestrator/session-manager call sites"
+  ],
+  "risk_signals": [
+    {
+      "type": "memory-path-compat",
+      "evidence": "local runtime and tests expect `colony_memory` layout and normalized session ids",
+      "impact": "upstream replay to `colonies/<raw_id>` can break recall subscription and cross-session path compatibility"
+    },
+    {
+      "type": "api-signature-compat",
+      "evidence": "server call sites pass `migrate_legacy=True` during colony memory subscription",
+      "impact": "dropping compatibility kwarg may raise TypeError on older caller paths"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_queen_memory.py -q",
+    "uv run --package framework pytest core/tests/test_create_colony_tool.py core/tests/test_run_parallel_workers_tool.py -q",
+    "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+    "uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q"
+  ],
+  "decision_gate": "prefer keep_local if compatibility deltas are intentional and targeted queen/session bundles are green"
+}

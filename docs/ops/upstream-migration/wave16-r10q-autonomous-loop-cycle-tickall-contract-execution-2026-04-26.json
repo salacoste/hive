@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-26T14:08:14Z",
+  "wave": "Wave16-R10Q",
+  "title": "Autonomous loop run-cycle + tick-all contract lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "loop control endpoints `tick_all` and `run_cycle` remain stable across validation/report summaries",
+      "project-id and max-steps validation semantics remain intact",
+      "no regression observed in loop control surface contracts"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle or pipeline_loop_tick_all' -q",
+        "result": "pass",
+        "summary": "7 passed, 186 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10Q lane closed as keep-local with green loop run-cycle/tick-all contracts",
+      "next lane targets tick-resolution transitions from event logs and terminal worker outcomes"
+    ]
+  }
+}

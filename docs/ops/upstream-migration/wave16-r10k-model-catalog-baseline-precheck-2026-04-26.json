@@ -1,0 +1,26 @@
+{
+  "generated_at_utc": "2026-04-26T13:20:26Z",
+  "wave": "Wave16-R10K",
+  "title": "Model catalog baseline drift lane precheck",
+  "scope": [
+    "core/framework/llm/model_catalog.json",
+    "core/tests/test_model_catalog.py"
+  ],
+  "delta_summary": [
+    "catalog expectations in tests diverge from current local provider/model list and token limits",
+    "routes_config lane is unaffected functionally but references model catalog metadata",
+    "requires explicit baseline decision: align tests to catalog or reconcile catalog to expected frontier set"
+  ],
+  "observed_failures": [
+    "cerebras model ordering/content drift",
+    "minimax context/token limit expectation drift",
+    "openrouter frontier set ordering/content drift",
+    "find_model_any_provider context limit mismatch",
+    "minimax preset max_tokens mismatch"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_model_catalog.py -q",
+    "uv run --package framework pytest core/tests/test_litellm_provider.py -q"
+  ],
+  "decision_gate": "classify authoritative source of truth first (catalog vs tests), then apply bounded reconcile"
+}

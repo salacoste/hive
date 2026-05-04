@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-26T18:45:10Z",
+  "wave": "Wave16-R11D",
+  "title": "Autonomous loop tick-resolution + run-cycle terminal coupling lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify tick-resolution transitions remain stable when coupled with run-cycle terminal/pr-ready aggregation",
+    "verify run-cycle terminal outcome reporting continuity after tick-derived completion/failure edges"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_tick_resolves_execution_completed_from_event_log",
+    "pipeline_loop_tick_resolves_execution_failed_from_event_log",
+    "pipeline_loop_tick_resolves_when_terminal_worker_completed_without_execution_event",
+    "pipeline_loop_tick_resolves_from_worker_completed_when_session_not_loaded",
+    "pipeline_loop_run_cycle_reports_terminal_and_pr_ready",
+    "pipeline_loop_run_cycle_summary_outcomes"
+  ]
+}

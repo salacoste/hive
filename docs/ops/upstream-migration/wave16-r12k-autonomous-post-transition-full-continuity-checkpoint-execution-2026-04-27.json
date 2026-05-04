@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T12:31:06Z",
+  "wave": "Wave16-R12K",
+  "title": "Autonomous post-transition full continuity checkpoint lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "post-transition full continuity remains stable across run-cycle/tick/evaluate/github-evaluate/auto-next/report",
+      "policy/report stability remains stable during full checkpoint pass",
+      "no regressions observed in targeted Wave16-R12K bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_report_endpoint or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "11 passed, 182 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R12K lane closed as keep-local with green post-transition full continuity checkpoint bundle",
+      "next lane continues post-transition full continuity expansion"
+    ]
+  }
+}

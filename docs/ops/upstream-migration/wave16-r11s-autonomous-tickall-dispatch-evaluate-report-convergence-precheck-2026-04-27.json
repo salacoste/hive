@@ -1,0 +1,23 @@
+{
+  "generated_at_utc": "2026-04-27T01:07:31Z",
+  "wave": "Wave16-R11S",
+  "title": "Autonomous tick-all/dispatch + evaluate/report convergence lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify tick-all and dispatch transitions remain consistent when converged with evaluate/report updates",
+    "verify report/read-model continuity across idle/active/reject dispatch edges combined with evaluate outcomes"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_tick_all_endpoint",
+    "pipeline_loop_tick_all_rejects_non_array_project_ids",
+    "pipeline_loop_tick_dispatches_next_when_idle",
+    "pipeline_dispatch_next_rejects_when_active_run_exists",
+    "pipeline_evaluate_endpoint_uses_checks_and_updates_report",
+    "pipeline_evaluate_github_endpoint",
+    "pipeline_auto_next_endpoint",
+    "pipeline_report_endpoint"
+  ]
+}

@@ -22,10 +22,10 @@ async def handle_logs(request: web.Request) -> web.Response:
     if err:
         return err
 
-    if not session.colony_runtime:
+    runtime = getattr(session, "colony_runtime", None) or getattr(session, "graph_runtime", None)
+    if not runtime:
         return web.json_response({"error": "No worker loaded in this session"}, status=503)
-
-        log_store = getattr(session.colony_runtime, "_runtime_log_store", None)
+    log_store = getattr(runtime, "_runtime_log_store", None)
     if log_store is None:
         return web.json_response({"error": "Logging not enabled for this agent"}, status=404)
 
@@ -77,10 +77,10 @@ async def handle_node_logs(request: web.Request) -> web.Response:
 
     node_id = request.match_info["node_id"]
 
-    if not session.colony_runtime:
+    runtime = getattr(session, "colony_runtime", None) or getattr(session, "graph_runtime", None)
+    if not runtime:
         return web.json_response({"error": "No worker loaded in this session"}, status=503)
-
-        log_store = getattr(session.colony_runtime, "_runtime_log_store", None)
+    log_store = getattr(runtime, "_runtime_log_store", None)
     if log_store is None:
         return web.json_response({"error": "Logging not enabled"}, status=404)
 
@@ -108,6 +108,12 @@ def register_routes(app: web.Application) -> None:
     """Register log routes."""
     # Session-primary routes
     app.router.add_get("/api/sessions/{session_id}/logs", handle_logs)
+    # Backward-compatible graph-scoped node logs (used by existing Web UI/tests)
+    app.router.add_get(
+        "/api/sessions/{session_id}/graphs/{graph_id}/nodes/{node_id}/logs",
+        handle_node_logs,
+    )
+    # Colony-scoped node logs (newer runtime topology)
     app.router.add_get(
         "/api/sessions/{session_id}/colonies/{colony_id}/nodes/{node_id}/logs",
         handle_node_logs,

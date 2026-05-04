@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T01:37:42Z",
+  "wave": "Wave16-R11X",
+  "title": "Autonomous run-cycle + full tick-dispatch/evaluate/auto-next/report super-convergence lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "run-cycle and full tick/dispatch/evaluate/auto-next/report super-convergence remains stable",
+      "report/read-model continuity remains stable across completion/failure, policy branches, review feedback, and run-cycle terminal states",
+      "no regressions observed in targeted super-convergence bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_report_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_loop_tick_all_endpoint or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "14 passed, 179 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11X lane closed as keep-local with green super-convergence bundle",
+      "next lane continues policy/report/tick+run-cycle closure sequencing"
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "generated_at_utc": "2026-04-26T02:19:37Z",
+  "wave": "Wave16-R10D",
+  "title": "Routes logs runtime-shape compatibility lane precheck",
+  "scope": [
+    "core/framework/server/routes_logs.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/server/routes_logs.py",
+      "add": 12,
+      "del": 6,
+      "total": 18
+    }
+  },
+  "delta_summary": [
+    "logs routes now resolve runtime from colony_runtime or graph_runtime",
+    "fixes indentation path so _runtime_log_store lookup always executes when runtime exists",
+    "adds backward-compatible graph-scoped node logs route in addition to colony-scoped route"
+  ],
+  "risk_signals": [
+    {
+      "type": "api-contract",
+      "evidence": "new route alias /graphs/{graph_id}/nodes/{node_id}/logs retained for UI/tests",
+      "impact": "route registration drift may break node-log retrieval"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'logs or node_logs' -q"
+  ],
+  "decision_gate": "keep_local acceptable if logs/node_logs API contracts remain green"
+}

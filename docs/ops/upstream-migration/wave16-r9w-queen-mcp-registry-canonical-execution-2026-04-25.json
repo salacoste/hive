@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-25T20:07:15Z",
+  "wave": "Wave16-R9W",
+  "title": "Queen MCP registry canonical include lane execution",
+  "scope": [
+    "core/framework/agents/queen/mcp_registry.json"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "queen include list is aligned to canonical MCP registry server name `hive-tools`",
+      "legacy `hive_tools` include key is intentionally retired in favor of canonical naming",
+      "targeted queen orchestration/API bundles are green"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9W lane (canonical queen include retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'queen' -q",
+        "result": "pass",
+        "summary": "9 passed, 184 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9W lane closed with explicit keep-local decision",
+      "next lane: runner package export boundary (`core/framework/runner/__init__.py`)"
+    ]
+  }
+}

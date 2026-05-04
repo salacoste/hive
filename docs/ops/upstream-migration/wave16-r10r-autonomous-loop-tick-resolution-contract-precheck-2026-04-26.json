@@ -1,0 +1,19 @@
+{
+  "generated_at_utc": "2026-04-26T14:08:14Z",
+  "wave": "Wave16-R10R",
+  "title": "Autonomous loop tick-resolution transition contract lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py",
+    "core/framework/server/session_manager.py"
+  ],
+  "delta_summary": [
+    "R10Q closed loop control-surface contracts (`run_cycle`, `tick_all`)",
+    "next bounded step validates tick-resolution transitions driven by event log/worker completion/failure signals",
+    "lane remains non-destructive and state-transition contract focused"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_ignores_queen_active_stream_when_worker_completed or pipeline_loop_tick_resolves_when_terminal_worker_completed_without_execution_event or pipeline_loop_tick_resolves_from_worker_completed_when_session_not_loaded or pipeline_loop_tick_resolves_execution_failed_from_event_log' -q"
+  ],
+  "decision_gate": "close lane only after tick-resolution transition bundle remains green for completed/failed/terminal-worker execution outcomes"
+}

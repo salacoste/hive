@@ -1,11 +1,24 @@
 # Acceptance Reports Index
 
-Generated: `2026-04-17T14:27:36`
+Generated: `2026-05-03T13:02:42`
 
-Artifacts: **37**
+Artifacts: **50**
 
 | Artifact |
 |---|
+| [acceptance-report-20260503-130242.json](acceptance-report-20260503-130242.json) |
+| [acceptance-report-20260503-125724.json](acceptance-report-20260503-125724.json) |
+| [acceptance-report-20260503-125645.json](acceptance-report-20260503-125645.json) |
+| [acceptance-report-20260423-144004.json](acceptance-report-20260423-144004.json) |
+| [acceptance-report-20260423-143339.json](acceptance-report-20260423-143339.json) |
+| [acceptance-report-20260423-142808.json](acceptance-report-20260423-142808.json) |
+| [acceptance-report-20260423-122437.json](acceptance-report-20260423-122437.json) |
+| [acceptance-report-20260423-122343.json](acceptance-report-20260423-122343.json) |
+| [acceptance-report-20260423-122323.json](acceptance-report-20260423-122323.json) |
+| [acceptance-report-20260423-122251.json](acceptance-report-20260423-122251.json) |
+| [acceptance-report-20260423-122150.json](acceptance-report-20260423-122150.json) |
+| [acceptance-report-20260423-110309.json](acceptance-report-20260423-110309.json) |
+| [acceptance-report-20260423-110212.json](acceptance-report-20260423-110212.json) |
 | [acceptance-report-20260417-142736.json](acceptance-report-20260417-142736.json) |
 | [acceptance-report-20260417-141851.json](acceptance-report-20260417-141851.json) |
 | [acceptance-report-20260417-141718.json](acceptance-report-20260417-141718.json) |

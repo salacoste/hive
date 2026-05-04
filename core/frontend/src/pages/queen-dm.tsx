@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { Loader2, Users } from "lucide-react";
+import { FolderOpen, Loader2, Minus, Plus, Users } from "lucide-react";
 import ChatPanel, {
   type ChatMessage,
   type ImageContent,
@@ -10,16 +10,46 @@ import { executionApi } from "@/api/execution";
 import { sessionsApi } from "@/api/sessions";
 import { queensApi } from "@/api/queens";
 import { useMultiSSE } from "@/hooks/use-sse";
+import { usePendingQueue } from "@/hooks/use-pending-queue";
 import type { AgentEvent, HistorySession } from "@/api/types";
 import {
-  sseEventToChatMessage,
+  findOptimisticUserMatchIndex,
+  newReplayState,
+  replayEvent,
   replayEventsToMessages,
 } from "@/lib/chat-helpers";
 import { useColony } from "@/context/ColonyContext";
 import { useHeaderActions } from "@/context/HeaderActionsContext";
 import { getQueenForAgent, slugToColonyId } from "@/lib/colony-registry";
+import DataExplorerModal from "@/components/DataExplorerModal";
 
 const makeId = () => Math.random().toString(36).slice(2, 9);
+
+// Remembers the last session the user had open in each queen DM so that
+// navigating away (e.g. to another queen) and back lands on the session
+// they were just in, instead of whichever session the server picks.
+const lastSessionKey = (queenId: string) => `hive:queen:${queenId}:lastSession`;
+const readLastSession = (queenId: string): string | null => {
+  try {
+    return localStorage.getItem(lastSessionKey(queenId));
+  } catch {
+    return null;
+  }
+};
+const writeLastSession = (queenId: string, sessionId: string) => {
+  try {
+    localStorage.setItem(lastSessionKey(queenId), sessionId);
+  } catch {
+    /* storage disabled/full — best-effort */
+  }
+};
+const clearLastSession = (queenId: string) => {
+  try {
+    localStorage.removeItem(lastSessionKey(queenId));
+  } catch {
+    /* ignore */
+  }
+};
 
 export default function QueenDM() {
   const { queenId } = useParams<{ queenId: string }>();
@@ -39,37 +69,60 @@ export default function QueenDM() {
   const [queenReady, setQueenReady] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
-  const [pendingOptions, setPendingOptions] = useState<string[] | null>(null);
   const [pendingQuestions, setPendingQuestions] = useState<
     { id: string; prompt: string; options?: string[] }[] | null
   >(null);
   const [awaitingInput, setAwaitingInput] = useState(false);
-  const [, setActiveToolCalls] = useState<
-    Record<string, { name: string; done: boolean }>
-  >({});
+  // `cached` and `cacheCreated` are subsets of `input` (providers count both
+  // inside prompt_tokens already) — display them, never add them to a total.
+  // `costUsd` is the session-total USD cost when the provider supplies one
+  // (Anthropic, OpenAI, OpenRouter); 0 means unreported, not free.
+  const [tokenUsage, setTokenUsage] = useState({
+    input: 0,
+    output: 0,
+    cached: 0,
+    cacheCreated: 0,
+    costUsd: 0,
+  });
   const [historySessions, setHistorySessions] = useState<HistorySession[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [switchingSessionId, setSwitchingSessionId] = useState<string | null>(
     null,
   );
   const [creatingNewSession, setCreatingNewSession] = useState(false);
-  const [spawning, setSpawning] = useState(false);
   const [initialDraft, setInitialDraft] = useState<string | null>(null);
   const [cloneDialogOpen, setCloneDialogOpen] = useState(false);
   const [cloneColonyName, setCloneColonyName] = useState("");
   const [cloneTask, setCloneTask] = useState("");
+  const [dataExplorerOpen, setDataExplorerOpen] = useState(false);
+  const [dataExplorerSessionId, setDataExplorerSessionId] = useState<
+    string | null
+  >(null);
+  const [cloneOutputs, setCloneOutputs] = useState("");
+  const [cloneDataSources, setCloneDataSources] = useState("");
+  const [cloneSchedule, setCloneSchedule] = useState("");
+  const [cloneConcurrency, setCloneConcurrency] = useState("");
+  const [showCloneOutputs, setShowCloneOutputs] = useState(false);
+  const [showCloneDataSources, setShowCloneDataSources] = useState(false);
+  const [showCloneSchedule, setShowCloneSchedule] = useState(false);
+  const [showCloneConcurrency, setShowCloneConcurrency] = useState(false);
+  // Colony-spawned lock state. Once a colony has been spawned from this DM
+  // and the user clicked into it, /chat is rejected server-side and the
+  // composer is replaced with a "compact + new session" button. Hydrated
+  // from the session detail and updated optimistically on click.
+  const [colonySpawned, setColonySpawned] = useState(false);
+  const [spawnedColonyName, setSpawnedColonyName] = useState<string | null>(
+    null,
+  );
+  const [compactingAndForking, setCompactingAndForking] = useState(false);
 
-  const turnCounterRef = useRef(0);
-  // Maps tool_use_id → the pill message ID and tool name that was created for it.
-  // Survives turn counter resets so deferred completions (e.g. ask_user) can
-  // find and update the correct pill even after llm_turn_complete bumps the counter.
-  const toolUseToPillRef = useRef<
-    Record<string, { msgId: string; name: string }>
-  >({});
-  const queenIterTextRef = useRef<Record<string, Record<number, string>>>({});
+  const replayStateRef = useRef(newReplayState());
+  // Flipped true by the auto-flush path; consumed by the next empty-prompt
+  // client_input_requested so we don't flicker the typing bubble off while
+  // the queen is about to resume on the flushed input.
+  const queenAboutToResumeRef = useRef(false);
   const [queenPhase, setQueenPhase] = useState<
-    "independent" | "working" | "reviewing"
+    "independent" | "incubating" | "working" | "reviewing"
   >("independent");
 
   const resetViewState = useCallback(() => {
@@ -78,17 +131,57 @@ export default function QueenDM() {
     setQueenReady(false);
     setIsTyping(false);
     setIsStreaming(false);
-    setPendingQuestion(null);
-    setPendingOptions(null);
     setPendingQuestions(null);
     setAwaitingInput(false);
-    setActiveToolCalls({});
     setQueenPhase("independent");
+    setTokenUsage({ input: 0, output: 0, cached: 0, cacheCreated: 0, costUsd: 0 });
     setInitialDraft(null);
-    turnCounterRef.current = 0;
-    toolUseToPillRef.current = {};
-    queenIterTextRef.current = {};
+    setColonySpawned(false);
+    setSpawnedColonyName(null);
+    setCompactingAndForking(false);
+    replayStateRef.current = newReplayState();
   }, []);
+
+  const upsertMessage = useCallback(
+    (chatMsg: ChatMessage, options?: { reconcileOptimisticUser?: boolean }) => {
+      setMessages((prev) => {
+        const idx = prev.findIndex((m) => m.id === chatMsg.id);
+        if (idx >= 0) {
+          return prev.map((m, i) =>
+            i === idx ? { ...chatMsg, createdAt: m.createdAt ?? chatMsg.createdAt } : m,
+          );
+        }
+        if (options?.reconcileOptimisticUser && chatMsg.type === "user") {
+          const matchIdx = findOptimisticUserMatchIndex(prev, chatMsg);
+          if (matchIdx !== -1) {
+            return prev.map((m, i) =>
+              i === matchIdx
+                ? {
+                    ...m,
+                    id: chatMsg.id,
+                    executionId: chatMsg.executionId,
+                    queued: undefined,
+                  }
+                : m,
+            );
+          }
+        }
+
+        const ts = chatMsg.createdAt ?? Date.now();
+        let insertIdx = prev.length - 1;
+        while (insertIdx >= 0 && (prev[insertIdx].createdAt ?? 0) > ts) {
+          insertIdx--;
+        }
+        if (insertIdx === -1 || insertIdx === prev.length - 1) {
+          return [...prev, chatMsg];
+        }
+        const next = [...prev];
+        next.splice(insertIdx + 1, 0, chatMsg);
+        return next;
+      });
+    },
+    [],
+  );
 
   const restoreMessages = useCallback(
     async (sid: string, cancelled: () => boolean) => {
@@ -100,7 +193,15 @@ export default function QueenDM() {
         // Use the stateful replay so tool_status pills are synthesized
         // the same way the live SSE handler does — without this the
         // refreshed queen DM shows zero tool activity.
-        const restored = replayEventsToMessages(events, "queen-dm", queenName);
+        const replayState = newReplayState();
+        const restored = replayEventsToMessages(
+          events,
+          "queen-dm",
+          queenName,
+          undefined,
+          replayState,
+        );
+        replayStateRef.current = replayState;
 
         // Show a banner if the server truncated older events.
         const droppedCount = Math.max(0, total - returned);
@@ -140,6 +241,19 @@ export default function QueenDM() {
 
   useEffect(() => {
     if (!queenId) return;
+
+    // If we arrived without an explicit session in the URL and aren't
+    // bootstrapping a new one, redirect to the last session the user had
+    // open for this queen. Session IDs are always of the form
+    // "session_<timestamp>_<hex>", so we gate on that prefix to avoid
+    // redirecting to anything unexpected that landed in storage.
+    if (!selectedSessionParam && newSessionFlag !== "1") {
+      const stored = readLastSession(queenId);
+      if (stored && stored.startsWith("session_")) {
+        setSearchParams({ session: stored }, { replace: true });
+        return;
+      }
+    }
 
     resetViewState();
     setLoading(true);
@@ -256,7 +370,17 @@ export default function QueenDM() {
         await restoreMessages(sid, () => cancelled);
         refresh();
       } catch {
-        // Session creation failed
+        // Session creation/selection failed. If the URL param came from
+        // our own localStorage restore, the stored session is stale (e.g.
+        // deleted on disk) — clear it so the next navigation falls
+        // through to getOrCreate instead of looping on the bad id.
+        if (
+          queenId &&
+          selectedSessionParam &&
+          selectedSessionParam === readLastSession(queenId)
+        ) {
+          clearLastSession(queenId);
+        }
       } finally {
         if (!cancelled) {
           setLoading(false);
@@ -278,6 +402,13 @@ export default function QueenDM() {
     resetViewState,
     setSearchParams,
   ]);
+
+  // Remember the session the user is currently viewing so switching queens
+  // and coming back lands on it instead of whatever the server picks.
+  useEffect(() => {
+    if (!queenId || !sessionId) return;
+    writeLastSession(queenId, sessionId);
+  }, [queenId, sessionId]);
 
   useEffect(() => {
     if (!queenId) return;
@@ -305,48 +436,76 @@ export default function QueenDM() {
     };
   }, [queenId, sessionId]);
 
-  const handleColonySpawn = useCallback(async () => {
-    if (!sessionId || spawning) return;
-    const colony = cloneColonyName.trim();
-    if (!colony) return;
-    setSpawning(true);
+  // Hydrate the colony-spawned lock + queen phase from the session detail
+  // whenever the session ID changes. /sessions/{id} carries both flags
+  // (and the cold-info path returns colony_spawned after a server restart),
+  // so this single fetch covers live, page-reload, and post-restart states.
+  // Without seeding queen_phase here the badge starts at the useState
+  // default ("independent") and only updates when a fresh
+  // QUEEN_PHASE_CHANGED SSE event fires — a reload mid-incubation would
+  // briefly mis-render.
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    sessionsApi
+      .get(sessionId)
+      .then((data) => {
+        if (cancelled) return;
+        const detail = data as {
+          colony_spawned?: boolean;
+          spawned_colony_name?: string | null;
+          queen_phase?: "independent" | "incubating" | "working" | "reviewing";
+        };
+        setColonySpawned(Boolean(detail.colony_spawned));
+        setSpawnedColonyName(detail.spawned_colony_name ?? null);
+        if (
+          detail.queen_phase === "independent" ||
+          detail.queen_phase === "incubating" ||
+          detail.queen_phase === "working" ||
+          detail.queen_phase === "reviewing"
+        ) {
+          setQueenPhase(detail.queen_phase);
+        }
+      })
+      .catch(() => {
+        // Non-fatal — lock + phase simply won't activate until a fresh
+        // SSE event arrives.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
+
+  const handleColonyLinkClick = useCallback(
+    (colonyName: string) => {
+      if (!sessionId || !colonyName) return;
+      // Optimistically lock so the textarea swaps to the button before the
+      // user navigates back. Backend persists the same flag in meta.json so
+      // a refresh would re-hydrate the locked state anyway.
+      setColonySpawned(true);
+      setSpawnedColonyName(colonyName);
+      executionApi.markColonySpawned(sessionId, colonyName).catch(() => {
+        // Revert on failure so the user isn't stranded with no composer.
+        setColonySpawned(false);
+        setSpawnedColonyName(null);
+      });
+    },
+    [sessionId],
+  );
+
+  const handleCompactAndFork = useCallback(async () => {
+    if (!sessionId || compactingAndForking || !queenId) return;
+    setCompactingAndForking(true);
     try {
-      const result = await executionApi.colonySpawn(
-        sessionId,
-        colony,
-        cloneTask.trim() || undefined,
-      );
-      const msg: ChatMessage = {
-        id: makeId(),
-        agent: "System",
-        agentColor: "",
-        content: `Forked to colony "${result.colony_name}"${result.is_new ? " (new)" : ""} — session ${result.queen_session_id}`,
-        timestamp: "",
-        type: "system",
-        thread: "queen-dm",
-        createdAt: Date.now(),
-      };
-      setMessages((prev) => [...prev, msg]);
-      setCloneDialogOpen(false);
-      setCloneColonyName("");
-      setCloneTask("");
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      const msg: ChatMessage = {
-        id: makeId(),
-        agent: "System",
-        agentColor: "",
-        content: `Clone failed: ${errMsg}`,
-        timestamp: "",
-        type: "system",
-        thread: "queen-dm",
-        createdAt: Date.now(),
-      };
-      setMessages((prev) => [...prev, msg]);
-    } finally {
-      setSpawning(false);
+      const result = await executionApi.compactAndFork(sessionId);
+      // Navigate to the freshly-forked session for the same queen. Replacing
+      // the URL keeps the back button on the home/history page rather than
+      // bouncing back to the now-locked DM.
+      setSearchParams({ session: result.new_session_id }, { replace: true });
+    } catch {
+      setCompactingAndForking(false);
     }
-  }, [sessionId, spawning, cloneColonyName, cloneTask]);
+  }, [sessionId, compactingAndForking, queenId, setSearchParams]);
 
   const handleSelectHistoricalSession = useCallback(
     (nextSessionId: string) => {
@@ -379,6 +538,19 @@ export default function QueenDM() {
     setActions(
       <>
         <button
+          onClick={() => {
+            if (!sessionId) return;
+            setDataExplorerSessionId(sessionId);
+            setDataExplorerOpen(true);
+          }}
+          disabled={!sessionId}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0 disabled:opacity-50"
+          title="Open session data explorer"
+        >
+          <FolderOpen className="w-3.5 h-3.5" />
+          Data
+        </button>
+        <button
           onClick={() => setCloneDialogOpen(true)}
           disabled={!sessionId}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0 disabled:opacity-50"
@@ -395,6 +567,10 @@ export default function QueenDM() {
           creatingNew={creatingNewSession}
           onSelect={handleSelectHistoricalSession}
           onCreateNew={handleCreateNewSession}
+          onOpenData={(targetSessionId) => {
+            setDataExplorerSessionId(targetSessionId);
+            setDataExplorerOpen(true);
+          }}
         />
       </>,
     );
@@ -416,19 +592,22 @@ export default function QueenDM() {
     (_agentType: string, event: AgentEvent) => {
       const isQueen = event.stream_id === "queen";
       if (!isQueen) return;
+      const emittedMessages = replayEvent(
+        replayStateRef.current,
+        event,
+        "queen-dm",
+        queenName,
+      );
 
       switch (event.type) {
         case "execution_started":
-          turnCounterRef.current++;
           setIsTyping(true);
           setQueenReady(true);
-          setActiveToolCalls({});
-          toolUseToPillRef.current = {};
-          // Clear queued flag on all user messages now that the queen is processing
-          setMessages((prev) => {
-            if (!prev.some((m) => m.queued)) return prev;
-            return prev.map((m) => (m.queued ? { ...m, queued: undefined } : m));
-          });
+          // Do NOT clear `queued` on user messages here. The pending queue
+          // hook owns that flag — it's cleared on steer / cancel / flush.
+          // If the user has queued messages that haven't been flushed yet,
+          // the queen starting a new turn (e.g. from a steer or from the
+          // flush itself) shouldn't hide the still-queued ones.
           break;
 
         case "execution_completed":
@@ -437,64 +616,39 @@ export default function QueenDM() {
           break;
 
         case "llm_turn_complete":
-          turnCounterRef.current++;
-          setActiveToolCalls({});
+          if (event.data) {
+            const inp = (event.data.input_tokens as number) || 0;
+            const out = (event.data.output_tokens as number) || 0;
+            // cached / cache_creation are subsets of input — accumulate
+            // separately for display, do NOT roll into input/total.
+            const cached = (event.data.cached_tokens as number) || 0;
+            const cacheCreated = (event.data.cache_creation_tokens as number) || 0;
+            const costUsd = (event.data.cost_usd as number) || 0;
+            setTokenUsage((prev) => ({
+              input: prev.input + inp,
+              output: prev.output + out,
+              cached: prev.cached + cached,
+              cacheCreated: prev.cacheCreated + cacheCreated,
+              costUsd: prev.costUsd + costUsd,
+            }));
+          }
+          // Flush one queued message per LLM turn boundary. This is the
+          // real "turn ended" signal in a queen DM — execution_completed
+          // only fires at session shutdown because the event loop parks in
+          // _await_user_input between turns. Mid-tool-call boundaries
+          // count too: sending now lets the queen pick up the message on
+          // her next drain, same as clicking Steer.
+          flushNextPendingRef.current();
           break;
 
         case "client_output_delta":
         case "llm_text_delta": {
-          const chatMsg = sseEventToChatMessage(
-            event,
-            "queen-dm",
-            queenName,
-            turnCounterRef.current,
-          );
-          if (chatMsg) {
-            if (event.execution_id) {
-              const iter = event.data?.iteration ?? 0;
-              const inner = (event.data?.inner_turn as number) ?? 0;
-              const iterKey = `${event.execution_id}:${iter}`;
-              if (!queenIterTextRef.current[iterKey]) {
-                queenIterTextRef.current[iterKey] = {};
-              }
-              const snapshot =
-                (event.data?.snapshot as string) ||
-                (event.data?.content as string) ||
-                "";
-              queenIterTextRef.current[iterKey][inner] = snapshot;
-              const parts = queenIterTextRef.current[iterKey];
-              const sorted = Object.keys(parts)
-                .map(Number)
-                .sort((a, b) => a - b);
-              chatMsg.content = sorted.map((k) => parts[k]).join("\n");
-              chatMsg.id = `queen-stream-${event.execution_id}-${iter}`;
-            }
-            chatMsg.role = "queen";
-
-            setMessages((prev) => {
-              const idx = prev.findIndex((m) => m.id === chatMsg.id);
-              if (idx >= 0) {
-                // Preserve the original createdAt so the displayed timestamp
-                // doesn't tick forward as new deltas stream in.
-                return prev.map((m, i) =>
-                  i === idx
-                    ? { ...chatMsg, createdAt: m.createdAt ?? chatMsg.createdAt }
-                    : m,
-                );
-              }
-              return [...prev, chatMsg];
-            });
-          }
+          for (const msg of emittedMessages) upsertMessage(msg);
           setIsStreaming(true);
           break;
         }
 
         case "client_input_requested": {
-          const prompt = (event.data?.prompt as string) || "";
-          const rawOptions = event.data?.options;
-          const options = Array.isArray(rawOptions)
-            ? (rawOptions as string[])
-            : null;
           const rawQuestions = event.data?.questions;
           const questions = Array.isArray(rawQuestions)
             ? (rawQuestions as {
@@ -503,63 +657,24 @@ export default function QueenDM() {
                 options?: string[];
               }[])
             : null;
+          // An empty-prompt client_input_requested means the queen parked
+          // in auto-wait. If we just auto-flushed a queued message, our
+          // inject will unblock her in a moment — skip flipping isTyping
+          // off so the thinking bubble doesn't flicker.
+          if (queenAboutToResumeRef.current && !questions) {
+            queenAboutToResumeRef.current = false;
+            break;
+          }
           setAwaitingInput(true);
           setIsTyping(false);
           setIsStreaming(false);
-          setPendingQuestion(prompt || null);
-          setPendingOptions(options);
           setPendingQuestions(questions);
           break;
         }
 
         case "client_input_received": {
-          const chatMsg = sseEventToChatMessage(
-            event,
-            "queen-dm",
-            queenName,
-            turnCounterRef.current,
-          );
-          if (chatMsg) {
-            setMessages((prev) => {
-              // Reconcile optimistic user message. A matching echo from
-              // the backend means the queen has now received this
-              // message, so drop the "queued" indicator (it was set when
-              // the user sent while the queen was still busy).
-              if (chatMsg.type === "user" && prev.length > 0) {
-                const incomingClientMessageId = chatMsg.clientMessageId?.trim();
-                if (incomingClientMessageId) {
-                  const byClientIdIdx = prev.findIndex(
-                    (m) =>
-                      m.type === "user" &&
-                      (m.clientMessageId?.trim() || "") === incomingClientMessageId,
-                  );
-                  if (byClientIdIdx !== -1) {
-                    return prev.map((m, i) =>
-                      i === byClientIdIdx
-                        ? {
-                            ...m,
-                            id: chatMsg.id,
-                            queued: undefined,
-                          }
-                        : m,
-                    );
-                  }
-                }
-                const idx = prev.findIndex(
-                  (m) =>
-                    m.type === "user" &&
-                    m.content === chatMsg.content &&
-                    Math.abs((chatMsg.createdAt ?? 0) - (m.createdAt ?? 0)) <=
-                      15000,
-                );
-                if (idx !== -1) {
-                  return prev.map((m, i) =>
-                    i === idx ? { ...m, id: chatMsg.id, queued: undefined } : m,
-                  );
-                }
-              }
-              return [...prev, chatMsg];
-            });
+          for (const msg of emittedMessages) {
+            upsertMessage(msg, { reconcileOptimisticUser: true });
           }
           break;
         }
@@ -568,6 +683,7 @@ export default function QueenDM() {
           const rawPhase = event.data?.phase as string;
           if (
             rawPhase === "independent" ||
+            rawPhase === "incubating" ||
             rawPhase === "working" ||
             rawPhase === "reviewing"
           ) {
@@ -613,133 +729,12 @@ export default function QueenDM() {
         }
 
         case "tool_call_started": {
-          const toolName = (event.data?.tool_name as string) || "unknown";
-          const toolUseId = (event.data?.tool_use_id as string) || "";
-          const sid = event.stream_id;
-          const execId = event.execution_id || "exec";
-          const eventCreatedAt = event.timestamp
-            ? new Date(event.timestamp).getTime()
-            : Date.now();
-
-          // Track which pill message this tool belongs to so deferred
-          // completions (ask_user) can find it after the turn counter changes.
-          const msgId = `tool-pill-${sid}-${execId}-${turnCounterRef.current}`;
-          toolUseToPillRef.current[toolUseId] = { msgId, name: toolName };
-
-          setActiveToolCalls((prev) => {
-            const newActive = {
-              ...prev,
-              [toolUseId]: { name: toolName, done: false },
-            };
-            const tools = Object.entries(newActive).map(([, t]) => ({
-              name: t.name,
-              done: t.done,
-            }));
-            const allDone = tools.length > 0 && tools.every((t) => t.done);
-            const toolMsg: ChatMessage = {
-              id: msgId,
-              agent: queenName,
-              agentColor: "",
-              content: JSON.stringify({ tools, allDone }),
-              timestamp: "",
-              type: "tool_status",
-              role: "queen",
-              thread: "queen-dm",
-              createdAt: eventCreatedAt,
-              nodeId: event.node_id || undefined,
-              executionId: event.execution_id || undefined,
-              streamId: sid || undefined,
-            };
-            setMessages((prevMsgs) => {
-              const idx = prevMsgs.findIndex((m) => m.id === msgId);
-              if (idx >= 0) {
-                return prevMsgs.map((m, i) =>
-                  i === idx ? { ...toolMsg, createdAt: m.createdAt ?? toolMsg.createdAt } : m,
-                );
-              }
-              // Insert in sorted position by createdAt
-              const ts = toolMsg.createdAt ?? Date.now();
-              let insertIdx = prevMsgs.length - 1;
-              while (insertIdx >= 0 && (prevMsgs[insertIdx].createdAt ?? 0) > ts) {
-                insertIdx--;
-              }
-              if (insertIdx === -1 || insertIdx === prevMsgs.length - 1) {
-                return [...prevMsgs, toolMsg];
-              }
-              const next = [...prevMsgs];
-              next.splice(insertIdx + 1, 0, toolMsg);
-              return next;
-            });
-            return newActive;
-          });
+          for (const msg of emittedMessages) upsertMessage(msg);
           break;
         }
 
         case "tool_call_completed": {
-          const toolUseId = (event.data?.tool_use_id as string) || "";
-
-          // Look up the original pill message this tool belongs to.
-          // For deferred completions (ask_user), the turn counter and
-          // activeToolCalls have already been reset by llm_turn_complete,
-          // so we rely on the ref recorded during tool_call_started.
-          const tracked = toolUseToPillRef.current[toolUseId];
-          delete toolUseToPillRef.current[toolUseId];
-
-          // Mark done in activeToolCalls if still present (normal case)
-          setActiveToolCalls((prev) => {
-            if (!prev[toolUseId]) return prev;
-            return {
-              ...prev,
-              [toolUseId]: { ...prev[toolUseId], done: true },
-            };
-          });
-
-          // Determine the correct pill message ID
-          const sid = event.stream_id;
-          const execId = event.execution_id || "exec";
-          const pillMsgId =
-            tracked?.msgId ??
-            `tool-pill-${sid}-${execId}-${turnCounterRef.current}`;
-          const toolName = tracked?.name;
-
-          // Update the pill message content directly
-          setMessages((prevMsgs) => {
-            const idx = prevMsgs.findIndex((m) => m.id === pillMsgId);
-            if (idx < 0) return prevMsgs;
-
-            try {
-              const parsed = JSON.parse(prevMsgs[idx].content);
-              const tools: { name: string; done: boolean }[] =
-                parsed.tools || [];
-
-              if (toolName) {
-                let marked = false;
-                for (let i = 0; i < tools.length; i++) {
-                  if (
-                    tools[i].name === toolName &&
-                    !tools[i].done &&
-                    !marked
-                  ) {
-                    tools[i] = { ...tools[i], done: true };
-                    marked = true;
-                  }
-                }
-              }
-
-              const allDone =
-                tools.length > 0 && tools.every((t) => t.done);
-              return prevMsgs.map((m, i) =>
-                i === idx
-                  ? {
-                      ...m,
-                      content: JSON.stringify({ tools, allDone }),
-                    }
-                  : m,
-              );
-            } catch {
-              return prevMsgs;
-            }
-          });
+          for (const msg of emittedMessages) upsertMessage(msg);
           break;
         }
 
@@ -747,7 +742,7 @@ export default function QueenDM() {
           break;
       }
     },
-    [queenName, refresh],
+    [queenName, refresh, upsertMessage],
   );
 
   const sseSessions = useMemo((): Record<string, string> => {
@@ -757,19 +752,60 @@ export default function QueenDM() {
 
   useMultiSSE({ sessions: sseSessions, onEvent: handleSSEEvent });
 
-  // Send handler
+  // Core backend send — used both for immediate sends and for Steer /
+  // auto-flush paths out of the pending queue.
+  const sendToBackend = useCallback(
+    (text: string, images?: ImageContent[]) => {
+      if (!sessionId) return;
+      executionApi.chat(sessionId, text, images).catch(() => {
+        setIsTyping(false);
+        setIsStreaming(false);
+      });
+    },
+    [sessionId],
+  );
+
+  const {
+    enqueue: enqueuePending,
+    steer: handleSteer,
+    cancelQueued: handleCancelQueued,
+    flushNext: flushNextPending,
+    flushNextRef: flushNextPendingRef,
+    clear: clearPendingQueue,
+  } = usePendingQueue({
+    sendToBackend,
+    setMessages,
+    onFlushStart: useCallback(() => {
+      setIsTyping(true);
+      queenAboutToResumeRef.current = true;
+    }, []),
+  });
+
+  // Reset the queue whenever we navigate to a different queen. The hook
+  // outlives the route change (same component instance), so without this,
+  // a message queued for Queen A would auto-flush into Queen B's session
+  // on B's next execution_completed.
+  useEffect(() => {
+    clearPendingQueue();
+  }, [queenId, clearPendingQueue]);
+
+  // Send handler. Queues when the queen is mid-turn (unless the user is
+  // answering an ask_user prompt, which must send immediately to unblock
+  // the loop). Queued messages are held locally until Steer, Cancel, or
+  // the next `execution_completed` auto-flush.
   const handleSend = useCallback(
     (text: string, _thread: string, images?: ImageContent[]) => {
-      if (awaitingInput) {
+      const answeringQuestion = awaitingInput;
+      if (answeringQuestion) {
         setAwaitingInput(false);
-        setPendingQuestion(null);
-        setPendingOptions(null);
+        setPendingQuestions(null);
       }
 
-      const isQueenBusy = isTyping;
-      const clientMessageId = makeId();
+      const shouldQueue = !answeringQuestion && isTyping;
+
+      const msgId = makeId();
       const userMsg: ChatMessage = {
-        id: clientMessageId,
+        id: msgId,
         agent: "You",
         agentColor: "",
         content: text,
@@ -778,41 +814,88 @@ export default function QueenDM() {
         thread: "queen-dm",
         createdAt: Date.now(),
         images,
-        queued: isQueenBusy || undefined,
-        clientMessageId,
+        queued: shouldQueue,
       };
       setMessages((prev) => [...prev, userMsg]);
-      setIsTyping(true);
 
-      if (sessionId) {
-        executionApi.chat(sessionId, text, images, undefined, clientMessageId).catch(() => {
-          setIsTyping(false);
-          setIsStreaming(false);
-        });
+      if (shouldQueue) {
+        enqueuePending(msgId, { text, images });
+        return;
       }
+
+      setIsTyping(true);
+      sendToBackend(text, images);
     },
-    [sessionId, awaitingInput, isTyping],
+    [awaitingInput, isTyping, sendToBackend, enqueuePending],
   );
+
+  const handleColonySpawn = useCallback(() => {
+    const colony = cloneColonyName.trim();
+    if (!colony) return;
+    const task = cloneTask.trim();
+
+    const briefLines = [
+      `Colony name: ${colony}`,
+      `Purpose: ${task || "Use the current conversation to propose the colony's purpose."}`,
+    ];
+    if (showCloneOutputs && cloneOutputs.trim()) {
+      briefLines.push(`Expected outputs: ${cloneOutputs.trim()}`);
+    }
+    if (showCloneDataSources && cloneDataSources.trim()) {
+      briefLines.push(`Inputs, data sources, tools, or credentials: ${cloneDataSources.trim()}`);
+    }
+    if (showCloneSchedule && cloneSchedule.trim()) {
+      briefLines.push(`Schedule/triggers: ${cloneSchedule.trim()}`);
+    }
+    if (showCloneConcurrency && cloneConcurrency.trim()) {
+      briefLines.push(`Concurrency: ${cloneConcurrency.trim()}`);
+    }
+
+    const message = [
+      "I want to set up a persistent colony.",
+      "",
+      briefLines.join("\n"),
+      "",
+      "Please use start_incubating_colony if this is appropriate. Ask me for any missing details before calling create_colony, then generate the self-contained task, skill name, skill description, skill body, and any optional triggers or concurrency hint needed by the colony.",
+    ].join("\n");
+
+    handleSend(message, "queen-dm");
+    setCloneDialogOpen(false);
+    setCloneColonyName("");
+    setCloneTask("");
+    setCloneOutputs("");
+    setCloneDataSources("");
+    setCloneSchedule("");
+    setCloneConcurrency("");
+    setShowCloneOutputs(false);
+    setShowCloneDataSources(false);
+    setShowCloneSchedule(false);
+    setShowCloneConcurrency(false);
+  }, [
+    cloneColonyName,
+    cloneConcurrency,
+    cloneDataSources,
+    cloneOutputs,
+    cloneSchedule,
+    cloneTask,
+    handleSend,
+    showCloneDataSources,
+    showCloneConcurrency,
+    showCloneOutputs,
+    showCloneSchedule,
+  ]);
 
   const handleQuestionAnswer = useCallback(
-    (answer: string) => {
-      setAwaitingInput(false);
-      setPendingQuestion(null);
-      setPendingOptions(null);
-      handleSend(answer, "queen-dm");
-    },
-    [handleSend],
-  );
-
-  const handleMultiQuestionAnswer = useCallback(
     (answers: Record<string, string>) => {
       setAwaitingInput(false);
-      setPendingQuestion(null);
-      setPendingOptions(null);
       setPendingQuestions(null);
-      const formatted = Object.entries(answers)
-        .map(([id, val]) => `${id}: ${val}`)
-        .join("\n");
+      // For a single question, send just the answer text. For a batch,
+      // send "id: answer" lines so the agent can map replies back.
+      const entries = Object.entries(answers);
+      const formatted =
+        entries.length === 1
+          ? entries[0][1]
+          : entries.map(([id, val]) => `${id}: ${val}`).join("\n");
       handleSend(formatted, "queen-dm");
     },
     [handleSend],
@@ -824,17 +907,15 @@ export default function QueenDM() {
       await executionApi.cancelQueen(sessionId);
       setIsTyping(false);
       setIsStreaming(false);
-      setActiveToolCalls({});
-      toolUseToPillRef.current = {};
-      // Clear queued flags since the queen is now idle
-      setMessages((prev) => {
-        if (!prev.some((m) => m.queued)) return prev;
-        return prev.map((m) => (m.queued ? { ...m, queued: undefined } : m));
-      });
+      replayStateRef.current = newReplayState();
+      // After cancelling the current turn, immediately send the oldest
+      // queued message (if any). The remaining queued messages stay put
+      // so the user can review them or Steer/Cancel individually.
+      flushNextPending();
     } catch {
       // ignore
     }
-  }, [sessionId]);
+  }, [sessionId, flushNextPending]);
 
   return (
     <div className="flex flex-col h-full">
@@ -857,26 +938,43 @@ export default function QueenDM() {
           messages={messages}
           onSend={handleSend}
           onCancel={handleCancelQueen}
+          onSteer={handleSteer}
+          onCancelQueued={handleCancelQueued}
           activeThread="queen-dm"
           isWaiting={isTyping && !isStreaming}
           isBusy={isTyping}
           disabled={loading || !queenReady}
           queenPhase={queenPhase}
-          showQueenPhaseBadge={false}
-          pendingQuestion={awaitingInput ? pendingQuestion : null}
-          pendingOptions={awaitingInput ? pendingOptions : null}
+          showQueenPhaseBadge
           pendingQuestions={awaitingInput ? pendingQuestions : null}
           onQuestionSubmit={handleQuestionAnswer}
-          onMultiQuestionSubmit={handleMultiQuestionAnswer}
           onQuestionDismiss={() => {
             setAwaitingInput(false);
-            setPendingQuestion(null);
-            setPendingOptions(null);
+            setPendingQuestions(null);
           }}
           supportsImages={true}
           initialDraft={initialDraft}
           queenProfileId={queenId ?? null}
           queenId={queenId}
+          onColonyLinkClick={handleColonyLinkClick}
+          colonySpawned={colonySpawned}
+          spawnedColonyName={spawnedColonyName}
+          queenDisplayName={queenName}
+          onCompactAndFork={handleCompactAndFork}
+          compactingAndForking={compactingAndForking}
+          onStartNewSession={handleCreateNewSession}
+          startingNewSession={creatingNewSession}
+          tokenUsage={tokenUsage}
+          headerAction={
+            <button
+              onClick={() => setCloneDialogOpen(true)}
+              disabled={!sessionId}
+              className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium text-primary hover:bg-primary/10 transition-colors disabled:opacity-40"
+            >
+              <Plus className="w-3 h-3" />
+              Start Colony Setup
+            </button>
+          }
         />
       </div>
 
@@ -884,17 +982,19 @@ export default function QueenDM() {
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div
             className="absolute inset-0 bg-black/40 backdrop-blur-sm"
-            onClick={() => !spawning && setCloneDialogOpen(false)}
+            onClick={() => setCloneDialogOpen(false)}
           />
-          <div className="relative bg-card border border-border/60 rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4">
-            <h2 className="text-sm font-semibold text-foreground">
-              Fork to Colony
-            </h2>
-            <p className="text-[11px] text-muted-foreground">
-              Forks the queen's full session into a new colony. Multiple
-              sessions can run against it in parallel.
-            </p>
-            <div className="space-y-3">
+          <div className="relative flex w-full max-w-lg h-[min(560px,88vh)] flex-col overflow-hidden rounded-xl border border-border/60 bg-card shadow-2xl">
+            <div className="px-6 pt-5 pb-3 space-y-1">
+              <h2 className="text-sm font-semibold text-foreground">
+                Set Up a Colony
+              </h2>
+              <p className="text-[11px] text-muted-foreground">
+                Share the brief. The queen will fill gaps, write the worker skill,
+                and create the colony when the setup is ready.
+              </p>
+            </div>
+            <div className="flex-1 overflow-y-auto px-6 pb-4 space-y-3">
               <div>
                 <label className="block text-[11px] font-medium text-muted-foreground mb-1">
                   Colony name
@@ -914,41 +1014,195 @@ export default function QueenDM() {
               </div>
               <div>
                 <label className="block text-[11px] font-medium text-muted-foreground mb-1">
-                  Task{" "}
-                  <span className="text-muted-foreground/40">(optional)</span>
+                  What should it do?
                 </label>
-                <input
-                  type="text"
+                <textarea
                   value={cloneTask}
                   onChange={(e) => setCloneTask(e.target.value)}
-                  placeholder="Continue the work from the queen's session"
-                  className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
+                  placeholder="Monitor launches, process a backlog, prepare a report, or continue this session's work."
+                  rows={3}
+                  className="w-full resize-none rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
                 />
               </div>
+
+              <div className="space-y-2 pt-1">
+                {!showCloneOutputs ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowCloneOutputs(true)}
+                    className="flex w-full items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
+                  >
+                    <Plus className="h-3.5 w-3.5 shrink-0" />
+                    Expected output
+                  </button>
+                ) : (
+                  <div className="rounded-md border border-border/60 p-3 space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowCloneOutputs(false)}
+                      className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
+                      aria-label="Hide expected output"
+                    >
+                      <span className="text-[11px] font-medium">
+                        Expected output
+                      </span>
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium">
+                        <Minus className="h-3.5 w-3.5" />
+                        Hide
+                      </span>
+                    </button>
+                    <textarea
+                      value={cloneOutputs}
+                      onChange={(e) => setCloneOutputs(e.target.value)}
+                      placeholder="A digest, saved rows, alerts, files, or a final summary."
+                      rows={2}
+                      className="w-full resize-none rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
+                )}
+
+                {!showCloneDataSources ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowCloneDataSources(true)}
+                    className="flex w-full items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
+                  >
+                    <Plus className="h-3.5 w-3.5 shrink-0" />
+                    Inputs, tools, or credentials
+                  </button>
+                ) : (
+                  <div className="rounded-md border border-border/60 p-3 space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowCloneDataSources(false)}
+                      className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
+                      aria-label="Hide inputs, tools, or credentials"
+                    >
+                      <span className="text-[11px] font-medium">
+                        Inputs, tools, or credentials
+                      </span>
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium">
+                        <Minus className="h-3.5 w-3.5" />
+                        Hide
+                      </span>
+                    </button>
+                    <textarea
+                      value={cloneDataSources}
+                      onChange={(e) => setCloneDataSources(e.target.value)}
+                      placeholder="APIs, websites, files, accounts, OAuth tools, or credentials it will need."
+                      rows={2}
+                      className="w-full resize-none rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
+                )}
+
+                {!showCloneSchedule ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowCloneSchedule(true)}
+                    className="flex w-full items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
+                  >
+                    <Plus className="h-3.5 w-3.5 shrink-0" />
+                    Schedule / triggers
+                  </button>
+                ) : (
+                  <div className="rounded-md border border-border/60 p-3 space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowCloneSchedule(false)}
+                      className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
+                      aria-label="Hide schedule or triggers"
+                    >
+                      <span className="text-[11px] font-medium">
+                        Schedule / triggers
+                      </span>
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium">
+                        <Minus className="h-3.5 w-3.5" />
+                        Hide
+                      </span>
+                    </button>
+                    <textarea
+                      value={cloneSchedule}
+                      onChange={(e) => setCloneSchedule(e.target.value)}
+                      placeholder="Manual only, every weekday at 9 AM, every 30 minutes, or webhook path."
+                      rows={2}
+                      className="w-full resize-none rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
+                )}
+
+                {!showCloneConcurrency ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowCloneConcurrency(true)}
+                    className="flex w-full items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
+                  >
+                    <Plus className="h-3.5 w-3.5 shrink-0" />
+                    Concurrency
+                  </button>
+                ) : (
+                  <div className="rounded-md border border-border/60 p-3 space-y-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowCloneConcurrency(false)}
+                      className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
+                      aria-label="Hide concurrency"
+                    >
+                      <span className="text-[11px] font-medium">
+                        Concurrency
+                      </span>
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium">
+                        <Minus className="h-3.5 w-3.5" />
+                        Hide
+                      </span>
+                    </button>
+                    <input
+                      type="text"
+                      value={cloneConcurrency}
+                      onChange={(e) => setCloneConcurrency(e.target.value)}
+                      placeholder="1 for a single worker, 5 for a parallel backlog, or any limit to respect."
+                      className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
+                )}
+              </div>
             </div>
-            <div className="flex justify-end gap-2 pt-2">
+            <div className="mt-auto flex justify-end gap-2 border-t border-border/50 px-6 py-4">
               <button
                 onClick={() => {
                   setCloneDialogOpen(false);
                   setCloneColonyName("");
                   setCloneTask("");
+                  setCloneOutputs("");
+                  setCloneDataSources("");
+                  setCloneSchedule("");
+                  setCloneConcurrency("");
+                  setShowCloneOutputs(false);
+                  setShowCloneDataSources(false);
+                  setShowCloneSchedule(false);
+                  setShowCloneConcurrency(false);
                 }}
-                disabled={spawning}
                 className="px-3 py-1.5 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
               >
                 Cancel
               </button>
               <button
                 onClick={handleColonySpawn}
-                disabled={spawning || !cloneColonyName.trim()}
+                disabled={!cloneColonyName.trim()}
                 className="px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
               >
-                {spawning ? "Forking..." : "Fork"}
+                Start setup
               </button>
             </div>
           </div>
         </div>
       )}
+
+      <DataExplorerModal
+        open={dataExplorerOpen}
+        sessionId={dataExplorerSessionId}
+        onClose={() => setDataExplorerOpen(false)}
+      />
     </div>
   );
 }

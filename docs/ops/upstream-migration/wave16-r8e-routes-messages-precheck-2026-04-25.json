@@ -1,0 +1,42 @@
+{
+  "generated_at_utc": "2026-04-25T10:26:01Z",
+  "wave": "Wave16-R8E",
+  "title": "Routes messages AppKey lane precheck",
+  "scope": [
+    "core/framework/server/routes_messages.py"
+  ],
+  "observed_delta": {
+    "numstat": {"add": 2, "del": 1},
+    "summary": [
+      "request.app['manager'] -> request.app[APP_KEY_MANAGER]",
+      "APP_KEY_MANAGER import added"
+    ]
+  },
+  "candidate_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "aligned with AppKey migration already preserved in routes_config and loader/cli",
+      "avoids reintroducing raw-string app key access"
+    ]
+  },
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"message or classify\" -q",
+        "result": "pass",
+        "summary": "4 passed, 189 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      },
+      {
+        "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+        "result": "pass",
+        "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+      }
+    ]
+  },
+  "status": "precheck_complete"
+}

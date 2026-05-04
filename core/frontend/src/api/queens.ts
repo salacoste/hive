@@ -16,6 +16,45 @@ export interface QueenSessionResult {
   status: "live" | "resumed" | "created";
 }
 
+export interface ToolMeta {
+  name: string;
+  description: string;
+  input_schema?: Record<string, unknown>;
+  editable?: boolean;
+}
+
+export interface McpServerTools {
+  name: string;
+  tools: Array<ToolMeta & { enabled: boolean }>;
+}
+
+export interface QueenToolsResponse {
+  queen_id: string;
+  enabled_mcp_tools: string[] | null;
+  /** True when the effective allowlist comes from the role-based default
+   * (no tools.json sidecar saved for this queen). False means the user
+   * has explicitly saved an allowlist. */
+  is_role_default: boolean;
+  stale: boolean;
+  lifecycle: ToolMeta[];
+  synthetic: ToolMeta[];
+  mcp_servers: McpServerTools[];
+}
+
+export interface QueenToolsUpdateResult {
+  queen_id: string;
+  enabled_mcp_tools: string[] | null;
+  refreshed_sessions: number;
+}
+
+export interface QueenToolsResetResult {
+  queen_id: string;
+  removed: boolean;
+  enabled_mcp_tools: string[] | null;
+  is_role_default: true;
+  refreshed_sessions: number;
+}
+
 export const queensApi = {
   /** List all queen profiles (id, name, title). */
   list: () =>
@@ -57,4 +96,24 @@ export const queensApi = {
       initial_prompt: initialPrompt,
       initial_phase: initialPhase || undefined,
     }),
+
+  /** Enumerate the queen's tool surface (lifecycle + synthetic + MCP). */
+  getTools: (queenId: string) =>
+    api.get<QueenToolsResponse>(`/queen/${queenId}/tools`),
+
+  /** Persist the MCP tool allowlist for a queen.
+   *
+   * Pass ``null`` to explicitly allow every MCP tool, or a list to
+   * restrict the queen's tool surface. Lifecycle and synthetic tools
+   * are always enabled and cannot be listed here.
+   */
+  updateTools: (queenId: string, enabled: string[] | null) =>
+    api.patch<QueenToolsUpdateResult>(`/queen/${queenId}/tools`, {
+      enabled_mcp_tools: enabled,
+    }),
+
+  /** Drop the queen's tools.json sidecar so she falls back to the
+   * role-based default (or allow-all for queens without a role entry). */
+  resetTools: (queenId: string) =>
+    api.delete<QueenToolsResetResult>(`/queen/${queenId}/tools`),
 };

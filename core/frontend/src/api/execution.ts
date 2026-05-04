@@ -37,13 +37,11 @@ export const executionApi = {
     message: string,
     images?: { type: string; image_url: { url: string } }[],
     displayMessage?: string,
-    clientMessageId?: string,
   ) =>
     api.post<ChatResult>(`/sessions/${sessionId}/chat`, {
       message,
       ...(images?.length ? { images } : {}),
       ...(displayMessage !== undefined ? { display_message: displayMessage } : {}),
-      ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
     }),
 
   /** Queue context for the queen without triggering an LLM response. */
@@ -76,4 +74,28 @@ export const executionApi = {
       `/sessions/${sessionId}/colony-spawn`,
       { colony_name: colonyName, task },
     ),
+
+  /** Lock a queen DM session because the user opened a spawned colony.
+   *  After this call /chat returns 409 until compactAndFork creates a new session.
+   */
+  markColonySpawned: (sessionId: string, colonyName: string) =>
+    api.post<{
+      session_id: string;
+      colony_spawned: boolean;
+      spawned_colony_name: string;
+    }>(`/sessions/${sessionId}/mark-colony-spawned`, {
+      colony_name: colonyName,
+    }),
+
+  /** Compact the locked session and fork into a fresh session under the same queen.
+   *  Returns the new session ID; the frontend should navigate the user to it.
+   */
+  compactAndFork: (sessionId: string) =>
+    api.post<{
+      new_session_id: string;
+      queen_id: string;
+      compacted_from: string;
+      summary_chars: number;
+      messages_compacted: number;
+    }>(`/sessions/${sessionId}/compact-and-fork`),
 };

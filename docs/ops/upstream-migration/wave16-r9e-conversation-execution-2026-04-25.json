@@ -1,0 +1,42 @@
+{
+  "generated_at_utc": "2026-04-25T11:34:16Z",
+  "wave": "Wave16-R9E",
+  "title": "Conversation behavior lane execution",
+  "scope": [
+    "core/framework/agent_loop/conversation.py"
+  ],
+  "reconcile_decision": {
+    "mode": "reconcile",
+    "reason": [
+      "restored Message runtime compatibility with routes_execution compact-and-fork flow",
+      "preserved local conversation semantics while reintroducing missing metadata fields",
+      "kept backward/forward persistence compatibility for inherited_from and trigger-origin markers"
+    ]
+  },
+  "changes": [
+    "Message dataclass restored fields: inherited_from, is_trigger",
+    "storage serialization/deserialization restored for inherited_from/is_trigger",
+    "NodeConversation.add_user_message restored optional is_trigger parameter (default false)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q",
+        "result": "pass",
+        "summary": "163 passed, 4 skipped"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q",
+        "result": "pass",
+        "summary": "29 passed, 164 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9E lane closed with reconcile decision and restored cross-session metadata contract",
+      "next candidate lane: core/framework/host/execution_manager.py"
+    ]
+  }
+}

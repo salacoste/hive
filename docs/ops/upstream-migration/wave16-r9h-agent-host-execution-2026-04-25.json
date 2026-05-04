@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T11:42:24Z",
+  "wave": "Wave16-R9H",
+  "title": "Agent host behavior lane execution",
+  "scope": [
+    "core/framework/host/agent_host.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local branch distinguishes timeout from generic cancel failure in cancel_all_tasks",
+      "local logging retains traceback for real failures while suppressing timeout warning noise",
+      "no functional regression signal observed in runtime/trigger/execution test paths"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local agent_host cancellation diagnostics"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_runtime.py -q",
+        "result": "pass",
+        "summary": "15 passed, 2 skipped"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_trigger_fires_into_queen.py -q",
+        "result": "pass",
+        "summary": "7 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q",
+        "result": "pass",
+        "summary": "29 passed, 164 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9H lane closed with explicit keep-local decision",
+      "next candidate lane: core/framework/host/colony_runtime.py"
+    ]
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T11:08:52Z",
+  "wave": "Wave16-R9B",
+  "title": "Routes execution medium-lane execution",
+  "scope": [
+    "core/framework/server/routes_execution.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local lane provides project-aware execution admission controls and queueing behavior",
+      "local lane enforces effective project policy before trigger execution",
+      "local lane includes runtime abstraction and web client metadata propagation needed by current dual-interface flow"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; local routes_execution behavior retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q",
+        "result": "pass",
+        "summary": "29 passed, 164 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution or autonomous\" -q",
+        "result": "pass",
+        "summary": "83 passed, 110 deselected"
+      }
+    ],
+    "gate_reference": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "latest run ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9B medium lane closed with explicit keep-local decision",
+      "next step: medium-bundle checkpoint to classify remaining server/project modules"
+    ]
+  }
+}

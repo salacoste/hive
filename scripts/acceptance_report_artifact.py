@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen
 
-BASE = "http://localhost:8787"
+BASE = os.environ.get("HIVE_BASE_URL", f"http://localhost:{os.environ.get('HIVE_CORE_PORT', '8787')}")
 OUT_DIR = Path("docs/ops/acceptance-reports")
 
 
@@ -43,6 +44,18 @@ def main() -> int:
             "status": tg.get("status"),
             "running": ((tg.get("bridge") or {}).get("running") if isinstance(tg, dict) else None),
             "poller_owner": ((tg.get("bridge") or {}).get("poller_owner") if isinstance(tg, dict) else None),
+            "poll_conflict_409_count": (
+                (tg.get("bridge") or {}).get("poll_conflict_409_count") if isinstance(tg, dict) else None
+            ),
+            "last_poll_conflict_409_at": (
+                (tg.get("bridge") or {}).get("last_poll_conflict_409_at") if isinstance(tg, dict) else None
+            ),
+            "last_poll_conflict_recover_result": (
+                (tg.get("bridge") or {}).get("last_poll_conflict_recover_result") if isinstance(tg, dict) else None
+            ),
+            "poll_conflict_warning_active": (
+                (tg.get("bridge") or {}).get("poll_conflict_warning_active") if isinstance(tg, dict) else None
+            ),
         },
     }
 

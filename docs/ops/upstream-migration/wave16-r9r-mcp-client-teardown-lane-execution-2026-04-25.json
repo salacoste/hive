@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T13:27:28Z",
+  "wave": "Wave16-R9R",
+  "title": "MCP client teardown warning-noise lane execution",
+  "scope": [
+    "core/framework/loader/mcp_client.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "known anyio teardown quirk is intentionally downgraded to debug to reduce warning noise",
+      "real teardown failures still surface as warnings",
+      "targeted MCP/registry/API bundles are green"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9R lane (teardown noise-hardening retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_mcp_client.py -q",
+        "result": "pass",
+        "summary": "7 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_mcp_registry_loader.py core/tests/test_tool_registry.py -k 'mcp' -q",
+        "result": "pass",
+        "summary": "17 passed, 26 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'mcp or credentials' -q",
+        "result": "pass",
+        "summary": "13 passed, 180 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9R lane closed with explicit keep-local decision",
+      "next residual lane: loader CLI AppKey contract (`core/framework/loader/cli.py`)"
+    ]
+  }
+}

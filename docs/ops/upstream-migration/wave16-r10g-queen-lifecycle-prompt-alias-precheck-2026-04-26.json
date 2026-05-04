@@ -1,0 +1,34 @@
+{
+  "generated_at_utc": "2026-04-26T13:10:31Z",
+  "wave": "Wave16-R10G",
+  "title": "Queen lifecycle prompt alias compatibility lane precheck",
+  "scope": [
+    "core/framework/tools/queen_lifecycle_tools.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/tools/queen_lifecycle_tools.py",
+      "add": 12,
+      "del": 0,
+      "total": 12
+    }
+  },
+  "delta_summary": [
+    "adds prompt_building compatibility field alongside prompt_independent",
+    "__post_init__ keeps both prompt aliases synchronized for legacy/new callers",
+    "intended to prevent test/caller drift during prompt-field rename"
+  ],
+  "risk_signals": [
+    {
+      "type": "dataclass-contract",
+      "evidence": "constructor fields changed for QueenPhaseState",
+      "impact": "legacy tests/callers may break without alias synchronization"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_queen_memory.py -q",
+    "uv run --package framework pytest core/tests/test_create_colony_tool.py -q",
+    "uv run --package framework pytest core/tests/test_run_parallel_workers_tool.py -q"
+  ],
+  "decision_gate": "keep_local acceptable if phase-state alias and colony tool bundles remain green"
+}

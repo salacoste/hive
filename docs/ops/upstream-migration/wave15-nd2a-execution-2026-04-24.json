@@ -1,0 +1,90 @@
+{
+  "date": "2026-04-24",
+  "generated_at_utc": "2026-04-24T14:22:57.734466+00:00",
+  "batch_id": "ND-2A-config-only",
+  "apply_patch_path": "docs/ops/upstream-migration/wave15-nd2a-config-only.patch",
+  "apply_result": "applied",
+  "changed_files_total": 12,
+  "changed_files": [
+    "examples/templates/competitive_intel_agent/mcp_servers.json",
+    "examples/templates/deep_research_agent/mcp_servers.json",
+    "examples/templates/email_inbox_management/mcp_servers.json",
+    "examples/templates/email_reply_agent/mcp_servers.json",
+    "examples/templates/job_hunter/mcp_servers.json",
+    "examples/templates/local_business_extractor/mcp_servers.json",
+    "examples/templates/meeting_scheduler/mcp_servers.json",
+    "examples/templates/sdr_agent/mcp_servers.json",
+    "examples/templates/tech_news_reporter/mcp_servers.json",
+    "examples/templates/twitter_news_agent/mcp_servers.json",
+    "examples/templates/vulnerability_assessment/mcp_registry.json",
+    "examples/templates/vulnerability_assessment/mcp_servers.json"
+  ],
+  "gate": {
+    "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "result": "pass",
+    "summary": "ok=7 failed=0",
+    "note": "gate script updated to run framework pytest via uv package environment"
+  },
+  "files": [
+    {
+      "path": "examples/templates/competitive_intel_agent/mcp_servers.json",
+      "worktree_status": "M examples/templates/competitive_intel_agent/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/deep_research_agent/mcp_servers.json",
+      "worktree_status": "M examples/templates/deep_research_agent/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/email_inbox_management/mcp_servers.json",
+      "worktree_status": "M examples/templates/email_inbox_management/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/email_reply_agent/mcp_servers.json",
+      "worktree_status": "M examples/templates/email_reply_agent/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/job_hunter/mcp_servers.json",
+      "worktree_status": "M examples/templates/job_hunter/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/local_business_extractor/mcp_servers.json",
+      "worktree_status": "M examples/templates/local_business_extractor/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/meeting_scheduler/mcp_servers.json",
+      "worktree_status": "M examples/templates/meeting_scheduler/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/sdr_agent/mcp_servers.json",
+      "worktree_status": "M examples/templates/sdr_agent/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/tech_news_reporter/mcp_servers.json",
+      "worktree_status": "M examples/templates/tech_news_reporter/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/twitter_news_agent/mcp_servers.json",
+      "worktree_status": "M examples/templates/twitter_news_agent/mcp_servers.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/vulnerability_assessment/mcp_registry.json",
+      "worktree_status": "M examples/templates/vulnerability_assessment/mcp_registry.json",
+      "changed": true
+    },
+    {
+      "path": "examples/templates/vulnerability_assessment/mcp_servers.json",
+      "worktree_status": "M examples/templates/vulnerability_assessment/mcp_servers.json",
+      "changed": true
+    }
+  ]
+}

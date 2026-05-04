@@ -1,0 +1,18 @@
+{
+  "generated_at_utc": "2026-04-26T14:01:06Z",
+  "wave": "Wave16-R10P",
+  "title": "Autonomous run-until-terminal + execute-next contract lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "delta_summary": [
+    "R10O closed with green GitHub evaluate and auto-next policy contracts",
+    "next bounded step verifies run-until-terminal and execute-next endpoint lifecycle continuity",
+    "lane remains non-destructive and endpoint-contract focused"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_run_until_terminal or pipeline_execute_next' -q"
+  ],
+  "decision_gate": "close lane only after run-until-terminal and execute-next endpoint contract tests remain green under current autonomous pipeline defaults"
+}

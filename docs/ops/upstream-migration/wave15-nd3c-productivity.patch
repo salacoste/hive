@@ -1,0 +1,711 @@
+diff --git a/tools/src/aden_tools/tools/calendar_tool/calendar_tool.py b/tools/src/aden_tools/tools/calendar_tool/calendar_tool.py
+index 6d449ca0f9c1f7d13bfdf9ffe9d260fd88127c44..d5bb4230d6920869f92ef908aa1e50750da3273e 100644
+--- a/tools/src/aden_tools/tools/calendar_tool/calendar_tool.py
++++ b/tools/src/aden_tools/tools/calendar_tool/calendar_tool.py
+@@ -25,8 +25,6 @@
+ import httpx
+ from fastmcp import FastMCP
+ 
+-from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
+-
+ if TYPE_CHECKING:
+     from framework.credentials.oauth2 import TokenLifecycleManager
+ 
+@@ -87,7 +85,7 @@ def _get_token() -> str | None:
+             return credentials.get("google")
+ 
+         # Fall back to environment variable
+-        return get_google_access_token_from_env_or_file()
++        return os.getenv("GOOGLE_ACCESS_TOKEN")
+ 
+     def _get_headers() -> dict[str, str]:
+         """Get authorization headers for API requests.
+diff --git a/tools/src/aden_tools/tools/github_tool/github_tool.py b/tools/src/aden_tools/tools/github_tool/github_tool.py
+index 1d11fe9bea188dde6b2988f2e68a3b5cf8037831..ba4923036b730800eecb87b29a6c516c110538de 100644
+--- a/tools/src/aden_tools/tools/github_tool/github_tool.py
++++ b/tools/src/aden_tools/tools/github_tool/github_tool.py
+@@ -270,48 +270,6 @@ def update_issue(
+         )
+         return self._handle_response(response)
+ 
+-    def list_issue_comments(
+-        self,
+-        owner: str,
+-        repo: str,
+-        issue_number: int,
+-        page: int = 1,
+-        limit: int = 30,
+-    ) -> dict[str, Any]:
+-        """List issue comments (also works for PR conversation comments)."""
+-        owner = _sanitize_path_param(owner, "owner")
+-        repo = _sanitize_path_param(repo, "repo")
+-        params = {
+-            "per_page": min(limit, 100),
+-            "page": max(1, page),
+-        }
+-
+-        response = httpx.get(
+-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/comments",
+-            headers=self._headers,
+-            params=params,
+-            timeout=30.0,
+-        )
+-        return self._handle_response(response)
+-
+-    def create_issue_comment(
+-        self,
+-        owner: str,
+-        repo: str,
+-        issue_number: int,
+-        body: str,
+-    ) -> dict[str, Any]:
+-        """Create an issue comment (also works for PR conversation comments)."""
+-        owner = _sanitize_path_param(owner, "owner")
+-        repo = _sanitize_path_param(repo, "repo")
+-        response = httpx.post(
+-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/comments",
+-            headers=self._headers,
+-            json={"body": body},
+-            timeout=30.0,
+-        )
+-        return self._handle_response(response)
+-
+     # --- Pull Requests ---
+ 
+     def list_pull_requests(
+@@ -385,112 +343,6 @@ def create_pull_request(
+         )
+         return self._handle_response(response)
+ 
+-    def list_pull_request_reviews(
+-        self,
+-        owner: str,
+-        repo: str,
+-        pull_number: int,
+-        page: int = 1,
+-        limit: int = 30,
+-    ) -> dict[str, Any]:
+-        """List reviews on a pull request."""
+-        owner = _sanitize_path_param(owner, "owner")
+-        repo = _sanitize_path_param(repo, "repo")
+-        params = {
+-            "per_page": min(limit, 100),
+-            "page": max(1, page),
+-        }
+-
+-        response = httpx.get(
+-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
+-            headers=self._headers,
+-            params=params,
+-            timeout=30.0,
+-        )
+-        return self._handle_response(response)
+-
+-    def list_pull_request_review_comments(
+-        self,
+-        owner: str,
+-        repo: str,
+-        pull_number: int,
+-        page: int = 1,
+-        limit: int = 30,
+-    ) -> dict[str, Any]:
+-        """List inline review comments on a pull request."""
+-        owner = _sanitize_path_param(owner, "owner")
+-        repo = _sanitize_path_param(repo, "repo")
+-        params = {
+-            "per_page": min(limit, 100),
+-            "page": max(1, page),
+-        }
+-
+-        response = httpx.get(
+-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/comments",
+-            headers=self._headers,
+-            params=params,
+-            timeout=30.0,
+-        )
+-        return self._handle_response(response)
+-
+-    def create_pull_request_review(
+-        self,
+-        owner: str,
+-        repo: str,
+-        pull_number: int,
+-        body: str | None = None,
+-        event: str | None = None,
+-        commit_id: str | None = None,
+-    ) -> dict[str, Any]:
+-        """Create a pull request review (COMMENT/APPROVE/REQUEST_CHANGES)."""
+-        owner = _sanitize_path_param(owner, "owner")
+-        repo = _sanitize_path_param(repo, "repo")
+-        payload: dict[str, Any] = {}
+-        if body is not None:
+-            payload["body"] = body
+-        if event is not None:
+-            payload["event"] = event
+-        if commit_id is not None:
+-            payload["commit_id"] = commit_id
+-
+-        response = httpx.post(
+-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/reviews",
+-            headers=self._headers,
+-            json=payload,
+-            timeout=30.0,
+-        )
+-        return self._handle_response(response)
+-
+-    def create_pull_request_review_comment(
+-        self,
+-        owner: str,
+-        repo: str,
+-        pull_number: int,
+-        body: str,
+-        commit_id: str,
+-        path: str,
+-        line: int,
+-        side: str = "RIGHT",
+-    ) -> dict[str, Any]:
+-        """Create an inline pull request review comment."""
+-        owner = _sanitize_path_param(owner, "owner")
+-        repo = _sanitize_path_param(repo, "repo")
+-        payload: dict[str, Any] = {
+-            "body": body,
+-            "commit_id": commit_id,
+-            "path": path,
+-            "line": line,
+-            "side": side,
+-        }
+-
+-        response = httpx.post(
+-            f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}/comments",
+-            headers=self._headers,
+-            json=payload,
+-            timeout=30.0,
+-        )
+-        return self._handle_response(response)
+-
+     # --- Search ---
+ 
+     def search_code(
+@@ -755,26 +607,14 @@ def register_tools(
+ 
+     def _get_token(account: str = "") -> str | None:
+         """Get GitHub token from credential manager or environment."""
+-        env_token = os.getenv("GITHUB_TOKEN")
+         if credentials is not None:
+-            try:
+-                if account:
+-                    token = credentials.get_by_alias("github", account)
+-                    if token:
+-                        return token
+-                else:
+-                    token = credentials.get("github")
+-                    if token is not None and not isinstance(token, str):
+-                        raise TypeError(
+-                            f"Expected string from credentials.get('github'), got {type(token).__name__}"
+-                        )
+-                    if token:
+-                        return token
+-            except Exception:
+-                # Credential store can fail to decrypt stale entries if key rotated.
+-                # Fall back to env token so runtime can continue.
+-                pass
+-        return env_token
++            if account:
++                return credentials.get_by_alias("github", account)
++            token = credentials.get("github")
++            if token is not None and not isinstance(token, str):
++                raise TypeError(f"Expected string from credentials.get('github'), got {type(token).__name__}")
++            return token
++        return os.getenv("GITHUB_TOKEN")
+ 
+     def _get_client(account: str = "") -> _GitHubClient | dict[str, str]:
+         """Get a GitHub client, or return an error dict if no credentials."""
+@@ -1008,55 +848,6 @@ def github_update_issue(
+         except httpx.RequestError as e:
+             return {"error": _sanitize_error_message(e)}
+ 
+-    @mcp.tool()
+-    def github_list_issue_comments(
+-        owner: str,
+-        repo: str,
+-        issue_number: int,
+-        page: int = 1,
+-        limit: int = 30,
+-        account: str = "",
+-    ) -> dict:
+-        """
+-        List issue comments.
+-
+-        Note: Pull requests are issues in GitHub, so this also returns
+-        PR conversation comments (top-level comments, not inline code comments).
+-        """
+-        client = _get_client(account)
+-        if isinstance(client, dict):
+-            return client
+-        try:
+-            return client.list_issue_comments(owner, repo, issue_number, page, limit)
+-        except httpx.TimeoutException:
+-            return {"error": "Request timed out"}
+-        except httpx.RequestError as e:
+-            return {"error": _sanitize_error_message(e)}
+-
+-    @mcp.tool()
+-    def github_create_issue_comment(
+-        owner: str,
+-        repo: str,
+-        issue_number: int,
+-        body: str,
+-        account: str = "",
+-    ) -> dict:
+-        """
+-        Create an issue comment.
+-
+-        Note: Pull requests are issues in GitHub, so this can be used to
+-        post a top-level PR conversation comment.
+-        """
+-        client = _get_client(account)
+-        if isinstance(client, dict):
+-            return client
+-        try:
+-            return client.create_issue_comment(owner, repo, issue_number, body)
+-        except httpx.TimeoutException:
+-            return {"error": "Request timed out"}
+-        except httpx.RequestError as e:
+-            return {"error": _sanitize_error_message(e)}
+-
+     # --- Pull Requests ---
+ 
+     @mcp.tool()
+@@ -1155,102 +946,6 @@ def github_create_pull_request(
+         except httpx.RequestError as e:
+             return {"error": _sanitize_error_message(e)}
+ 
+-    @mcp.tool()
+-    def github_list_pull_request_reviews(
+-        owner: str,
+-        repo: str,
+-        pull_number: int,
+-        page: int = 1,
+-        limit: int = 30,
+-        account: str = "",
+-    ) -> dict:
+-        """
+-        List pull request reviews (APPROVED/CHANGES_REQUESTED/COMMENTED).
+-        """
+-        client = _get_client(account)
+-        if isinstance(client, dict):
+-            return client
+-        try:
+-            return client.list_pull_request_reviews(owner, repo, pull_number, page, limit)
+-        except httpx.TimeoutException:
+-            return {"error": "Request timed out"}
+-        except httpx.RequestError as e:
+-            return {"error": _sanitize_error_message(e)}
+-
+-    @mcp.tool()
+-    def github_list_pull_request_review_comments(
+-        owner: str,
+-        repo: str,
+-        pull_number: int,
+-        page: int = 1,
+-        limit: int = 30,
+-        account: str = "",
+-    ) -> dict:
+-        """
+-        List inline review comments on a pull request (code-level comments).
+-        """
+-        client = _get_client(account)
+-        if isinstance(client, dict):
+-            return client
+-        try:
+-            return client.list_pull_request_review_comments(owner, repo, pull_number, page, limit)
+-        except httpx.TimeoutException:
+-            return {"error": "Request timed out"}
+-        except httpx.RequestError as e:
+-            return {"error": _sanitize_error_message(e)}
+-
+-    @mcp.tool()
+-    def github_create_pull_request_review(
+-        owner: str,
+-        repo: str,
+-        pull_number: int,
+-        body: str | None = None,
+-        event: str | None = None,
+-        commit_id: str | None = None,
+-        account: str = "",
+-    ) -> dict:
+-        """
+-        Create a pull request review.
+-
+-        event can be COMMENT, APPROVE, or REQUEST_CHANGES.
+-        """
+-        client = _get_client(account)
+-        if isinstance(client, dict):
+-            return client
+-        try:
+-            return client.create_pull_request_review(owner, repo, pull_number, body, event, commit_id)
+-        except httpx.TimeoutException:
+-            return {"error": "Request timed out"}
+-        except httpx.RequestError as e:
+-            return {"error": _sanitize_error_message(e)}
+-
+-    @mcp.tool()
+-    def github_create_pull_request_review_comment(
+-        owner: str,
+-        repo: str,
+-        pull_number: int,
+-        body: str,
+-        commit_id: str,
+-        path: str,
+-        line: int,
+-        side: str = "RIGHT",
+-        account: str = "",
+-    ) -> dict:
+-        """
+-        Create an inline pull request review comment.
+-        """
+-        client = _get_client(account)
+-        if isinstance(client, dict):
+-            return client
+-        try:
+-            return client.create_pull_request_review_comment(
+-                owner, repo, pull_number, body, commit_id, path, line, side
+-            )
+-        except httpx.TimeoutException:
+-            return {"error": "Request timed out"}
+-        except httpx.RequestError as e:
+-            return {"error": _sanitize_error_message(e)}
+-
+     # --- Search ---
+ 
+     @mcp.tool()
+@@ -1494,9 +1189,7 @@ def github_create_release(
+         if isinstance(client, dict):
+             return client
+         try:
+-            return client.create_release(
+-                owner, repo, tag_name, name, body, draft, prerelease, target_commitish
+-            )
++            return client.create_release(owner, repo, tag_name, name, body, draft, prerelease, target_commitish)
+         except httpx.TimeoutException:
+             return {"error": "Request timed out"}
+         except httpx.RequestError as e:
+diff --git a/tools/src/aden_tools/tools/gmail_tool/gmail_tool.py b/tools/src/aden_tools/tools/gmail_tool/gmail_tool.py
+index fcb25038d38472c950fe968ed5cbc833524bdc42..9c659a645427f031fca605bd89c851264ef2c747 100644
+--- a/tools/src/aden_tools/tools/gmail_tool/gmail_tool.py
++++ b/tools/src/aden_tools/tools/gmail_tool/gmail_tool.py
+@@ -21,8 +21,6 @@
+ import httpx
+ from fastmcp import FastMCP
+ 
+-from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
+-
+ if TYPE_CHECKING:
+     from aden_tools.credentials import CredentialStoreAdapter
+ 
+@@ -60,7 +58,7 @@ def _get_token(account: str = "") -> str | None:
+             if account:
+                 return credentials.get_by_alias("google", account)
+             return credentials.get("google")
+-        return get_google_access_token_from_env_or_file()
++        return os.getenv("GOOGLE_ACCESS_TOKEN")
+ 
+     def _gmail_request(method: str, path: str, access_token: str, **kwargs: object) -> httpx.Response:
+         """Make an authenticated Gmail API request."""
+diff --git a/tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py b/tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py
+index 4f5f96e90c5d69c4bb23c7d1f01b5125856b4757..24a3ae5264249c84ca35d5104cb068da86b6dcf7 100644
+--- a/tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py
++++ b/tools/src/aden_tools/tools/google_docs_tool/google_docs_tool.py
+@@ -24,8 +24,6 @@
+ import httpx
+ from fastmcp import FastMCP
+ 
+-from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
+-
+ if TYPE_CHECKING:
+     from aden_tools.credentials import CredentialStoreAdapter
+ 
+@@ -393,7 +391,7 @@ def _get_token(account: str = "") -> str | None:
+             if token is not None and not isinstance(token, str):
+                 raise TypeError(f"Expected string from credentials.get('google'), got {type(token).__name__}")
+             return token
+-        return get_google_access_token_from_env_or_file()
++        return os.getenv("GOOGLE_ACCESS_TOKEN")
+ 
+     def _get_client(account: str = "") -> _GoogleDocsClient | dict[str, str]:
+         """Get a Google Docs client, or return an error dict if no credentials."""
+diff --git a/tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py b/tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py
+index 5a20c514485a9ee1da9aa3692ef8b5868a912072..3886ceb0204ca45104d1311dc2cf3c0b8ee7924f 100644
+--- a/tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py
++++ b/tools/src/aden_tools/tools/google_sheets_tool/google_sheets_tool.py
+@@ -16,8 +16,6 @@
+ import httpx
+ from fastmcp import FastMCP
+ 
+-from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
+-
+ if TYPE_CHECKING:
+     from aden_tools.credentials import CredentialStoreAdapter
+ 
+@@ -262,7 +260,7 @@ def _get_token() -> str | None:
+             if token is not None and not isinstance(token, str):
+                 raise TypeError(f"Expected string from credentials.get('google'), got {type(token).__name__}")
+             return token
+-        return get_google_access_token_from_env_or_file()
++        return os.getenv("GOOGLE_ACCESS_TOKEN")
+ 
+     def _get_client() -> _GoogleSheetsClient | dict[str, str]:
+         """Get a Google Sheets client, or return an error dict if no credentials."""
+diff --git a/tools/tests/tools/test_github_tool.py b/tools/tests/tools/test_github_tool.py
+index cd1fc62778ea4fdc0ad96713bfb38a6b6127e38b..27f69c9882f00c063f1a887be0764f3e5eb2d714 100644
+--- a/tools/tests/tools/test_github_tool.py
++++ b/tools/tests/tools/test_github_tool.py
+@@ -195,30 +195,6 @@ def test_update_issue(self, mock_patch):
+         assert result["success"] is True
+         assert result["data"]["state"] == "closed"
+ 
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+-    def test_list_issue_comments(self, mock_get):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.json.return_value = [{"id": 1, "body": "Comment"}]
+-        mock_get.return_value = mock_response
+-
+-        result = self.client.list_issue_comments("owner", "repo", 1)
+-
+-        assert result["success"] is True
+-        assert len(result["data"]) == 1
+-
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+-    def test_create_issue_comment(self, mock_post):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 201
+-        mock_response.json.return_value = {"id": 11, "body": "New comment"}
+-        mock_post.return_value = mock_response
+-
+-        result = self.client.create_issue_comment("owner", "repo", 1, "New comment")
+-
+-        assert result["success"] is True
+-        assert result["data"]["id"] == 11
+-
+     @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+     def test_list_pull_requests(self, mock_get):
+         mock_response = MagicMock()
+@@ -268,68 +244,6 @@ def test_create_pull_request(self, mock_post):
+         assert result["success"] is True
+         assert result["data"]["number"] == 10
+ 
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+-    def test_list_pull_request_reviews(self, mock_get):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.json.return_value = [{"id": 1, "state": "COMMENTED"}]
+-        mock_get.return_value = mock_response
+-
+-        result = self.client.list_pull_request_reviews("owner", "repo", 10)
+-
+-        assert result["success"] is True
+-        assert len(result["data"]) == 1
+-
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+-    def test_list_pull_request_review_comments(self, mock_get):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.json.return_value = [{"id": 2, "path": "src/a.ts"}]
+-        mock_get.return_value = mock_response
+-
+-        result = self.client.list_pull_request_review_comments("owner", "repo", 10)
+-
+-        assert result["success"] is True
+-        assert len(result["data"]) == 1
+-
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+-    def test_create_pull_request_review(self, mock_post):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.json.return_value = {"id": 99, "state": "COMMENTED"}
+-        mock_post.return_value = mock_response
+-
+-        result = self.client.create_pull_request_review(
+-            "owner",
+-            "repo",
+-            10,
+-            body="Looks good",
+-            event="COMMENT",
+-        )
+-
+-        assert result["success"] is True
+-        assert result["data"]["id"] == 99
+-
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+-    def test_create_pull_request_review_comment(self, mock_post):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 201
+-        mock_response.json.return_value = {"id": 101, "path": "src/main.ts"}
+-        mock_post.return_value = mock_response
+-
+-        result = self.client.create_pull_request_review_comment(
+-            "owner",
+-            "repo",
+-            10,
+-            body="Please fix this",
+-            commit_id="abc123",
+-            path="src/main.ts",
+-            line=12,
+-        )
+-
+-        assert result["success"] is True
+-        assert result["data"]["id"] == 101
+-
+     @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+     def test_search_code(self, mock_get):
+         mock_response = MagicMock()
+@@ -435,26 +349,6 @@ def test_credential_store_token(self, mcp):
+             call_headers = mock_get.call_args.kwargs["headers"]
+             assert call_headers["Authorization"] == "Bearer ghp_store_token"
+ 
+-    def test_credential_decrypt_failure_falls_back_to_env(self, mcp):
+-        """If credential decryption fails, fallback to GITHUB_TOKEN env."""
+-        mock_credentials = MagicMock()
+-        mock_credentials.get.side_effect = ValueError("Failed to decrypt credential")
+-
+-        with patch("os.getenv", return_value="ghp_env_fallback"):
+-            with patch("aden_tools.tools.github_tool.github_tool.httpx.get") as mock_get:
+-                mock_response = MagicMock()
+-                mock_response.status_code = 200
+-                mock_response.json.return_value = []
+-                mock_get.return_value = mock_response
+-
+-                register_tools(mcp, credentials=mock_credentials)
+-                list_repos = mcp._tool_manager._tools["github_list_repos"].fn
+-
+-                list_repos()
+-
+-                call_headers = mock_get.call_args.kwargs["headers"]
+-                assert call_headers["Authorization"] == "Bearer ghp_env_fallback"
+-
+ 
+ # --- MCP Tool function tests ---
+ 
+@@ -613,36 +507,6 @@ def test_update_issue_success(self, mock_patch, mcp):
+ 
+             assert result["success"] is True
+ 
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+-    def test_list_issue_comments_success(self, mock_get, mcp):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.json.return_value = [{"id": 1, "body": "comment"}]
+-        mock_get.return_value = mock_response
+-
+-        with patch("os.getenv", return_value="ghp_test"):
+-            register_tools(mcp, credentials=None)
+-            list_comments = mcp._tool_manager._tools["github_list_issue_comments"].fn
+-
+-            result = list_comments(owner="owner", repo="repo", issue_number=1)
+-
+-            assert result["success"] is True
+-
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+-    def test_create_issue_comment_success(self, mock_post, mcp):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 201
+-        mock_response.json.return_value = {"id": 1, "body": "comment"}
+-        mock_post.return_value = mock_response
+-
+-        with patch("os.getenv", return_value="ghp_test"):
+-            register_tools(mcp, credentials=None)
+-            create_comment = mcp._tool_manager._tools["github_create_issue_comment"].fn
+-
+-            result = create_comment(owner="owner", repo="repo", issue_number=1, body="comment")
+-
+-            assert result["success"] is True
+-
+ 
+ class TestGitHubPullRequests:
+     @pytest.fixture
+@@ -700,84 +564,6 @@ def test_create_pull_request_success(self, mock_post, mcp):
+ 
+             assert result["success"] is True
+ 
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+-    def test_list_pull_request_reviews_success(self, mock_get, mcp):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.json.return_value = [{"id": 1, "state": "COMMENTED"}]
+-        mock_get.return_value = mock_response
+-
+-        with patch("os.getenv", return_value="ghp_test"):
+-            register_tools(mcp, credentials=None)
+-            list_reviews = mcp._tool_manager._tools["github_list_pull_request_reviews"].fn
+-
+-            result = list_reviews(owner="owner", repo="repo", pull_number=1)
+-
+-            assert result["success"] is True
+-
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.get")
+-    def test_list_pull_request_review_comments_success(self, mock_get, mcp):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.json.return_value = [{"id": 2, "path": "src/main.ts"}]
+-        mock_get.return_value = mock_response
+-
+-        with patch("os.getenv", return_value="ghp_test"):
+-            register_tools(mcp, credentials=None)
+-            list_review_comments = mcp._tool_manager._tools[
+-                "github_list_pull_request_review_comments"
+-            ].fn
+-
+-            result = list_review_comments(owner="owner", repo="repo", pull_number=1)
+-
+-            assert result["success"] is True
+-
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+-    def test_create_pull_request_review_success(self, mock_post, mcp):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 200
+-        mock_response.json.return_value = {"id": 9, "state": "COMMENTED"}
+-        mock_post.return_value = mock_response
+-
+-        with patch("os.getenv", return_value="ghp_test"):
+-            register_tools(mcp, credentials=None)
+-            create_review = mcp._tool_manager._tools["github_create_pull_request_review"].fn
+-
+-            result = create_review(
+-                owner="owner",
+-                repo="repo",
+-                pull_number=1,
+-                body="Looks good",
+-                event="COMMENT",
+-            )
+-
+-            assert result["success"] is True
+-
+-    @patch("aden_tools.tools.github_tool.github_tool.httpx.post")
+-    def test_create_pull_request_review_comment_success(self, mock_post, mcp):
+-        mock_response = MagicMock()
+-        mock_response.status_code = 201
+-        mock_response.json.return_value = {"id": 12, "path": "src/main.ts"}
+-        mock_post.return_value = mock_response
+-
+-        with patch("os.getenv", return_value="ghp_test"):
+-            register_tools(mcp, credentials=None)
+-            create_review_comment = mcp._tool_manager._tools[
+-                "github_create_pull_request_review_comment"
+-            ].fn
+-
+-            result = create_review_comment(
+-                owner="owner",
+-                repo="repo",
+-                pull_number=1,
+-                body="Please update",
+-                commit_id="abc123",
+-                path="src/main.ts",
+-                line=12,
+-            )
+-
+-            assert result["success"] is True
+-
+ 
+ class TestGitHubSearch:
+     @pytest.fixture

@@ -1,0 +1,15 @@
+{
+  "generated_at_utc": "2026-04-25T00:13:48Z",
+  "item": 288,
+  "lane": "ND-5D",
+  "title": "Event publishing micro-lane probe",
+  "patch": "docs/ops/upstream-migration/wave15-nd5d-event-publishing.patch",
+  "scope": [
+    "core/framework/agent_loop/internals/event_publishing.py"
+  ],
+  "probe": {
+    "command": "git apply --check docs/ops/upstream-migration/wave15-nd5d-event-publishing.patch",
+    "exit_code": 0,
+    "status": "replay_ready"
+  }
+}

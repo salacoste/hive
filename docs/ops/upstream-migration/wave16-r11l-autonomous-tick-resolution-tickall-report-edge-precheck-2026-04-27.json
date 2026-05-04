@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-27T00:32:16Z",
+  "wave": "Wave16-R11L",
+  "title": "Autonomous tick-resolution + tick-all + report edge continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify tick-resolution transitions remain consistent when combined with tick-all orchestration paths",
+    "verify report continuity after tick-derived completion/failure edges in tick-all flows"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_tick_resolves_execution_completed_from_event_log",
+    "pipeline_loop_tick_resolves_execution_failed_from_event_log",
+    "pipeline_loop_tick_all_endpoint",
+    "pipeline_loop_tick_all_rejects_non_array_project_ids",
+    "pipeline_loop_run_cycle_report_endpoint",
+    "pipeline_report_endpoint"
+  ]
+}

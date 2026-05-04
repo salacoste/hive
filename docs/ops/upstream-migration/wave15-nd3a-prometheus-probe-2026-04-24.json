@@ -1,0 +1,7 @@
+{
+  "generated_at_utc": "2026-04-24T14:31:04Z",
+  "patch": "docs/ops/upstream-migration/wave15-nd3a-prometheus.patch",
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "error: patch failed: tools/src/aden_tools/credentials/health_check.py:1342\nerror: tools/src/aden_tools/credentials/health_check.py: patch does not apply\nerror: tools/src/aden_tools/credentials/prometheus.py: already exists in working directory\nerror: patch failed: tools/src/aden_tools/tools/__init__.py:106\nerror: tools/src/aden_tools/tools/__init__.py: patch does not apply\nerror: tools/src/aden_tools/tools/prometheus_tool/__init__.py: already exists in working directory\nerror: tools/src/aden_tools/tools/prometheus_tool/prometheus_tool.py: already exists in working directory\nerror: patch failed: tools/tests/test_health_checks.py:88\nerror: tools/tests/test_health_checks.py: patch does not apply\n"
+}

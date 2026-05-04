@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-25T10:48:51Z",
+  "wave": "Wave16-R9A",
+  "title": "Routes queens medium-lane kickoff precheck",
+  "scope": [
+    "core/framework/server/routes_queens.py"
+  ],
+  "observed_delta_summary": {
+    "numstat": {"add": 95, "del": 51, "total": 146},
+    "themes": [
+      "AppKey manager access migration (request.app[APP_KEY_MANAGER])",
+      "JSON body parsing hardening via _read_json_object helper",
+      "phase alias normalization and explicit phase-state application",
+      "queen session reuse/create flow adjustments with explicit queen_name attribute binding"
+    ]
+  },
+  "risk_notes": [
+    "medium API-surface lane touching queen session lifecycle endpoints",
+    "behavioral sensitivity around live-vs-cold queen session selection"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"queen\" -q",
+        "result": "pass",
+        "summary": "9 passed, 184 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      }
+    ]
+  },
+  "status": "precheck_complete"
+}

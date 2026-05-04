@@ -1,0 +1,7 @@
+{
+  "generated_at_utc": "2026-04-24T14:58:47Z",
+  "patch": "docs/ops/upstream-migration/wave15-nd3d-runtime.patch",
+  "exit_code": 1,
+  "stdout": "",
+  "stderr": "error: patch failed: tools/coder_tools_server.py:1738\nerror: tools/coder_tools_server.py: patch does not apply\n"
+}

@@ -1,0 +1,43 @@
+{
+  "generated_at_utc": "2026-04-25T11:22:41Z",
+  "wave": "Wave16-R9D",
+  "title": "Compaction behavior lane execution",
+  "scope": [
+    "core/framework/agent_loop/internals/compaction.py",
+    "core/framework/graph/event_loop/compaction.py"
+  ],
+  "reconcile_decision": {
+    "mode": "reconcile",
+    "reason": [
+      "restored runtime compatibility for preserve_user_messages path used by compact-and-fork",
+      "eliminated TypeError risk when routes_execution forwards preserve_user_messages=True",
+      "kept compaction prompt semantics aligned while adding explicit verbatim-preserve guidance in preserve mode"
+    ]
+  },
+  "changes": [
+    "added preserve_user_messages optional parameter to llm_compact, _llm_compact_split, and build_llm_compaction_prompt in both compaction modules",
+    "wired preserve_user_messages through split recursion and top-level prompt/system instructions",
+    "kept default behavior unchanged for existing callers (preserve_user_messages defaults to false)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q",
+        "result": "pass",
+        "summary": "163 passed, 4 skipped"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q",
+        "result": "pass",
+        "summary": "29 passed, 164 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9D lane closed with reconcile decision and explicit preserve_user_messages contract restoration",
+      "next candidate lane: core/framework/agent_loop/conversation.py"
+    ]
+  }
+}

@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_mcp_server_name(name: object) -> str:
+    """Normalize MCP server names for alias-safe dedupe (`_` <-> `-`)."""
+    return str(name or "").strip().replace("_", "-")
+
+
 def _project_workspace_from_metadata(project: dict[str, Any] | None) -> str | None:
     """Resolve preferred workspace path from project metadata."""
     if not isinstance(project, dict):
@@ -112,6 +117,26 @@ def _patch_mcp_server_list_for_workspace(
     return patched
 
 
+def _hydrate_queen_identity_prompt(*, session: Any, phase_state: Any) -> None:
+    """Populate phase-state identity fields from the selected queen profile."""
+    from framework.agents.queen.queen_profiles import (
+        ensure_default_queens,
+        format_queen_identity_prompt,
+        load_queen_profile,
+    )
+
+    queen_id = str(getattr(session, "queen_name", "") or "").strip() or "queen_technology"
+    try:
+        ensure_default_queens()
+        profile = load_queen_profile(queen_id)
+    except Exception:
+        logger.warning("Queen: failed to load profile for %s", queen_id, exc_info=True)
+        return
+
+    phase_state.queen_profile = profile
+    phase_state.queen_identity_prompt = format_queen_identity_prompt(profile, max_examples=1)
+
+
 async def create_queen(
     session: Session,
     session_manager: Any,
@@ -127,41 +152,11 @@ async def create_queen(
     """
     from framework.agents.queen.agent import (
         queen_goal,
-        queen_graph as _queen_graph,
+        queen_loop_config,
     )
-    from framework.agents.queen.nodes import (
-        _QUEEN_BUILDING_TOOLS,
-        _QUEEN_EDITING_TOOLS,
-        _QUEEN_PLANNING_TOOLS,
-        _QUEEN_RUNNING_TOOLS,
-        _QUEEN_STAGING_TOOLS,
-        _appendices,
-        _building_knowledge,
-        _planning_knowledge,
-        _queen_behavior_always,
-        _queen_behavior_building,
-        _queen_behavior_editing,
-        _queen_behavior_planning,
-        _queen_behavior_running,
-        _queen_behavior_staging,
-        _queen_character_core,
-        _queen_identity_editing,
-        _queen_phase_7,
-        _queen_role_building,
-        _queen_role_planning,
-        _queen_role_running,
-        _queen_role_staging,
-        _queen_style,
-        _queen_tools_building,
-        _queen_tools_editing,
-        _queen_tools_planning,
-        _queen_tools_running,
-        _queen_tools_staging,
-        _shared_building_knowledge,
-    )
-    from framework.agents.queen.nodes.thinking_hook import select_expert_persona
-    from framework.graph.event_loop_node import HookContext, HookResult
+    import framework.agents.queen.nodes as queen_nodes
     from framework.graph.executor import GraphExecutor
+    from framework.orchestrator.edge import GraphSpec
     from framework.runner.mcp_registry import MCPRegistry
     from framework.runner.tool_registry import ToolRegistry
     from framework.runtime.core import Runtime
@@ -171,6 +166,51 @@ async def create_queen(
         register_queen_lifecycle_tools,
     )
 
+    # Compatibility shim:
+    # The queen nodes module evolved from a legacy 5-phase symbol set
+    # (planning/building/staging/running/editing) to a newer 4-phase set
+    # (independent/incubating/working/reviewing). Keep create_queen resilient
+    # by resolving legacy symbols first, then falling back to the new names.
+    def _node_attr(*names: str, default: Any) -> Any:
+        for name in names:
+            if hasattr(queen_nodes, name):
+                return getattr(queen_nodes, name)
+        return default
+
+    _QUEEN_PLANNING_TOOLS = _node_attr("_QUEEN_PLANNING_TOOLS", "_QUEEN_INDEPENDENT_TOOLS", default=[])
+    _QUEEN_BUILDING_TOOLS = _node_attr("_QUEEN_BUILDING_TOOLS", "_QUEEN_INCUBATING_TOOLS", default=[])
+    _QUEEN_STAGING_TOOLS = _node_attr("_QUEEN_STAGING_TOOLS", "_QUEEN_REVIEWING_TOOLS", default=[])
+    _QUEEN_RUNNING_TOOLS = _node_attr("_QUEEN_RUNNING_TOOLS", "_QUEEN_WORKING_TOOLS", default=[])
+    _QUEEN_EDITING_TOOLS = _node_attr("_QUEEN_EDITING_TOOLS", "_QUEEN_REVIEWING_TOOLS", default=[])
+
+    _queen_character_core = _node_attr("_queen_character_core", default="")
+    _queen_style = _node_attr("_queen_style", default="")
+    _queen_behavior_always = _node_attr("_queen_behavior_always", default="")
+    _queen_role_planning = _node_attr("_queen_role_planning", "_queen_role_independent", default="")
+    _queen_role_building = _node_attr("_queen_role_building", "_queen_role_incubating", default="")
+    _queen_role_staging = _node_attr("_queen_role_staging", "_queen_role_reviewing", default="")
+    _queen_role_running = _node_attr("_queen_role_running", "_queen_role_working", default="")
+    _queen_identity_editing = _node_attr("_queen_identity_editing", "_queen_role_reviewing", default="")
+
+    _queen_tools_planning = _node_attr("_queen_tools_planning", "_queen_tools_independent", default="")
+    _queen_tools_building = _node_attr("_queen_tools_building", "_queen_tools_incubating", default="")
+    _queen_tools_staging = _node_attr("_queen_tools_staging", "_queen_tools_reviewing", default="")
+    _queen_tools_running = _node_attr("_queen_tools_running", "_queen_tools_working", default="")
+    _queen_tools_editing = _node_attr("_queen_tools_editing", "_queen_tools_reviewing", default="")
+
+    _queen_behavior_planning = _node_attr("_queen_behavior_planning", "_queen_behavior_independent", default="")
+    _queen_behavior_building = _node_attr("_queen_behavior_building", "_queen_behavior_independent", default="")
+    _queen_behavior_staging = _node_attr("_queen_behavior_staging", "_queen_behavior_independent", default="")
+    _queen_behavior_running = _node_attr("_queen_behavior_running", "_queen_behavior_independent", default="")
+    _queen_behavior_editing = _node_attr("_queen_behavior_editing", "_queen_behavior_independent", default="")
+
+    _planning_knowledge = _node_attr("_planning_knowledge", "_queen_memory_instructions", default="")
+    _shared_building_knowledge = _node_attr("_shared_building_knowledge", "_queen_memory_instructions", default="")
+    _building_knowledge = _node_attr("_building_knowledge", default="")
+    _queen_phase_7 = _node_attr("_queen_phase_7", default="")
+    _appendices = _node_attr("_appendices", default="")
+    queen_node = _node_attr("queen_node", default=None)
+
     hive_home = Path.home() / ".hive"
 
     # ---- Tool registry ------------------------------------------------
@@ -179,6 +219,7 @@ async def create_queen(
 
     queen_pkg_dir = Path(_queen_pkg.__file__).parent
     mcp_config = queen_pkg_dir / "mcp_servers.json"
+    loaded_from_config: set[str] = set()
     if mcp_config.exists():
         try:
             with open(mcp_config, encoding="utf-8") as f:
@@ -204,6 +245,11 @@ async def create_queen(
                 queen_registry._resolve_mcp_server_config(server_config, mcp_config.parent)
                 for server_config in server_list
             ]
+            loaded_from_config = {
+                _normalize_mcp_server_name(server.get("name"))
+                for server in resolved_server_list
+                if str(server.get("name") or "").strip()
+            }
             queen_registry.load_registry_servers(
                 resolved_server_list,
                 log_summary=False,
@@ -217,9 +263,34 @@ async def create_queen(
     try:
         registry = MCPRegistry()
         registry.initialize()
+        # Ensure built-in local MCP servers are present in fresh environments
+        # (notably Docker) before resolving mcp_registry.json selections.
+        if hasattr(registry, "ensure_defaults"):
+            try:
+                registry.ensure_defaults()
+            except Exception:
+                logger.debug("Queen: MCP ensure_defaults failed", exc_info=True)
         if (queen_pkg_dir / "mcp_registry.json").is_file():
             queen_registry.set_mcp_registry_agent_path(queen_pkg_dir)
         registry_configs, selection_max_tools = registry.load_agent_selection(queen_pkg_dir)
+        if registry_configs:
+            # Avoid loading the same server twice when both static mcp_servers.json and
+            # registry selection reference it (including underscore/dash aliases).
+            filtered_registry_configs: list[dict[str, Any]] = []
+            skipped_registry_names: list[str] = []
+            for server in registry_configs:
+                raw_name = str(server.get("name") or "").strip()
+                norm_name = _normalize_mcp_server_name(raw_name)
+                if norm_name and norm_name in loaded_from_config:
+                    skipped_registry_names.append(raw_name)
+                    continue
+                filtered_registry_configs.append(server)
+            if skipped_registry_names:
+                logger.info(
+                    "Queen: skipped duplicate MCP registry servers already loaded from mcp_servers.json: %s",
+                    sorted(set(skipped_registry_names)),
+                )
+            registry_configs = filtered_registry_configs
         if registry_configs:
             results = queen_registry.load_registry_servers(
                 registry_configs,
@@ -235,6 +306,7 @@ async def create_queen(
     initial_phase = "staging" if worker_identity else "planning"
     phase_state = QueenPhaseState(phase=initial_phase, event_bus=session.event_bus)
     session.phase_state = phase_state
+    _hydrate_queen_identity_prompt(session=session, phase_state=phase_state)
 
     # ---- Track ask rounds during planning ----------------------------
     # Increment planning_ask_rounds each time the queen requests user
@@ -346,7 +418,7 @@ async def create_queen(
     )
 
     # ---- Compose phase-specific prompts ------------------------------
-    _orig_node = _queen_graph.nodes[0]
+    _orig_node = queen_node
 
     if worker_identity is None:
         worker_identity = (
@@ -426,51 +498,6 @@ async def create_queen(
     except Exception:
         logger.debug("Queen skill loading failed (non-fatal)", exc_info=True)
 
-    # ---- Persona hook ------------------------------------------------
-    _session_llm = session.llm
-    _session_event_bus = session.event_bus
-
-    async def _persona_hook(ctx: HookContext) -> HookResult | None:
-        from framework.agents.queen.queen_memory import format_for_injection
-
-        memory_context = format_for_injection()
-        result = await select_expert_persona(
-            ctx.trigger or "", _session_llm, memory_context=memory_context
-        )
-        if not result:
-            return None
-        # Store on phase_state so persona/style persist across dynamic prompt refreshes
-        phase_state.persona_prefix = result.persona_prefix
-        phase_state.style_directive = result.style_directive
-        if _session_event_bus is not None:
-            await _session_event_bus.publish(
-                AgentEvent(
-                    type=EventType.QUEEN_PERSONA_SELECTED,
-                    stream_id="queen",
-                    data={"persona": result.persona_prefix},
-                )
-            )
-
-        # Seed global recall block from the initial trigger so first turn starts
-        # with relevant global memory context.
-        trigger = ctx.trigger or ""
-        if trigger:
-            try:
-                from framework.agents.queen.recall_selector import (
-                    format_recall_injection,
-                    select_memories,
-                )
-
-                selected = await select_memories(trigger, _session_llm, global_dir)
-                phase_state._cached_global_recall_block = format_recall_injection(
-                    selected,
-                    global_dir,
-                    heading="Global Memories",
-                )
-            except Exception:
-                logger.debug("recall: initial seeding failed", exc_info=True)
-        return HookResult(system_prompt=phase_state.get_current_prompt())
-
     # ---- Graph preparation -------------------------------------------
     initial_prompt_text = phase_state.get_current_prompt()
 
@@ -493,12 +520,20 @@ async def create_queen(
         node_updates["tools"] = available_tools
 
     adjusted_node = _orig_node.model_copy(update=node_updates)
-    _queen_loop_config = {
-        **(_queen_graph.loop_config or {}),
-        "hooks": {"session_start": [_persona_hook]},
-    }
-    queen_graph = _queen_graph.model_copy(
-        update={"nodes": [adjusted_node], "loop_config": _queen_loop_config}
+    _queen_loop_config = dict(queen_loop_config or {})
+    queen_graph = GraphSpec(
+        id="queen-graph",
+        goal_id=queen_goal.id,
+        version="1.0.0",
+        entry_node=adjusted_node.id,
+        entry_points={"default": adjusted_node.id},
+        terminal_nodes=[],
+        pause_nodes=[],
+        nodes=[adjusted_node],
+        edges=[],
+        loop_config=_queen_loop_config,
+        description="Queen runtime graph",
+        created_by="system",
     )
 
     # ---- Queen event loop --------------------------------------------
@@ -590,8 +625,9 @@ async def create_queen(
                 session.event_bus,
                 queen_dir,
                 session.llm,
-                memory_dir=colony_dir,
-                phase_state=phase_state,
+                global_memory_dir=global_dir,
+                queen_memory_dir=colony_dir,
+                queen_id=getattr(session, "queen_name", None),
             )
 
             # Store sub IDs on session for teardown.

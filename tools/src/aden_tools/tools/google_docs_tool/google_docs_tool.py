@@ -24,8 +24,6 @@ from urllib.parse import urlparse
 import httpx
 from fastmcp import FastMCP
 
-from aden_tools.tools.google_auth import get_google_access_token_from_env_or_file
-
 if TYPE_CHECKING:
     from aden_tools.credentials import CredentialStoreAdapter
 
@@ -393,7 +391,7 @@ def register_tools(
             if token is not None and not isinstance(token, str):
                 raise TypeError(f"Expected string from credentials.get('google'), got {type(token).__name__}")
             return token
-        return get_google_access_token_from_env_or_file()
+        return os.getenv("GOOGLE_ACCESS_TOKEN")
 
     def _get_client(account: str = "") -> _GoogleDocsClient | dict[str, str]:
         """Get a Google Docs client, or return an error dict if no credentials."""

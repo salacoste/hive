@@ -1,0 +1,24 @@
+{
+  "generated_at_utc": "2026-04-27T11:07:46Z",
+  "wave": "Wave16-R12H",
+  "title": "Autonomous wave transition stabilization checkpoint lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify transition stabilization checkpoint continuity across run-cycle/tick/evaluate/auto-next/report",
+    "prepare bounded checkpoint before next transition lane expansion"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_run_cycle_report_endpoint",
+    "pipeline_loop_run_cycle_summary_outcomes",
+    "pipeline_loop_tick_all_endpoint",
+    "pipeline_loop_tick_resolves_execution_failed_from_event_log",
+    "pipeline_dispatch_next_rejects_when_active_run_exists",
+    "pipeline_evaluate_endpoint_uses_checks_and_updates_report",
+    "pipeline_evaluate_github_endpoint",
+    "pipeline_auto_next_endpoint",
+    "pipeline_report_endpoint"
+  ]
+}

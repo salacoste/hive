@@ -20,6 +20,7 @@ import re
 import time
 import uuid
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -45,6 +46,7 @@ class TelegramBridge:
     MENU_PROJECTS = "Projects"
     MENU_TOOLCHAIN = "Toolchain"
     MENU_CREDENTIALS = "Credentials"
+    MENU_BEES = "Bees"
 
     def __init__(self, session_manager: Any) -> None:
         self._manager = session_manager
@@ -76,6 +78,35 @@ class TelegramBridge:
         self._poller_owner = False
         self._startup_status = "idle"
         self._last_poll_error: str | None = None
+        self._poll_conflict_409_count = 0
+        self._last_poll_conflict_409_at: float | None = None
+        self._last_poll_conflict_recover_at: float | None = None
+        self._last_poll_conflict_recover_result: str | None = None
+        self._auto_clear_webhook_on_409 = (
+            os.environ.get("HIVE_TELEGRAM_AUTO_CLEAR_WEBHOOK_ON_409", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
+        try:
+            self._poll_conflict_recover_cooldown_seconds = int(
+                os.environ.get("HIVE_TELEGRAM_CONFLICT_RECOVER_COOLDOWN_SECONDS", "120").strip() or "120"
+            )
+        except ValueError:
+            self._poll_conflict_recover_cooldown_seconds = 120
+        self._poll_conflict_recover_cooldown_seconds = max(10, self._poll_conflict_recover_cooldown_seconds)
+        try:
+            self._poll_conflict_warn_threshold = int(
+                os.environ.get("HIVE_TELEGRAM_CONFLICT_WARN_THRESHOLD", "3").strip() or "3"
+            )
+        except ValueError:
+            self._poll_conflict_warn_threshold = 3
+        self._poll_conflict_warn_threshold = max(1, self._poll_conflict_warn_threshold)
+        try:
+            self._poll_conflict_warn_window_seconds = int(
+                os.environ.get("HIVE_TELEGRAM_CONFLICT_WARN_WINDOW_SECONDS", "3600").strip() or "3600"
+            )
+        except ValueError:
+            self._poll_conflict_warn_window_seconds = 3600
+        self._poll_conflict_warn_window_seconds = max(60, self._poll_conflict_warn_window_seconds)
 
         self._offset = 0
         self._poll_task: asyncio.Task | None = None
@@ -111,11 +142,20 @@ class TelegramBridge:
         self._autonomous_digest_hour = max(0, min(23, self._autonomous_digest_hour))
         self._autonomous_digest_minute = 0
         self._autonomous_last_sent_key: dict[str, str] = {}
+        self._acceptance_gate_results_path = os.path.expanduser(
+            os.environ.get(
+                "HIVE_ACCEPTANCE_GATE_SHARED_JSON_PATH",
+                "~/.hive/server/acceptance/gate-latest.json",
+            ).strip()
+            or "~/.hive/server/acceptance/gate-latest.json"
+        )
 
         # chat_id -> session_id
         self._chat_session: dict[str, str] = {}
         # chat_id -> project_id
         self._chat_project: dict[str, str] = {}
+        # chat_id -> preferred queen_id
+        self._chat_queen: dict[str, str] = {}
         # session_id -> set(chat_id)
         self._session_chats: dict[str, set[str]] = defaultdict(set)
 
@@ -150,6 +190,10 @@ class TelegramBridge:
         self._menu_visible: dict[str, bool] = {}
         # known chats for proactive reminders
         self._known_chats: set[str] = set()
+        self._default_queen_id = (
+            os.environ.get("HIVE_TELEGRAM_DEFAULT_QUEEN_ID", "queen_technology").strip()
+            or "queen_technology"
+        )
 
     def _default_project_id(self) -> str:
         return self._manager.default_project_id()
@@ -159,6 +203,13 @@ class TelegramBridge:
 
     def _set_project_for_chat(self, chat_id: str, project_id: str) -> None:
         self._chat_project[chat_id] = project_id
+        self._persist_state()
+
+    def _selected_queen_id(self, chat_id: str) -> str:
+        return self._chat_queen.get(chat_id, self._default_queen_id)
+
+    def _set_queen_for_chat(self, chat_id: str, queen_id: str) -> None:
+        self._chat_queen[chat_id] = queen_id
         self._persist_state()
 
     @property
@@ -191,6 +242,7 @@ class TelegramBridge:
             return
 
         self._load_persistent_state()
+        self._backfill_bound_session_identities()
         self._client = ClientSession()
         self._stopped.clear()
         await self._ensure_bot_commands()
@@ -206,6 +258,31 @@ class TelegramBridge:
             )
         self._startup_status = "running"
         logger.info("Telegram bridge started")
+
+    def _backfill_bound_session_identities(self) -> None:
+        """Ensure restored chat-bound sessions have queen identity for Web UI."""
+        touched = 0
+        state_changed = False
+        for chat_id, sid in list(self._chat_session.items()):
+            self._persist_default_queen_to_meta(str(sid))
+            session = self._manager.get_session(sid)
+            if session is None:
+                if chat_id not in self._chat_queen:
+                    self._chat_queen[chat_id] = self._default_queen_id
+                    state_changed = True
+                continue
+            before = getattr(session, "queen_name", None)
+            self._ensure_default_queen_identity(session)
+            after = getattr(session, "queen_name", None)
+            if after and self._chat_queen.get(chat_id) != str(after):
+                self._chat_queen[chat_id] = str(after)
+                state_changed = True
+            if not before and after:
+                touched += 1
+        if touched:
+            logger.info("Telegram bridge backfilled queen identity for %d bound sessions", touched)
+        if state_changed:
+            self._persist_state()
 
     async def stop(self) -> None:
         """Stop background tasks and clean subscriptions."""
@@ -264,6 +341,8 @@ class TelegramBridge:
             {"command": "sessions", "description": "List active sessions"},
             {"command": "session", "description": "Bind chat to session id"},
             {"command": "new", "description": "Create and bind new session"},
+            {"command": "bees", "description": "List available bees/queens"},
+            {"command": "bee", "description": "Switch active bee for new chat session"},
             {"command": "run", "description": "Run worker default entry"},
             {"command": "stop", "description": "Stop active worker runs"},
             {"command": "cancel", "description": "Cancel current queen turn"},
@@ -274,6 +353,7 @@ class TelegramBridge:
             {"command": "toolchain_plan", "description": "Plan toolchain profile (optional source arg)"},
             {"command": "toolchain_approve", "description": "Approve pending toolchain token"},
             {"command": "credentials", "description": "Credential readiness report"},
+            {"command": "intake_template", "description": "Show autonomous task intake template"},
             {"command": "toggle", "description": "Toggle button menu"},
             {"command": "help", "description": "Show usage help"},
         ]
@@ -317,6 +397,9 @@ class TelegramBridge:
                 [
                     TelegramBridge.MENU_TOOLCHAIN,
                     TelegramBridge.MENU_CREDENTIALS,
+                ],
+                [
+                    TelegramBridge.MENU_BEES,
                     TelegramBridge.MENU_TOGGLE,
                 ],
             ],
@@ -414,19 +497,226 @@ class TelegramBridge:
         self._session_chats[session_id].add(chat_id)
         session = self._manager.get_session(session_id)
         if session is not None:
+            queen_id = str(getattr(session, "queen_name", "") or "").strip()
+            if queen_id:
+                self._set_queen_for_chat(chat_id, queen_id)
+            self._ensure_default_queen_identity(session)
             self._set_project_for_chat(chat_id, getattr(session, "project_id", self._default_project_id()))
 
         # Reset duplicate guards when switching sessions.
         self._last_sent.pop((chat_id, session_id), None)
         self._last_input_sig.pop((chat_id, session_id), None)
         self._remember_chat(chat_id)
+        logger.info(
+            "Telegram bridge bound chat=%s session=%s project=%s queen=%s prev=%s",
+            chat_id,
+            session_id,
+            self._selected_project_id(chat_id),
+            self._selected_queen_id(chat_id),
+            prev or "-",
+        )
         self._persist_state()
 
-    def _chats_for_session(self, session_id: str) -> set[str]:
-        """Return bound chats for a session, with optional test-chat fallback auto-bind."""
+    def _ensure_queen_identity(self, session: Any, queen_id: str) -> None:
+        """Attach explicit queen identity to bridge sessions for Web UI continuity."""
+        if session is None:
+            return
+        resolved = str(queen_id or "").strip() or self._default_queen_id
+        current = str(getattr(session, "queen_name", "") or "").strip()
+        if current == resolved:
+            return
+        setattr(session, "queen_name", resolved)
+        storage_session_id = getattr(session, "queen_resume_from", None) or getattr(session, "id", "")
+        if storage_session_id:
+            self._persist_queen_to_meta(str(storage_session_id), resolved)
+
+    def _ensure_default_queen_identity(self, session: Any) -> None:
+        """Attach default queen identity when no explicit queen is set."""
+        if session is None:
+            return
+        if getattr(session, "queen_name", None):
+            return
+        self._ensure_queen_identity(session, self._default_queen_id)
+
+    def _persist_queen_to_meta(self, session_id: str, queen_id: str) -> None:
+        """Persist queen id into session meta for cold history views."""
+        if not session_id:
+            return
+        meta_path = Path.home() / ".hive" / "queen" / "session" / session_id / "meta.json"
+        try:
+            meta: dict[str, Any] = {}
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if not isinstance(meta, dict):
+                    meta = {}
+            meta["queen_id"] = str(queen_id or "").strip() or self._default_queen_id
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        except Exception:
+            logger.debug(
+                "Failed to persist queen identity for session %s",
+                session_id,
+                exc_info=True,
+            )
+
+    def _persist_default_queen_to_meta(self, session_id: str) -> None:
+        self._persist_queen_to_meta(session_id, self._default_queen_id)
+
+    async def _create_bridge_session(
+        self,
+        *,
+        project_id: str,
+        queen_id: str | None = None,
+    ) -> Any:
+        session = await self._manager.create_session(project_id=project_id)
+        self._ensure_queen_identity(session, str(queen_id or "").strip() or self._default_queen_id)
+        return session
+
+    async def _resume_bridge_session(
+        self,
+        *,
+        chat_id: str,
+        stale_session_id: str,
+        queen_id: str | None = None,
+    ) -> Any | None:
+        """Try to restore a stale chat binding via queen_resume_from.
+
+        Returns resumed session on success, or ``None`` to let caller create a
+        fresh session as fallback.
+        """
+        resume_from = str(stale_session_id or "").strip()
+        if not resume_from:
+            return None
+        try:
+            session = await self._manager.create_session(queen_resume_from=resume_from)
+        except TypeError:
+            logger.debug(
+                "Telegram bridge manager.create_session() does not support queen_resume_from; stale=%s",
+                resume_from,
+            )
+            return None
+        except Exception:
+            logger.info(
+                "Telegram bridge failed to resume stale session=%s for chat=%s",
+                resume_from,
+                chat_id,
+                exc_info=True,
+            )
+            return None
+        self._ensure_queen_identity(session, str(queen_id or "").strip() or self._default_queen_id)
+        logger.info(
+            "Telegram bridge resumed stale binding chat=%s session=%s",
+            chat_id,
+            getattr(session, "id", resume_from),
+        )
+        return session
+
+    def _available_queens(self) -> list[dict[str, str]]:
+        from framework.agents.queen.queen_profiles import ensure_default_queens, list_queens
+
+        ensure_default_queens()
+        queens = list_queens()
+        out: list[dict[str, str]] = []
+        for item in queens:
+            if not isinstance(item, dict):
+                continue
+            qid = str(item.get("id") or "").strip()
+            if not qid:
+                continue
+            out.append(
+                {
+                    "id": qid,
+                    "name": str(item.get("name") or qid).strip(),
+                    "title": str(item.get("title") or "").strip(),
+                }
+            )
+        if not out:
+            out.append({"id": self._default_queen_id, "name": self._default_queen_id, "title": ""})
+        return out
+
+    def _resolve_known_queen_id(self, candidate: str | None) -> str:
+        desired = str(candidate or "").strip()
+        known = {row["id"] for row in self._available_queens()}
+        if desired and desired in known:
+            return desired
+        return self._default_queen_id if self._default_queen_id in known else sorted(known)[0]
+
+    def _is_known_queen_id(self, candidate: str | None) -> bool:
+        desired = str(candidate or "").strip()
+        if not desired:
+            return False
+        return desired in {row["id"] for row in self._available_queens()}
+
+    async def _classify_queen_for_message(self, message: str) -> str:
+        from framework.agents.queen.queen_profiles import select_queen
+
+        text = str(message or "").strip()
+        if not text:
+            return self._resolve_known_queen_id(None)
+        try:
+            llm = self._manager.build_llm()
+            candidate = await select_queen(text, llm)
+            return self._resolve_known_queen_id(candidate)
+        except Exception:
+            logger.warning("Telegram bridge queen classification failed; falling back to default.", exc_info=True)
+            return self._resolve_known_queen_id(None)
+
+    async def _choose_queen_for_new_binding(
+        self,
+        chat_id: str,
+        *,
+        first_user_message: str | None = None,
+    ) -> str:
+        preferred = self._chat_queen.get(chat_id)
+        if preferred:
+            return self._resolve_known_queen_id(preferred)
+        if first_user_message:
+            chosen = await self._classify_queen_for_message(first_user_message)
+            self._set_queen_for_chat(chat_id, chosen)
+            return chosen
+        chosen = self._resolve_known_queen_id(None)
+        self._set_queen_for_chat(chat_id, chosen)
+        return chosen
+
+    def _auto_rebind_chats_to_session(self, session_id: str) -> set[str]:
+        """Rebind chats to a live session when project+queen identity matches.
+
+        This is primarily used for Web-originated activity where Web can move to a
+        new live session while Telegram still points to an older session id.
+        """
+        target = self._manager.get_session(session_id)
+        if target is None:
+            return set()
+        target_project = str(getattr(target, "project_id", self._default_project_id()) or self._default_project_id())
+        target_queen = str(getattr(target, "queen_name", "") or "").strip() or self._default_queen_id
+        rebound: set[str] = set()
+        for chat_id, bound_sid in list(self._chat_session.items()):
+            if str(bound_sid) == session_id:
+                rebound.add(chat_id)
+                continue
+            if self._selected_project_id(chat_id) != target_project:
+                continue
+            if self._selected_queen_id(chat_id) != target_queen:
+                continue
+            self._bind_chat(chat_id, session_id)
+            rebound.add(chat_id)
+        if rebound:
+            logger.info(
+                "Telegram bridge auto-rebound %d chat(s) to session=%s by project+queen identity",
+                len(rebound),
+                session_id,
+            )
+        return rebound
+
+    def _chats_for_session(self, session_id: str, *, source: str | None = None) -> set[str]:
+        """Return bound chats for a session, with optional auto-rebind and test-chat fallback."""
         chats = self._session_chats.get(session_id, set())
         if chats:
             return chats
+        if str(source or "").strip().lower() == "web":
+            rebound = self._auto_rebind_chats_to_session(session_id)
+            if rebound:
+                return self._session_chats.get(session_id, rebound)
         fallback_chat_id = os.environ.get("HIVE_TELEGRAM_TEST_CHAT_ID", "").strip()
         if not fallback_chat_id:
             return chats
@@ -438,6 +728,7 @@ class TelegramBridge:
             state = {
                 "chat_session": dict(self._chat_session),
                 "chat_project": dict(self._chat_project),
+                "chat_queen": dict(self._chat_queen),
                 "menu_visible": dict(self._menu_visible),
                 "known_chats": sorted(self._known_chats),
                 "updated_at": time.time(),
@@ -475,6 +766,13 @@ class TelegramBridge:
                     project_id = str(project_id_raw).strip()
                     if chat_id and project_id:
                         self._chat_project[chat_id] = project_id
+            chat_queen = data.get("chat_queen")
+            if isinstance(chat_queen, dict):
+                for chat_id_raw, queen_id_raw in chat_queen.items():
+                    chat_id = str(chat_id_raw).strip()
+                    queen_id = str(queen_id_raw).strip()
+                    if chat_id and queen_id:
+                        self._chat_queen[chat_id] = queen_id
             menu_visible = data.get("menu_visible")
             if isinstance(menu_visible, dict):
                 for chat_id_raw, visible_raw in menu_visible.items():
@@ -515,28 +813,58 @@ class TelegramBridge:
         sid = self._pick_default_session()
         if sid:
             return sid
-        session = await self._manager.create_session(project_id=self._default_project_id())
+        session = await self._create_bridge_session(project_id=self._default_project_id())
         return session.id
 
-    async def _ensure_session_for_project(self, project_id: str) -> str:
+    async def _ensure_session_for_project(
+        self,
+        project_id: str,
+        *,
+        queen_id: str | None = None,
+    ) -> str:
         sid = self._pick_default_session_for_project(project_id)
         if sid:
             return sid
-        session = await self._manager.create_session(project_id=project_id)
+        session = await self._create_bridge_session(project_id=project_id, queen_id=queen_id)
         return session.id
 
-    async def _ensure_bound_session(self, chat_id: str) -> tuple[str, Any]:
+    async def _ensure_bound_session(
+        self,
+        chat_id: str,
+        *,
+        first_user_message: str | None = None,
+    ) -> tuple[str, Any]:
         session_id = self._chat_session.get(chat_id)
         if not session_id:
             project_id = self._selected_project_id(chat_id)
-            session_id = await self._ensure_session_for_project(project_id)
+            queen_id = await self._choose_queen_for_new_binding(
+                chat_id,
+                first_user_message=first_user_message,
+            )
+            session = await self._create_bridge_session(project_id=project_id, queen_id=queen_id)
+            session_id = session.id
             self._bind_chat(chat_id, session_id)
 
         session = self._manager.get_session(session_id)
         if session is None:
-            session = await self._manager.create_session(project_id=self._selected_project_id(chat_id))
-            session_id = session.id
+            fallback_queen = self._selected_queen_id(chat_id)
+            resumed = await self._resume_bridge_session(
+                chat_id=chat_id,
+                stale_session_id=session_id,
+                queen_id=fallback_queen,
+            )
+            if resumed is not None:
+                session = resumed
+                session_id = resumed.id
+            else:
+                session = await self._create_bridge_session(
+                    project_id=self._selected_project_id(chat_id),
+                    queen_id=fallback_queen,
+                )
+                session_id = session.id
             self._bind_chat(chat_id, session_id)
+        else:
+            self._ensure_default_queen_identity(session)
 
         # Ensure this session is subscribed immediately, so Web-originated
         # user input is mirrored to bound Telegram chats without waiting
@@ -550,7 +878,11 @@ class TelegramBridge:
         return session_id, session
 
     async def _inject_user_input(self, chat_id: str, text: str) -> None:
-        session_id, session = await self._ensure_bound_session(chat_id)
+        first_message = text if chat_id not in self._chat_session else None
+        session_id, session = await self._ensure_bound_session(
+            chat_id,
+            first_user_message=first_message,
+        )
 
         node = await self._await_queen_node(session, timeout_s=10.0)
         if node is None:
@@ -697,6 +1029,7 @@ class TelegramBridge:
             "Hive Telegram Control Center\n\n"
             f"Project: {project_id}\n"
             f"Current session: {sid}\n"
+            f"Bee: {self._selected_queen_id(chat_id)}\n"
             f"Worker loaded: {'yes' if has_worker else 'no'}\n\n"
             "How to use:\n"
             "1) Send any text to chat with queen.\n"
@@ -708,14 +1041,45 @@ class TelegramBridge:
             "/repo <url|owner/repo> /onboard [stack=<..>] [template_id=<..>] [workspace_path=<..>]\n"
             "/bootstrap newrepo <name> [owner=<org>] [visibility=<..>] --task <goal> [--title <..>] [--criteria a|b|c]\n"
             "/bootstrap repo <url|owner/repo> --task <goal> [--title <..>] [--criteria a|b|c]\n"
-            "/menu /help /status /sessions /session <id> /new\n"
+            "/menu /help /status /sessions /session <id> /new /bees /bee <queen_id>\n"
             "/run /stop /cancel /retention /digest /autodigest\n"
             "/toolchain /toolchain_plan [workspace|repo-url] /toolchain_approve [token]\n"
             "/credentials (/creds)\n"
+            "/intake_template\n"
             "/hide /show /toggle"
         )
         markup = self._main_reply_keyboard() if self._is_menu_visible(chat_id) else None
         await self._send_text(chat_id, text, reply_markup=markup)
+
+    async def _send_intake_template(self, chat_id: str) -> None:
+        text = (
+            "Autonomous Task Intake Template\n\n"
+            "Required fields:\n"
+            "- title\n"
+            "- goal\n"
+            "- acceptance_criteria[]\n"
+            "- constraints[]\n"
+            "- delivery_mode (patch_only | pr_only | patch_and_pr)\n\n"
+            "Example JSON:\n"
+            "{\n"
+            '  "title": "Fix redirect downgrade in API wrapper",\n'
+            '  "goal": "Preserve HTTP method on redirects and verify with regression tests",\n'
+            '  "acceptance_criteria": [\n'
+            '    "POST request method preserved across redirect path",\n'
+            '    "Regression tests added and passing"\n'
+            "  ],\n"
+            '  "constraints": [\n'
+            '    "container-first execution",\n'
+            '    "no dependency updates without approval"\n'
+            "  ],\n"
+            '  "delivery_mode": "patch_and_pr"\n'
+            "}\n\n"
+            "Validation API:\n"
+            "POST /api/autonomous/backlog/intake/validate\n"
+            "Template API:\n"
+            "GET /api/autonomous/backlog/intake/template"
+        )
+        await self._send_text(chat_id, text, reply_markup=self._main_reply_keyboard() if self._is_menu_visible(chat_id) else None)
 
     def _project_retention_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -845,18 +1209,47 @@ class TelegramBridge:
         outcomes = summary.get("outcomes", {}) if isinstance(summary, dict) else {}
         projects = data.get("projects", []) if isinstance(data, dict) else []
         highlights = data.get("highlights", {}) if isinstance(data, dict) else {}
+        matrix_snapshot = self._read_release_matrix_snapshot()
+        conflict_kpi = self._conflict_kpi_snapshot()
         if proactive and isinstance(outcomes, dict):
             noisy = int(outcomes.get("failed", 0)) + int(outcomes.get("escalated", 0)) + int(outcomes.get("manual_deferred", 0))
-            if noisy <= 0:
+            matrix_risky = bool(
+                matrix_snapshot and str(matrix_snapshot.get("status") or "").lower() not in {"", "pass"}
+            )
+            conflict_risky = bool(conflict_kpi.get("warning"))
+            if noisy <= 0 and not matrix_risky and not conflict_risky:
                 return False
 
         lines = ["Autonomous cycle digest", ""]
         lines.append(
             f"projects={summary.get('projects_total', 0)} ok={summary.get('ok', 0)} failed={summary.get('failed', 0)}"
         )
+        if matrix_snapshot:
+            lines.append(
+                "release_matrix: "
+                f"{matrix_snapshot['status']} (must {matrix_snapshot['must_passed']}/{matrix_snapshot['must_total']})"
+            )
+            generated_at = str(matrix_snapshot.get("generated_at") or "").strip()
+            if generated_at:
+                lines.append(f"release_matrix_at: {generated_at}")
         if isinstance(outcomes, dict) and outcomes:
             pairs = [f"{k}:{v}" for k, v in sorted(outcomes.items(), key=lambda item: str(item[0]))]
             lines.append("outcomes: " + ", ".join(pairs))
+        conflict_count = int(conflict_kpi.get("count") or 0)
+        conflict_last = int(conflict_kpi.get("last_seen_age_seconds") or -1)
+        conflict_recover = str(conflict_kpi.get("last_recover_result") or "none")
+        if conflict_last >= 0:
+            lines.append(
+                f"telegram_conflicts_409: count={conflict_count}, last_seen={conflict_last}s_ago, last_recover={conflict_recover}"
+            )
+        else:
+            lines.append(f"telegram_conflicts_409: count={conflict_count}, last_seen=never, last_recover={conflict_recover}")
+        if bool(conflict_kpi.get("warning")):
+            window_min = int(int(conflict_kpi.get("window_seconds") or 0) / 60)
+            lines.append(
+                "warning=telegram 409 conflicts rising "
+                f"(count>={int(conflict_kpi.get('threshold') or 0)} within {window_min}m)"
+            )
         ready = highlights.get("terminal_ready_projects", []) if isinstance(highlights, dict) else []
         blocked = highlights.get("blocked_projects", []) if isinstance(highlights, dict) else []
         deferred = highlights.get("manual_deferred_projects", []) if isinstance(highlights, dict) else []
@@ -894,6 +1287,30 @@ class TelegramBridge:
 
         await self._send_text(chat_id, "\n".join(lines))
         return True
+
+    def _read_release_matrix_snapshot(self) -> dict[str, Any] | None:
+        path = Path(self._acceptance_gate_results_path)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        matrix = payload.get("release_matrix")
+        if not isinstance(matrix, dict):
+            return None
+        status = str(matrix.get("status") or "unknown").strip().lower() or "unknown"
+        must_passed = int(matrix.get("must_passed") or 0)
+        must_total = int(matrix.get("must_total") or 0)
+        generated_at = str(payload.get("generated_at") or "").strip()
+        return {
+            "status": status,
+            "must_passed": must_passed,
+            "must_total": must_total,
+            "generated_at": generated_at,
+        }
 
     def _core_api_base(self) -> str:
         base = os.environ.get("HIVE_TELEGRAM_LOCAL_API_BASE", "").strip()
@@ -1798,11 +2215,13 @@ class TelegramBridge:
         available_triggers = len(getattr(session, "available_triggers", {}) or {})
         active_triggers = len(getattr(session, "active_trigger_ids", set()) or set())
         docker_lane_line = await self._docker_lane_status_line(chat_id, project_id=project_id)
+        active_bee = str(getattr(session, "queen_name", "") or "").strip() or self._selected_queen_id(chat_id)
 
         text = (
             "Session status\n\n"
             f"Project: {project_id}\n"
             f"Session: {session_id}\n"
+            f"Bee: {active_bee}\n"
             f"Phase: {phase}\n"
             f"Graph: {graph_id}\n"
             f"Worker loaded: {'yes' if session.graph_runtime else 'no'}\n"
@@ -1818,7 +2237,7 @@ class TelegramBridge:
                 [("▶️ Run", "run_worker", None), ("⏹ Stop", "stop_worker", None)],
                 [("🗂 Retention", "show_retention", None), ("📦 Digest", "show_digest", None)],
                 [("🧭 Auto Digest", "show_autodigest", None)],
-                [("🧰 Toolchain", "show_toolchain", None)],
+                [("🧰 Toolchain", "show_toolchain", None), ("👑 Bees", "show_bees", None)],
                 [("❌ Cancel", "cancel_turn", None), ("ℹ️ Help", "show_help", None)],
                 [("🙈 Hide menu", "hide_menu", None), ("📌 Show menu", "show_menu", None)],
             ],
@@ -1872,6 +2291,45 @@ class TelegramBridge:
             "\n".join(lines),
             reply_markup=self._make_inline_markup(chat_id=chat_id, rows=rows),
         )
+
+    async def _send_bees(self, chat_id: str) -> None:
+        queens = self._available_queens()
+        selected = self._selected_queen_id(chat_id)
+        lines: list[str] = ["Available bees (queens):"]
+        rows: list[list[tuple[str, str, dict[str, Any] | None]]] = []
+        for row in queens[:12]:
+            qid = row["id"]
+            name = row["name"]
+            title = row.get("title") or ""
+            marker = "✅" if qid == selected else "•"
+            if title:
+                lines.append(f"{marker} {qid} ({name}, {title})")
+            else:
+                lines.append(f"{marker} {qid} ({name})")
+            label = f"{'✅ ' if qid == selected else ''}{name[:22]}"
+            rows.append([(label, "select_bee", {"queen_id": qid})])
+        rows.append([("📊 Status", "show_status", None), ("🧠 Sessions", "show_sessions", None)])
+        await self._send_text(
+            chat_id,
+            "\n".join(lines),
+            reply_markup=self._make_inline_markup(chat_id=chat_id, rows=rows),
+        )
+
+    async def _activate_queen_for_chat(
+        self,
+        chat_id: str,
+        queen_id: str,
+    ) -> None:
+        resolved = self._resolve_known_queen_id(queen_id)
+        self._set_queen_for_chat(chat_id, resolved)
+        session = await self._create_bridge_session(
+            project_id=self._selected_project_id(chat_id),
+            queen_id=resolved,
+        )
+        self._bind_chat(chat_id, session.id)
+        self._clear_pending_input_state(chat_id, session.id)
+        await self._send_text(chat_id, f"Active bee set to: {resolved}\nCreated and bound new session: {session.id}")
+        await self._send_status(chat_id)
 
     async def _run_worker_default(self, chat_id: str) -> None:
         _, session = await self._ensure_bound_session(chat_id)
@@ -1992,9 +2450,17 @@ class TelegramBridge:
             lowered = "/toolchain"
         elif cmd == self.MENU_CREDENTIALS:
             lowered = "/credentials"
+        elif cmd == self.MENU_BEES:
+            lowered = "/bees"
 
         if lowered.startswith("/start") or lowered.startswith("/help"):
-            sid = await self._ensure_session()
+            sid = self._chat_session.get(chat_id)
+            if not sid or self._manager.get_session(sid) is None:
+                session = await self._create_bridge_session(
+                    project_id=self._selected_project_id(chat_id),
+                    queen_id=self._selected_queen_id(chat_id),
+                )
+                sid = session.id
             self._bind_chat(chat_id, sid)
             await self._send_help(chat_id)
             return True
@@ -2062,6 +2528,29 @@ class TelegramBridge:
             await self._send_sessions(chat_id)
             return True
 
+        if lowered == "/bees":
+            await self._send_bees(chat_id)
+            return True
+
+        if lowered == "/intake_template":
+            await self._send_intake_template(chat_id)
+            return True
+
+        if lowered == "/bee":
+            await self._send_text(chat_id, "Usage: /bee <queen_id>")
+            return True
+
+        if lowered.startswith("/bee "):
+            queen_id = cmd.split(" ", 1)[1].strip()
+            if not queen_id:
+                await self._send_text(chat_id, "Usage: /bee <queen_id>")
+                return True
+            if not self._is_known_queen_id(queen_id):
+                await self._send_text(chat_id, f"Unknown bee: {queen_id}. Use /bees to list available ids.")
+                return True
+            await self._activate_queen_for_chat(chat_id, queen_id)
+            return True
+
         if lowered == "/projects":
             self._pending_new_project.pop(chat_id, None)
             self._pending_new_repo.pop(chat_id, None)
@@ -2078,7 +2567,10 @@ class TelegramBridge:
                 await self._send_text(chat_id, f"Project not found: {pid}")
                 return True
             self._set_project_for_chat(chat_id, pid)
-            sid = await self._ensure_session_for_project(pid)
+            sid = await self._ensure_session_for_project(
+                pid,
+                queen_id=self._selected_queen_id(chat_id),
+            )
             self._bind_chat(chat_id, sid)
             self._clear_pending_input_state(chat_id, sid)
             await self._send_text(chat_id, f"Active project set to: {pid}")
@@ -2093,7 +2585,10 @@ class TelegramBridge:
             created = self._manager.create_project(name=name)
             pid = str(created.get("id") or "")
             self._set_project_for_chat(chat_id, pid)
-            sid = await self._ensure_session_for_project(pid)
+            sid = await self._ensure_session_for_project(
+                pid,
+                queen_id=self._selected_queen_id(chat_id),
+            )
             self._bind_chat(chat_id, sid)
             self._clear_pending_input_state(chat_id, sid)
             await self._send_text(chat_id, f"Created project '{created.get('name')}' ({pid})")
@@ -2151,7 +2646,10 @@ class TelegramBridge:
             return True
 
         if lowered == "/new":
-            s = await self._manager.create_session(project_id=self._selected_project_id(chat_id))
+            s = await self._create_bridge_session(
+                project_id=self._selected_project_id(chat_id),
+                queen_id=self._selected_queen_id(chat_id),
+            )
             self._bind_chat(chat_id, s.id)
             self._clear_pending_input_state(chat_id, s.id)
             await self._send_text(chat_id, f"Created and bound new session: {s.id}")
@@ -2294,6 +2792,9 @@ class TelegramBridge:
             self._pending_bootstrap.pop(chat_id, None)
             await self._send_projects(chat_id)
             return
+        if action == "show_bees":
+            await self._send_bees(chat_id)
+            return
         if action == "new_project_start":
             self._pending_new_project[chat_id] = {"expires_at": time.time() + 900}
             await self._send_text(
@@ -2329,14 +2830,27 @@ class TelegramBridge:
                 await self._send_text(chat_id, "Project not found.")
                 return
             self._set_project_for_chat(chat_id, pid)
-            sid = await self._ensure_session_for_project(pid)
+            sid = await self._ensure_session_for_project(
+                pid,
+                queen_id=self._selected_queen_id(chat_id),
+            )
             self._bind_chat(chat_id, sid)
             self._clear_pending_input_state(chat_id, sid)
             await self._send_text(chat_id, f"Active project set to: {pid}")
             await self._send_status(chat_id)
             return
+        if action == "select_bee":
+            queen_id = str(payload.get("queen_id") or "").strip()
+            if not queen_id or not self._is_known_queen_id(queen_id):
+                await self._send_text(chat_id, "Bee not found.")
+                return
+            await self._activate_queen_for_chat(chat_id, queen_id)
+            return
         if action == "new_session":
-            s = await self._manager.create_session(project_id=self._selected_project_id(chat_id))
+            s = await self._create_bridge_session(
+                project_id=self._selected_project_id(chat_id),
+                queen_id=self._selected_queen_id(chat_id),
+            )
             self._bind_chat(chat_id, s.id)
             self._clear_pending_input_state(chat_id, s.id)
             await self._send_text(chat_id, f"Created and bound new session: {s.id}")
@@ -2536,7 +3050,10 @@ class TelegramBridge:
             created = self._manager.create_project(name=name)
             pid = str(created.get("id") or "")
             self._set_project_for_chat(chat_id, pid)
-            sid = await self._ensure_session_for_project(pid)
+            sid = await self._ensure_session_for_project(
+                pid,
+                queen_id=self._selected_queen_id(chat_id),
+            )
             self._bind_chat(chat_id, sid)
             self._clear_pending_input_state(chat_id, sid)
             await self._send_text(chat_id, f"Created project '{created.get('name')}' ({pid})")
@@ -2622,8 +3139,41 @@ class TelegramBridge:
                 detail = self._format_exception_details(exc)
                 self._last_poll_error = detail
                 logger.warning("Telegram bridge polling error: %s", detail)
+                await self._maybe_recover_poll_conflict(detail)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, 20.0)
+
+    @staticmethod
+    def _is_poll_conflict_409_error(detail: str) -> bool:
+        text = str(detail or "").lower()
+        if "getupdates failed" not in text:
+            return False
+        return "error_code" in text and "409" in text
+
+    async def _maybe_recover_poll_conflict(self, detail: str) -> None:
+        if not self._is_poll_conflict_409_error(detail):
+            return
+        now_ts = time.time()
+        self._poll_conflict_409_count += 1
+        self._last_poll_conflict_409_at = now_ts
+        if not self._auto_clear_webhook_on_409:
+            self._last_poll_conflict_recover_result = "disabled_by_env"
+            return
+        last_recover = float(self._last_poll_conflict_recover_at or 0.0)
+        cooldown = float(self._poll_conflict_recover_cooldown_seconds)
+        if (now_ts - last_recover) < cooldown:
+            self._last_poll_conflict_recover_result = "cooldown"
+            return
+        self._last_poll_conflict_recover_at = now_ts
+        try:
+            # Safe in polling mode: clears stale webhook setup that can conflict with getUpdates.
+            await self._api("deleteWebhook", {"drop_pending_updates": False})
+            self._last_poll_conflict_recover_result = "delete_webhook_ok"
+            logger.info("Telegram bridge conflict recovery: deleteWebhook succeeded")
+        except Exception as recover_exc:
+            recover_detail = self._format_exception_details(recover_exc)
+            self._last_poll_conflict_recover_result = f"delete_webhook_failed:{recover_detail}"
+            logger.warning("Telegram bridge conflict recovery failed: %s", recover_detail)
 
     def _try_acquire_poll_lock(self) -> bool:
         lock_dir = os.path.dirname(self._poll_lock_path)
@@ -2666,6 +3216,7 @@ class TelegramBridge:
     def status(self) -> dict[str, Any]:
         poll_task = self._poll_task
         poll_running = bool(poll_task is not None and not poll_task.done())
+        conflict_kpi = self._conflict_kpi_snapshot()
         return {
             "enabled": self._enabled,
             "mode": self._mode,
@@ -2675,6 +3226,124 @@ class TelegramBridge:
             "running": poll_running,
             "startup_status": self._startup_status,
             "last_poll_error": self._last_poll_error,
+            "poll_conflict_409_count": self._poll_conflict_409_count,
+            "last_poll_conflict_409_at": self._last_poll_conflict_409_at,
+            "last_poll_conflict_recover_at": self._last_poll_conflict_recover_at,
+            "last_poll_conflict_recover_result": self._last_poll_conflict_recover_result,
+            "auto_clear_webhook_on_409": self._auto_clear_webhook_on_409,
+            "conflict_recover_cooldown_seconds": self._poll_conflict_recover_cooldown_seconds,
+            "conflict_warn_threshold": self._poll_conflict_warn_threshold,
+            "conflict_warn_window_seconds": self._poll_conflict_warn_window_seconds,
+            "poll_conflict_warning_active": bool(conflict_kpi.get("warning")),
+            "last_poll_conflict_age_seconds": conflict_kpi.get("last_seen_age_seconds"),
+        }
+
+    def _conflict_kpi_snapshot(self) -> dict[str, Any]:
+        now_ts = time.time()
+        count = int(self._poll_conflict_409_count or 0)
+        last_at = self._last_poll_conflict_409_at
+        age_seconds: int | None = None
+        if isinstance(last_at, (int, float)):
+            age_seconds = max(0, int(now_ts - float(last_at)))
+        warning = bool(
+            count >= self._poll_conflict_warn_threshold
+            and isinstance(age_seconds, int)
+            and age_seconds <= self._poll_conflict_warn_window_seconds
+        )
+        return {
+            "count": count,
+            "last_seen_age_seconds": age_seconds,
+            "last_recover_result": self._last_poll_conflict_recover_result,
+            "threshold": self._poll_conflict_warn_threshold,
+            "window_seconds": self._poll_conflict_warn_window_seconds,
+            "warning": warning,
+        }
+
+    async def operator_recover(
+        self,
+        *,
+        force_delete_webhook: bool = True,
+        drop_pending_updates: bool = False,
+        reset_conflict_telemetry: bool = False,
+        clear_last_error: bool = True,
+    ) -> dict[str, Any]:
+        """Operator-triggered bridge recovery/reset path.
+
+        Returns a machine-readable action report suitable for API response.
+        """
+        requested_at = time.time()
+        report: dict[str, Any] = {
+            "requested_at": requested_at,
+            "force_delete_webhook": bool(force_delete_webhook),
+            "drop_pending_updates": bool(drop_pending_updates),
+            "reset_conflict_telemetry": bool(reset_conflict_telemetry),
+            "clear_last_error": bool(clear_last_error),
+            "actions": [],
+            "ok": True,
+            "error": None,
+        }
+
+        if clear_last_error:
+            self._last_poll_error = None
+            report["actions"].append("cleared_last_poll_error")
+
+        if reset_conflict_telemetry:
+            self._poll_conflict_409_count = 0
+            self._last_poll_conflict_409_at = None
+            self._last_poll_conflict_recover_at = None
+            self._last_poll_conflict_recover_result = None
+            report["actions"].append("reset_conflict_telemetry")
+
+        if force_delete_webhook:
+            if self._client is None:
+                report["ok"] = False
+                report["error"] = "bridge_client_not_initialized"
+            else:
+                try:
+                    await self._api(
+                        "deleteWebhook",
+                        {"drop_pending_updates": bool(drop_pending_updates)},
+                    )
+                    self._last_poll_conflict_recover_at = requested_at
+                    self._last_poll_conflict_recover_result = "operator_delete_webhook_ok"
+                    report["actions"].append("delete_webhook_ok")
+                except Exception as exc:
+                    detail = self._format_exception_details(exc)
+                    self._last_poll_conflict_recover_at = requested_at
+                    self._last_poll_conflict_recover_result = f"operator_delete_webhook_failed:{detail}"
+                    report["ok"] = False
+                    report["error"] = detail
+                    report["actions"].append("delete_webhook_failed")
+
+        report["bridge"] = self.status()
+        return report
+
+    def bindings_snapshot(self) -> dict[str, Any]:
+        """Return current chat/session binding snapshot for operator inspection."""
+        rows: list[dict[str, Any]] = []
+        for chat_id in sorted(self._chat_session.keys()):
+            session_id = str(self._chat_session.get(chat_id) or "").strip()
+            session = self._manager.get_session(session_id) if session_id else None
+            rows.append(
+                {
+                    "chat_id": chat_id,
+                    "project_id": self._selected_project_id(chat_id),
+                    "queen_id": self._selected_queen_id(chat_id),
+                    "session_id": session_id or None,
+                    "session_live": bool(session is not None),
+                    "session_project_id": (
+                        str(getattr(session, "project_id", "") or "") if session is not None else None
+                    ),
+                    "session_queen_id": (
+                        str(getattr(session, "queen_name", "") or "") if session is not None else None
+                    ),
+                }
+            )
+        return {
+            "bindings": rows,
+            "known_chats_total": len(self._known_chats),
+            "bound_chats_total": len(rows),
+            "sessions_with_bound_chats_total": len([sid for sid, chats in self._session_chats.items() if chats]),
         }
 
     async def _on_client_output_delta(self, session_id: str, event: Any) -> None:
@@ -2752,7 +3421,7 @@ class TelegramBridge:
         source = str(data.get("source") or "").strip().lower()
         source_chat_id = str(data.get("chat_id") or "").strip()
 
-        chats = self._chats_for_session(session_id)
+        chats = self._chats_for_session(session_id, source=source)
         if not chats:
             return
 

@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T00:03:09Z",
+  "wave": "Wave16-R11F",
+  "title": "Autonomous GitHub evaluate + auto-next policy edge continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "GitHub evaluate continuity remains stable under policy-edge payload conditions",
+      "auto-next policy branch behavior remains stable across deferred/success/reject paths",
+      "no regressions observed in targeted policy-edge bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_rejects_execution_stage or pipeline_auto_next_deferred_without_token_in_manual_mode' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11F lane closed as keep-local with green GitHub evaluate/auto-next policy-edge bundle",
+      "next lane continues GitHub review-feedback/report coupling continuity"
+    ]
+  }
+}

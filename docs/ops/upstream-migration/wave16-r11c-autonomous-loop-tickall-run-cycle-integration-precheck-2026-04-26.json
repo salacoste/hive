@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-26T18:40:58Z",
+  "wave": "Wave16-R11C",
+  "title": "Autonomous loop tick-all + run-cycle integration continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify loop tick_all integration continuity with run-cycle endpoints",
+    "verify run-cycle/report continuity after tick_all-driven dispatch paths"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_tick_all_rejects_non_array_project_ids",
+    "pipeline_loop_run_cycle_endpoint",
+    "pipeline_loop_run_cycle_rejects_invalid_max_steps",
+    "pipeline_loop_tick_dispatches_next_when_idle",
+    "pipeline_loop_run_cycle_report_endpoint",
+    "pipeline_report_endpoint"
+  ]
+}

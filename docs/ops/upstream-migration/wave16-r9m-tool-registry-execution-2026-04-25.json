@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T13:14:49Z",
+  "wave": "Wave16-R9M",
+  "title": "Tool registry built-in save_data compatibility lane execution",
+  "scope": [
+    "core/framework/loader/tool_registry.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local additive built-in save_data registration is required by existing runtime/test contract",
+      "execution-context data_dir precedence for save_data is validated and should remain deterministic",
+      "targeted tool-registry and context-propagation bundles are green"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9M lane (local behavior retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_tool_registry.py -k 'builtin_save_data or concurrency_safe_tools' -q",
+        "result": "pass",
+        "summary": "2 passed, 38 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_tool_context_propagation.py -q",
+        "result": "pass",
+        "summary": "2 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_mcp_registry_loader.py -q",
+        "result": "pass",
+        "summary": "3 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9M lane closed with explicit keep-local decision",
+      "next residual lane: graph/event-loop package boundary contract (`core/framework/graph/__init__.py`)"
+    ]
+  }
+}

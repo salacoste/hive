@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-24T18:14:49Z",
+  "item": 285,
+  "lane": "ND-5A",
+  "title": "Orchestrator micro-lane execution",
+  "scope": [
+    "core/framework/orchestrator/client_io.py",
+    "core/framework/orchestrator/gcu.py",
+    "core/framework/orchestrator/node.py",
+    "core/framework/orchestrator/safe_eval.py"
+  ],
+  "inputs": {
+    "patch": "docs/ops/upstream-migration/wave15-nd5a-orchestrator.patch",
+    "probe": "docs/ops/upstream-migration/wave15-nd5a-orchestrator-probe-2026-04-24.json",
+    "replay_plan": "docs/ops/upstream-migration/wave15-nd5a-orchestrator-replay-plan-2026-04-24.md"
+  },
+  "execution": {
+    "patch_apply": {
+      "command": "git apply docs/ops/upstream-migration/wave15-nd5a-orchestrator.patch",
+      "result": "pass"
+    },
+    "compatibility_reconcile": {
+      "file": "core/framework/host/event_bus.py",
+      "reason": "targeted tests failed after replay because AgentLoop callers pass prompt/options to emit_client_input_requested",
+      "change": "restored backward-compatible method signature and payload emission for prompt/options while preserving questions support"
+    },
+    "targeted_validation": {
+      "command": "uv run pytest core/tests/test_event_loop_node.py core/tests/test_safe_eval.py core/tests/test_node_conversation.py -q",
+      "result": "pass",
+      "summary": "285 passed, 4 skipped"
+    },
+    "full_gate_validation": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "ND-5A scope replayed and stabilized with one backward-compat reconcile in EventBus",
+      "targeted and full regression gates are green"
+    ]
+  }
+}

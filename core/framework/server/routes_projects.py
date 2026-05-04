@@ -563,6 +563,7 @@ async def handle_update_project_execution_template(request: web.Request) -> web.
         for key in (
             "default_flow",
             "retry_policy",
+            "run_guardrails",
             "github",
             "default_ref",
             "default_branch",

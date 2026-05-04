@@ -1,0 +1,42 @@
+{
+  "generated_at_utc": "2026-04-26T13:58:37Z",
+  "wave": "Wave16-R10N",
+  "title": "Autonomous pipeline stage-profile contract lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py",
+    "core/framework/server/project_execution.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "autonomous backlog/pipeline stage-profile contract remains stable across expanded pipeline bundle",
+      "project execution-template stage defaults still align with pipeline expectations",
+      "no hidden coupling regressions found in selected autonomous-route contracts"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'backlog_ or pipeline_' -q",
+        "result": "pass",
+        "summary": "42 passed, 151 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'project_execution_template_defaults_and_update or project_execution_template_rejects_invalid_payload' -q",
+        "result": "pass",
+        "summary": "2 passed, 191 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10N lane closed as keep-local with expanded autonomous pipeline contract coverage",
+      "next lane targets GitHub evaluate/auto-next policy contract continuity"
+    ]
+  }
+}

@@ -1,0 +1,2289 @@
+diff --git a/core/framework/skills/_preset_skills/browser-automation/SKILL.md b/core/framework/skills/_preset_skills/browser-automation/SKILL.md
+new file mode 100644
+index 00000000..fb52ac18
+--- /dev/null
++++ b/core/framework/skills/_preset_skills/browser-automation/SKILL.md
+@@ -0,0 +1,471 @@
++---
++name: hive.browser-automation
++description: Required before any browser_* tool call. Teaches the screenshot + browser_click_coordinate workflow that reaches shadow-DOM inputs selectors can't see, the CSS-pixel coordinate rule (not physical px), rich-text editor quirks ("send button stays disabled" failures), and CSP gotchas. Covers Chrome via CDP through the GCU Beeline extension. Skipping this causes repeated failures on LinkedIn / Reddit / X. Verified against real production sites 2026-04-11.
++metadata:
++  author: hive
++  type: default-skill
++  version: "2.0"
++  verified: 2026-04-11
++---
++
++# GCU Browser Automation
++
++All GCU browser tools drive a real Chrome instance through the Beeline extension and Chrome DevTools Protocol (CDP). That means clicks, keystrokes, and screenshots are processed by the actual browser's native hit testing, focus, and layout engines — **not** a synthetic event layer. Understanding this unlocks strategies that make hard sites easy.
++
++## Coordinates
++
++Every browser tool that takes or returns coordinates operates in **fractions of the viewport (0..1 for both axes)**. Read a target's proportional position off `browser_screenshot` — "this button is about 35% from the left and 20% from the top" → pass `(0.35, 0.20)`. Rect-returning tools (`browser_get_rect`, `browser_shadow_query`, and the `rect` inside `focused_element`) also return fractions. The tools convert to CSS pixels internally before dispatching to Chrome.
++
++```
++browser_screenshot()                  → image + cssWidth/cssHeight in meta
++browser_click_coordinate(x, y)        → x, y are fractions 0..1
++browser_hover_coordinate(x, y)        → fractions
++browser_press_at(x, y, key)           → fractions
++browser_get_rect(selector) → rect     → rect.cx / rect.cy are fractions
++browser_shadow_query(...)  → rect     → same
++```
++
++**Why fractions:** every vision model (Claude ~1.15 MP target, GPT-4o 512-px tiles, Gemini, local VLMs) resizes or tiles images differently before the model sees the pixels. Proportions survive every such transform; pixel coordinates only "work" per-model and silently break when you swap backends. Four-decimal precision (`0.0001` ≈ 0.17 CSS px on a 1717-wide viewport) is more than enough for the tightest targets.
++
++**Exception for zoomed elements:** pages that use `zoom` or `transform: scale()` on a container (LinkedIn's `#interop-outlet`, some embedded iframes) render in a scaled local coordinate space. `getBoundingClientRect` there may not match CDP's hit space. Prefer `browser_shadow_query` (which handles the math and returns fractions) or visually pick coordinates from a screenshot. Avoid raw `browser_evaluate` + `getBoundingClientRect()` for coord lookup — that returns CSS px and will be wrong when fed to click tools.
++
++## Screenshot + coordinates is shadow-agnostic — prefer it on shadow-heavy sites
++
++Start with `browser_snapshot` when you need to inspect the page structure or find ordinary controls. If the snapshot does not show the thing you need, shows stale or misleading refs, or cannot prove where a visible target is, take `browser_screenshot` and use the screenshot + coordinate path. This is especially useful on sites that use Shadow DOM heavily
++
++Why:
++
++- **CDP hit testing walks shadow roots natively.** `browser_click_coordinate(x, y)` routes through Chrome's native hit tester, which traverses open shadow roots automatically. You don't need to know the shadow structure.
++- **Keyboard dispatch follows focus** into shadow roots. After a click focuses an input (even one three shadow levels deep), `browser_press(...)` with no selector dispatches keys to `document.activeElement`'s computed focus target.
++- **Screenshots render the real layout** regardless of DOM implementation.
++
++Whereas `wait_for_selector`, `browser_click(selector=...)`, `browser_type(selector=...)` all use `document.querySelector` under the hood, which **stops at shadow boundaries**. They cannot see elements inside shadow roots. For shadow-DOM inputs, use `browser_type_focused` after focusing via click-coordinate.
++
++### Recommended workflow on shadow-heavy sites
++
++1. `browser_screenshot()` → JPEG; meta includes `cssWidth`/`cssHeight` for reference.
++2. Identify the target visually → estimate its proportional position `(fx, fy)` where each is in `0..1`.
++3. `browser_click_coordinate(fx, fy)` → tool converts to CSS px and dispatches; CDP native hit testing focuses the element. **The response includes `focused_element: {tag, id, role, contenteditable, rect, inFrame?, ...}`** — use it to verify you actually focused what you intended. `rect` is in fractions (same space as your input). When focus is inside a same-origin iframe, the descriptor reports the inner element and adds `inFrame: [...]` breadcrumbs.
++4. `browser_type_focused(text="...")` → inserts text into `document.activeElement` (traverses into same-origin iframes automatically). Shadow roots, iframes, Lexical, Draft.js, ProseMirror all just work. Use `browser_type(selector, text)` instead when you have a reliable CSS selector for a light-DOM element.
++5. Verify via `browser_screenshot` OR `browser_get_attribute` on a known-reachable marker (e.g. check that the Send button's `aria-disabled` flipped to `false`).
++
++### The click→type loop (canonical pattern)
++
++1. Call `browser_click_coordinate(x, y)` to click the target element.
++2. Check the `focused_element` field in the response — it tells you what actually received focus (tag, id, role, contenteditable, rect).
++3. If the focused element is editable, call `browser_type_focused(text="...")` to insert text. Use tools to verify the text took effect — prefer checking the underlying `.value` / `innerText` via `browser_evaluate` or confirming the submit button enabled. A screenshot alone can mislead: narrow input boxes visually clip long text, so only a portion may appear on screen even though the full string was accepted.
++4. If it is NOT editable, your click landed on the wrong thing — refine coordinates and retry. Do NOT reach for `browser_evaluate` + `execCommand('insertText')` or shadow-root traversals. The problem is the click target, not the typing method.
++
++`browser_click` (selector-based) also returns `focused_element`, so the same check works whether you clicked by selector or coordinate.
++
++### Empirically verified (2026-04-11)
++
++Tested against `https://www.reddit.com/r/programming/` whose search input lives at:
++
++```
++document > reddit-search-large [shadow]
++         > faceplate-search-input#search-input [shadow]
++         > input[name="q"]
++```
++
++### Shadow-piercing selectors
++
++When you DO want a selector-based approach and know the shadow structure, `browser_shadow_query` and `browser_get_rect` support `>>>` shadow-piercing syntax:
++
++```
++browser_shadow_query("reddit-search-large >>> #search-input")
++browser_get_rect("#interop-outlet >>> #ember37 >>> p")
++```
++
++Returns the element's rect as **fractions of the viewport** (feed `rect.cx` / `rect.cy` directly to click tools). Remember: `browser_type` and `wait_for_selector` do **not** support `>>>` — only shadow_query and get_rect do.
++
++## Navigation and waiting
++
++### The basics
++
++```
++browser_navigate(url, wait_until="load")   # "load" | "domcontentloaded" | "networkidle"
++browser_wait_for_selector("h1", timeout_ms=2000)
++browser_wait_for_text("Some text", timeout_ms=2000)
++browser_go_back()
++browser_go_forward()
++browser_reload()
++```
++
++All return real URLs and titles. On a fast page `navigate(wait_until="load")` returns in sub-second. `wait_for_selector` and `wait_for_text` typically resolve in single-digit milliseconds on elements already in the DOM.
++
++### Timing expectations (measured against real sites)
++
++| Site                     | Navigate load time |
++| ------------------------ | ------------------ |
++| example.com              | 100–400 ms         |
++| wikipedia.org            | 200–500 ms         |
++| reddit.com               | 1.5–2 s            |
++| x.com/twitter            | 1.2–1.6 s          |
++| linkedin.com (logged in) | 4–5 s              |
++
++For LinkedIn and other heavy SPAs, rely on `sleep()` after navigation to let the page hydrate.
++
++### After navigate, always let SPA hydrate
++
++Even after `wait_until="load"`, React/Vue SPAs often render their real chrome in a second pass. Add `await sleep(2)` to `await sleep(3)` before querying for site-specific elements. Otherwise `wait_for_selector` will fail on elements that do exist moments later.
++
++### Reading pages efficiently
++
++- **Prefer `browser_snapshot` over `browser_get_text("body")`** — returns a compact ~1–5 KB accessibility tree vs 100+ KB of raw HTML.
++- Interaction tools `browser_click`, `browser_type`, `browser_type_focused`, `browser_fill`, and `browser_scroll` wait 0.5 s for the page to settle after a successful action, then attach a fresh accessibility snapshot under the `snapshot` key of their result. Use it to decide your next action — do NOT call `browser_snapshot` separately after every action. Tune the capture via `auto_snapshot_mode`: `"default"` (full tree, the default), `"simple"` (trims unnamed structural nodes), `"interactive"` (only controls — tightest token footprint), or `"off"` to skip the capture entirely (useful when batching several interactions and you don't need the intermediate trees). Call `browser_snapshot` explicitly only when you need a newer view or a different mode than what was auto-captured.
++- Complex pages (LinkedIn, Twitter/X, SPAs with virtual scrolling) can have DOMs that don't match what's visually rendered — snapshot refs may be stale, missing, or misaligned with visible layout. Try the available snapshot first; when the target is not present in that snapshot or visual position matters, switch to `browser_screenshot` to orient yourself.
++- Only fall back to `browser_get_text` for extracting specific small elements by CSS selector.
++
++## Typing and keyboard input
++
++### ALWAYS click before typing into rich-text editors
++
++**The single most common "looks like it worked but send button stays disabled" failure.** If you're typing into a modern editor (X/Twitter's Draft.js compose, LinkedIn's post composer, Reddit's comment box, Gmail compose, Slack, Discord, Notion, Monaco, any `contenteditable`), **click the input area first with `browser_click_coordinate` or `browser_click(selector)` before you type**.
++
++Why this is necessary:
++
++- **React / Vue controlled components** don't trust JS-sourced `.focus()`. React uses event delegation and watches for _native_ pointer/focus events — a `click` dispatched via CDP fires the real `pointerdown`/`pointerup`/`click`/`focus` sequence that React listens to, and updates its internal state. A JS-only `.focus()` sets `document.activeElement` but the framework's controlled state doesn't see it.
++- **Draft.js** (X/Twitter compose) and **Lexical** (Gmail, LinkedIn DMs) use contenteditable divs with immutable editor state. They only enter "edit mode" after a real click on the editor surface. Typing at them without clicking routes keys to `document.body` or gets silently discarded.
++- **Send/submit buttons are bound to framework state**, not DOM state. They're typically `disabled={!hasRealContent}` where `hasRealContent` is computed from React/Vue/Svelte state. The input field can have characters in the DOM but the button stays disabled because the framework never saw a real input event.
++
++The symptom is always the same: **you type, the characters appear visually, and the send button doesn't enable**. The agent then clicks send anyway, nothing happens, and it thinks the post failed.
++
++### Safe "click-then-type-then-verify" pattern
++
++1. **Focus** the real element via a real click (not JS `.focus()`). Use `browser_get_rect(selector)` (or `browser_shadow_query` for shadow sites) to get coordinates, then `browser_click_coordinate(cx, cy)`. Wait ~0.5 s for the editor to open and focus to settle.
++
++2. **Type** the text. Use `browser_type(selector, text)` for light-DOM inputs, or `browser_type_focused(text=...)` for shadow-DOM / already-focused inputs. Both use CDP `Input.insertText` by default, which is the most reliable method for rich editors (Lexical, Draft.js, ProseMirror). Wait ~500 ms for framework state to commit.
++
++3. **Verify** the submit button is enabled before clicking it. Use `browser_evaluate` to check the button's `disabled` or `aria-disabled` attribute. Do NOT trust that typing worked — always check state.
++
++   **Partial visibility is fine.** Small single-line inputs, chat boxes with fixed width, and search fields commonly clip or truncate long text visually — only the tail or head may be shown on screen. Don't treat that as failure. What matters is that the framework accepted the input: the submit button enabled, or `element.value` / `innerText` read via `browser_evaluate` contains the full string. If the visible pixels don't match what you typed but the button is enabled and the underlying value is correct, typing succeeded — proceed.
++
++4. **Only click send if the button is enabled.** If the button is still disabled, try the recovery dance: click the textarea again, press `End`, press a space, press `Backspace` — this forces React to recompute `hasRealContent`. Then re-check the button state.
++
++### Why `browser_type` uses `Input.insertText` by default
++
++CDP has a dedicated method — `Input.insertText` — for committing text into the focused element as if IME just committed it. It **bypasses the keyboard event pipeline entirely** and works cleanly on every rich-text editor tested to date: Lexical (LinkedIn DMs, Gmail), Draft.js (X compose), ProseMirror (Reddit), Monaco, and plain `contenteditable`. Playwright uses this under the hood for `keyboard.type()` on rich editors.
++
++Per-character `Input.dispatchKeyEvent` looks equivalent on paper, but some rich editors listen for `beforeinput` events with a specific shape and route insertion through their own state machine — the raw keys arrive but never get turned into text. That was the exact failure mode that left LinkedIn's message composer empty (and its Send button disabled) during the 2026-04-11 empirical run.
++
++If you need per-keystroke dispatch (autocomplete testing, code editors, animated typing with `delay_ms`), pass `use_insert_text=False` to fall back to the old `keyDown/keyUp` path.
++
++### Neutralizing `beforeunload` draft dialogs
++
++When a composer has unsent text and you try to navigate away or close the tab, sites like LinkedIn pop a native "You have an unsent message, leave?" confirm dialog via `window.onbeforeunload`. Your automation hangs waiting on the dialog — `browser_close_tab` and `browser_navigate` both time out.
++
++**Strip the handler via `browser_evaluate` before navigating:**
++
++```
++browser_evaluate("""
++    (function(){
++      window.onbeforeunload = null;
++      window.addEventListener('beforeunload', function(e){
++        e.stopImmediatePropagation();
++      }, true);
++      return true;
++    })()
++""")
++# Now browser_navigate / close_tab work without hitting a confirm
++```
++
++Always include an equivalent cleanup block in any script that types into a compose UI — without it, a script crash mid-type leaves the tab in an unusable state with the draft modal blocking every subsequent automation call.
++
++### Verified site-specific quirks
++
++| Site                                                 | Editor                                                 | Workaround                                                                                                                                                                                                                             |
++| ---------------------------------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| **X / Twitter** compose                              | Draft.js                                               | Click `[data-testid='tweetTextarea_0']` first, then type with `delay_ms=20`. First 1-2 chars may be eaten — accept truncation or prepend a throwaway char. Verify `[data-testid='tweetButton']` has `disabled: false` before clicking. |
++| **LinkedIn** messaging                               | contenteditable (inside `#interop-outlet` shadow root) | Use `browser_shadow_query` to find the rect, click-coordinate to focus, then `browser_type_focused(text=...)` (selector-based `browser_type` can't reach shadow). Send button is `.msg-form__send-button`.                             |
++| **LinkedIn** feed post composer                      | Quill/LinkedIn custom                                  | Click the "Start a post" trigger first, wait 1s for modal, click the textarea, type.                                                                                                                                                   |
++| **Reddit** comment/post box                          | ProseMirror                                            | Click the textarea, wait 0.5s for the toolbar to mount, then type. Submit is `button[slot="submit-button"]` inside a shreddit-composer.                                                                                                |
++| **Gmail** compose                                    | Lexical                                                | Click the body first. Gmail has a visible `div[contenteditable=true][aria-label*='Message Body']` after opening a compose window.                                                                                                      |
++| **Slack** message box                                | contenteditable                                        | Click first, then type. Send is a paper-plane button with `data-qa='texty_send_button'`.                                                                                                                                               |
++| **Discord**                                          | Slate                                                  | Click first. Discord's send is implicit on Enter (no button), so just press Enter after typing.                                                                                                                                        |
++| **Monaco** editors (GitHub code review, CodeSandbox) | Monaco                                                 | Click first, type with `delay_ms=10`. Monaco listens for `textarea` input events on a hidden textarea — requires focus to be on that textarea.                                                                                         |
++
++### Plain text into a real input
++
++For plain `<input>` and `<textarea>` elements with no framework wrapper (forms on static sites, simple search bars that pass a selector string straight through), `browser_type(selector, text)` is sufficient — the bridge's internal `focus()` call does the right thing. But when in doubt, click first. It's cheap insurance.
++
++```
++browser_type(selector, text)
++```
++
++- Sends `keyDown` (with `key`, `code`, `text` fields populated) → `keyUp` per character (or a single `Input.insertText` by default)
++- Fires real `keydown` / `keypress` / `input` / `keyup` events — frameworks that branch on `event.key` or `event.code` see the right values
++- Matches what Playwright and Puppeteer send
++
++Works on real `<input>`, `<textarea>`, and `contenteditable` elements. For shadow-DOM inputs, see the "shadow-heavy sites" section above — `browser_type(selector=)` can't see past shadow boundaries; use `browser_type_focused` after click-coordinate focus.
++
++### Keyboard shortcuts (Ctrl+A, Shift+Tab, Cmd+Enter)
++
++```
++browser_press("a", modifiers=["ctrl"])         # Ctrl+A — select all
++browser_press("Backspace")                      # clear selected text
++browser_press("Enter", modifiers=["meta"])     # Cmd+Enter (mac) — submit
++browser_press("Tab", modifiers=["shift"])      # Shift+Tab — reverse focus
++```
++
++Accepted modifier names (case-insensitive): `"alt"`, `"ctrl"` / `"control"`, `"meta"` / `"cmd"`, `"shift"`.
++
++Behind the scenes this dispatches the modifier's own `keyDown` first, then the main key with `code` and `windowsVirtualKeyCode` populated (so Chrome's shortcut dispatcher recognises it), then releases modifiers in reverse order. Without the `code` + `windowsVirtualKeyCode` fields Chrome routes the event to the DOM without firing shortcuts — which is what plain string keys get.
++
++### Special keys
++
++Recognized without modifiers: `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, `ArrowUp/Down/Left/Right`, `Home`, `End`, `PageUp`, `PageDown`.
++
++## Screenshots
++
++```
++browser_screenshot()                    # viewport, 800 px wide JPEG
++browser_screenshot(full_page=True)      # full scrollable page (overview only — don't click off a full-page shot)
++browser_screenshot(selector="#header")  # clip to element's rect
++```
++
++Returns a JPEG (quality 75, ~50–120 KB) at 800 px wide. The pixel width is purely a bandwidth choice; all tool coordinates are fractions of the viewport and are invariant to image size. Metadata includes `imageWidth` (800), `cssWidth`, `cssHeight` (for reference), and `physicalScale`. The image is annotated with a highlight rectangle/dot showing the last interaction (click, hover, type) if one happened on this tab.
++
++The highlight overlay stays visible on the page for **10 seconds** after each interaction, then fades. Before a screenshot is likely, make sure your click / hover / type happens <10 s before the screenshot.
++
++## Scrolling
++
++- Use large scroll amounts (~2000) when loading more content — sites like Twitter and LinkedIn have lazy loading for paging.
++- The scroll result includes a snapshot automatically — no need to call `browser_snapshot` separately.
++- Never re-navigate to the same URL after scrolling — this resets your scroll position and loses loaded content.
++
++## Batching actions
++
++- You can call multiple tools in a single turn — they execute in parallel. ALWAYS batch independent actions together. Examples: fill multiple form fields in one turn, navigate + snapshot in one turn, click + scroll if targeting different elements.
++- When batching, set `auto_snapshot=false` on all but the last action to avoid redundant snapshots.
++- Aim for 3–5 tool calls per turn minimum. One tool call per turn is wasteful.
++
++## Tab management
++
++**Close tabs as soon as you are done with them** — not only at the end of the task. After reading or extracting data from a tab, close it immediately.
++
++- Finished reading/extracting from a tab? `browser_close(target_id=...)`
++- Completed a multi-tab workflow? `browser_close_finished()` to clean up all your tabs
++- More than 3 tabs open? Stop and close finished ones before opening more
++- Popup appeared that you didn't need? Close it immediately
++
++`browser_tabs` returns an `origin` field for each tab:
++
++- `"agent"` — you opened it; you own it; close it when done
++- `"popup"` — opened by a link or script; close after extracting what you need
++- `"startup"` or `"user"` — leave these alone unless the task requires it
++
++Never accumulate tabs. Treat every tab you open as a resource you must free.
++
++The bridge automatically evicts per-tab state (`_cdp_attached`, `_interaction_highlights`) when a tab is closed, so you can't leak stale annotations or attached-debugger flags.
++
++## Site-specific selectors (verified 2026-04-11)
++
++### LinkedIn
++
++| Target              | Selector                                              |
++| ------------------- | ----------------------------------------------------- |
++| Global search input | `input[data-testid='typeahead-input']`                |
++| Own profile link    | `a[href*='linkedin.com/in/']`                         |
++| Messaging overlay   | `#interop-outlet >>> [aria-label]` (use shadow_query) |
++
++LinkedIn enforces **strict Trusted Types CSP**. Any script you inject via `browser_evaluate` that uses `innerHTML = "<...>"` will be **silently dropped** — the wrapper element gets added but its content is empty, no console error. Always use `createElement` + `appendChild` + `setAttribute` for DOM injection on LinkedIn. `style.cssText`, `textContent`, and `.value` assignments are fine (they don't go through the Trusted Types sink).
++
++### Reddit (new reddit / shreddit)
++
++| Target                | Selector                                                                     |
++| --------------------- | ---------------------------------------------------------------------------- |
++| Search input (shadow) | `reddit-search-large >>> #search-input` (rect only; type via click-to-focus) |
++| Reddit logo (home)    | `#reddit-logo`                                                               |
++| Subreddit posts       | `shreddit-post` custom elements                                              |
++| Create post button    | `a[href*='/submit']`                                                         |
++
++Reddit's search input lives **two shadow levels deep** inside `reddit-search-large > faceplate-search-input`. You cannot reach it with `browser_type(selector=)`. The working pattern:
++
++1. `browser_shadow_query("reddit-search-large >>> #search-input")` → rect
++2. `browser_click_coordinate(rect.cx, rect.cy)` → click lands on the real shadow input via native hit testing; input becomes focused
++3. `browser_type_focused(text="query")` → dispatches to focused element via `Input.insertText`
++4. Verify by reading `.value` via `browser_evaluate` walking the shadow path
++
++### X / Twitter
++
++| Target                     | Selector                                      |
++| -------------------------- | --------------------------------------------- |
++| Main search input          | `input[data-testid='SearchBox_Search_Input']` |
++| Home nav link              | `a[data-testid='AppTabBar_Home_Link']`        |
++| Post text area (compose)   | `[data-testid='tweetTextarea_0']`             |
++| Reply buttons on feed      | `[data-testid='reply']`                       |
++| Post / Tweet submit button | `[data-testid='tweetButton']`                 |
++| Caret (⋯) menu on a post   | `[data-testid='caret']`                       |
++| Confirmation sheet button  | `[data-testid='confirmationSheetConfirm']`    |
++
++**X uses Draft.js for the compose text editor**, which does NOT accept synthetic input reliably. Working workaround: `browser_type(selector='[data-testid="tweetTextarea_0"]', text="...", delay_ms=20)`. The delay gives Draft.js time to process each keystroke. The first 1–2 characters may still get eaten — accept minor truncation or prepend a throwaway character. After typing, check `[data-testid="tweetButton"]` has `disabled: false` before clicking submit.
++
++After submitting, press Escape to close the composer.
++
++## File uploads — use `browser_upload`, never click the upload button
++
++**Clicking an `<input type="file">` or the button that triggers one (X's photo button, LinkedIn's attach button, Gmail's paperclip) opens Chrome's native OS file picker. That dialog is rendered by the operating system, NOT the page, so CDP cannot see it, cannot interact with it, and the automation wedges.** This is the single most common way to lock up a browser session on any "compose with media" flow.
++
++**The only correct pattern:** call `browser_upload(selector, file_paths)`. It uses the CDP `DOM.setFileInputFiles` method, which sets the files directly on the input element's internal state as if the user had picked them — no OS dialog ever opens.
++
++```
++# WRONG — opens the native file picker, agent gets stuck
++browser_click_coordinate(photo_button_x, photo_button_y)   # ❌
++
++# RIGHT — sets the file programmatically, no dialog
++browser_upload(
++    selector="input[type='file']",          # the underlying file input
++    file_paths=["/absolute/path/to/image.png"],
++)
++```
++
++**Finding the file input.** On most modern SPAs the visible "Add photo" / "Attach" button is a styled `<button>` or `<label>`, and the real `<input type="file">` is hidden (often `display:none` or `opacity:0`, positioned offscreen, wrapped in a `<label for="...">`, or injected on click). Use `browser_evaluate` to enumerate ALL file inputs on the page first:
++
++```python
++browser_evaluate("""
++  (function(){
++    const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
++    return inputs.map(el => ({
++      name: el.name || '',
++      accept: el.accept || '',
++      multiple: el.multiple,
++      id: el.id || '',
++      inViewport: (() => {
++        const r = el.getBoundingClientRect();
++        return r.width > 0 && r.height > 0;
++      })(),
++    }));
++  })();
++""")
++```
++
++Then pass the most specific selector that uniquely identifies the right input (e.g. `input[type='file'][accept*='image']` for a photo-only upload). `browser_upload` doesn't care if the input is hidden or offscreen — `DOM.setFileInputFiles` works on any valid file input node, visible or not.
++
++**X / LinkedIn / Twitter pattern.** On X (`x.com/compose/post`), the photo upload input is `input[data-testid='fileInput']` — hidden, reachable via `browser_upload`. On LinkedIn feed compose, look for `input[type='file'][accept*='image']` inside the post-creation modal after clicking "Add media" (clicking the Add-media button reveals the input but does NOT open the dialog; only clicking the SECOND layer — the "From computer" entry — would trigger the picker. Stop at the first layer, find the input, call `browser_upload`).
++
++**Verification after upload.** `DOM.setFileInputFiles` dispatches a `change` event on the input but NOT the `click` / `focus` events that some sites gate their UI on. Always verify the upload actually took effect by screenshotting the composer (the uploaded image should appear as a preview) or by checking for a "preview" / "remove" element that only exists post-upload. If verification fails, the site may be reading the file via some other bridge — fall back to reading the file bytes and pasting them via the clipboard (`navigator.clipboard.write` with a `ClipboardItem`) through `browser_evaluate`.
++
++**If a native file picker DOES open** (you clicked the wrong thing): there is no recovery via CDP. Press Escape via `browser_press("Escape")` immediately — this dismisses the OS dialog in Chrome on Linux/macOS. Then find the actual `<input type='file'>` and use `browser_upload`.
++
++## Common pitfalls
++
++- **Typing into a rich-text editor without clicking first → send button stays disabled.** Draft.js (X), Lexical (Gmail, LinkedIn DMs), ProseMirror (Reddit), and React-controlled `contenteditable` elements only register input as "real" when the element received a native focus event — JS-sourced `.focus()` is not enough. `browser_type` now does this automatically via a real CDP pointer click before inserting text, but always verify the submit button's `disabled` state before clicking send. See the "ALWAYS click before typing" section above.
++- **Using per-character `keyDown` on Lexical / Draft.js editors → keys dispatch but text never appears.** Those editors intercept `beforeinput` and route insertion through their own state machine; raw keyDown events are silently dropped. `browser_type` now uses `Input.insertText` by default (the CDP IME-commit method) which these editors accept cleanly. Only set `use_insert_text=False` when you explicitly need per-keystroke dispatch.
++- **Leaving a composer with text then trying to navigate → `beforeunload` dialog hangs the bridge.** LinkedIn and several other sites pop a native "unsent message" confirm. `browser_navigate` and `close_tab` both time out against this. Always strip `window.onbeforeunload = null` via `browser_evaluate` before any navigation after typing in a composer, or wrap your logic in a `try/finally` that runs the cleanup block.
++- **Click landed in the wrong region (sidebar / header instead of target).** Check `focused_element` in the click response — it's ground truth for what actually got focused, including the `inFrame` breadcrumb when focus ends up inside a same-origin iframe. If it isn't the target (e.g. `className: "msg-conversation-listitem__link"` when you meant to hit a composer), adjust the fraction and retry. Coordinates you pass are fractions of the viewport; the tool multiplies by `cssWidth` / `cssHeight` internally, so a wrong result means your estimated proportion was off — not that any scale went sideways.
++- **Accidentally passing pixels to click / hover / press_at.** The tools reject any coord outside `[-0.1, 1.5]` with a clear error. If you see that error, you passed a pixel (like 815) instead of a fraction (like 0.475). Use `browser_get_rect` to get exact fractional cx/cy, or read proportions off `browser_screenshot`.
++- **Calling `wait_for_selector` on a shadow element.** It'll always time out. Use `browser_shadow_query` or the screenshot + coordinate strategy.
++- **Relying on `innerHTML` in injected scripts on LinkedIn.** Silently discarded. Use `createElement` + `appendChild`.
++- **Not waiting for SPA hydration.** `wait_until="load"` fires before React/Vue rendering on many sites. Add a 2–3 s sleep before querying for chrome elements.
++- **Using `browser_type(selector)` on LinkedIn DMs or any shadow-DOM input.** Won't find the element. Use `browser_click_coordinate` to focus, then `browser_type_focused(text=...)` to type.
++- **Clicking a "Photo" / "Attach" / "Upload" button to pick a file.** This opens Chrome's NATIVE OS file picker, which is rendered outside the web page and cannot be interacted with via CDP. Your automation will hang staring at an unreachable dialog. ALWAYS use `browser_upload(selector, file_paths)` against the underlying `<input type='file'>` element — see the "File uploads" section above for the full pattern. This is the single most common way to wedge a browser session on compose-with-media flows (X/LinkedIn/Gmail).
++- **Keyboard shortcuts without the `code` field.** Chrome's shortcut dispatcher ignores keyboard events that lack a `code` or `windowsVirtualKeyCode`. `browser_press(..., modifiers=[...])` populates these automatically; raw `Input.dispatchKeyEvent` calls from `browser_evaluate` may not.
++- **Taking a screenshot more than 10s after the last interaction** and expecting the highlight to still be visible. The overlay fades after 10s. Take the screenshot sooner, or re-trigger the interaction.
++- **Expecting `browser_navigate` to return when you specified `wait_until="networkidle"` on a busy site.** networkidle is approximate — some sites keep a websocket or analytics beacon open forever. Use `"load"` or `"domcontentloaded"` for reliable timing.
++
++## Dead CDP sessions and auto-recovery
++
++If Chrome detaches the debugger for its own reasons (tab closed, user opened DevTools manually, cross-origin navigation, `chrome://` page loaded), the bridge detects the "target closed" / "not attached" error on the next call and **automatically reattaches + retries once**. You don't need to handle this yourself.
++
++If reattach also fails, you'll get the underlying CDP error string — that's a real problem, usually the tab is gone.
++
++## `browser_evaluate` is a last-resort escape hatch
++
++**Before using `browser_evaluate`, try these first — in this order:**
++
++1. **`browser_screenshot` + `browser_click_coordinate`** — works on every site regardless of shadow DOM, iframes, obfuscated classes. This is the default path for "click a thing you can see."
++2. **`browser_type(use_insert_text=True, text=...)`** — for typing into ANY input/contenteditable, including Lexical and Draft.js. Handles click-focus-insert with built-in retries. Do **not** call `document.execCommand('insertText')` via evaluate; this tool already does it correctly.
++3. **`browser_shadow_query`** or **`browser_get_rect(selector)`** with the `>>>` shadow-piercing syntax — for selector-based lookups across shadow roots.
++4. **`browser_get_text` / `browser_get_attribute`** — for reading element state by selector.
++5. **`browser_snapshot`** — for dumping the accessibility tree of the page.
++
++If all five of those fit your goal, **do not use `browser_evaluate`.** Each evaluate call is a small LLM round-trip of ~30-100 tokens of JS plus a JSON response; five of them burn more context than a single screenshot-and-coordinate does, with less reliability.
++
++### Anti-patterns — stop immediately if you catch yourself doing these
++
++- **Trying multiple `querySelectorAll` variants when the first returned `[]`.** Different selectors on the same page rarely work if the first guess failed — modern SPAs obfuscate class names at build time. After one empty result, switch to `browser_screenshot` + `browser_click_coordinate`. Do not write `.artdeco-list__item`, then `[data-test-incoming-invitation-card]`, then `[class*="invitation"]` — you are already on the wrong path.
++- **Writing `walk(root)` recursive shadow-DOM traversal functions.** Use `browser_shadow_query` — it traverses at the CDP level (native C++), not by re-running a recursive JS function every call.
++- **Calling `document.execCommand('insertText', ...)` to type into a contenteditable.** Use `browser_type(use_insert_text=True, text='...')`. The high-level tool handles the exact same Lexical/Draft.js case but with click-focus-retry logic built in.
++- **Accessing `iframe.contentDocument`.** Rarely works (cross-origin, late hydration) and when it does, the code is brittle. Use `browser_screenshot` to see the iframe, then `browser_click_coordinate` to interact.
++- **Using `innerHTML = "<...>"` on a Trusted Types site (LinkedIn, GitHub).** The assignment is silently dropped. Use `createElement` + `appendChild` if you must inject DOM — but first, ask whether you really need to.
++- **Triggering React/Vue state via synthetic `dispatchEvent`.** Frameworks watch for real browser events. Use `browser_click_coordinate`, `browser_press`, or `browser_type` — all go through CDP's native event pipeline.
++
++### Legitimate uses (when nothing semantic fits)
++
++- Reading a computed style, `window.innerWidth/Height`, `document.scrollingElement.scrollTop`, or other layout values the tools don't expose.
++- Firing a one-shot site-specific API call (analytics beacon, feature-flag toggle).
++- Stripping `onbeforeunload` before navigating away from a page with an unsent draft (LinkedIn, Gmail).
++- Detecting whether a specific shadow-root host exists before a follow-up screenshot.
++
++In all of these cases the script is SHORT (< 10 lines) and the result is CONSUMED (read, then acted on), not further probed.
++
++## Login & auth walls
++
++- If you see a "Log in" or "Sign up" prompt, report the auth wall to user immediately — do NOT attempt to log in.
++- Check for cookie consent banners and dismiss them if they block content.
++
++## Error recovery
++
++- If a tool fails, retry once with the same approach.
++- If it fails a second time, STOP retrying and switch approach.
++- If `browser_snapshot` fails, try `browser_get_text` with a specific small selector as fallback.
++- If `browser_open` fails or page seems stale, `browser_stop`, then `browser_start`, then retry.
++
++## Verified workflows
++
++These sequences have been empirically verified against real production sites on 2026-04-11.
++
++### Search on X and read the live dropdown
++
++```
++browser_navigate("https://x.com/explore", wait_until="load")
++# Wait for SPA hydration
++sleep(3)
++browser_wait_for_selector("input[data-testid='SearchBox_Search_Input']", timeout_ms=5000)
++rect = browser_get_rect("input[data-testid='SearchBox_Search_Input']")
++browser_click_coordinate(rect.cx, rect.cy)
++browser_type("input[data-testid='SearchBox_Search_Input']", "openai", clear_first=True)
++# Screenshot now shows live search suggestions
++browser_screenshot()
++browser_press("Escape", selector="input[data-testid='SearchBox_Search_Input']")
++```
++
++### Search Reddit (shadow DOM)
++
++```
++browser_navigate("https://www.reddit.com/r/programming/", wait_until="load")
++sleep(2)
++# Shadow-pierce the nested search input
++sq = browser_shadow_query("reddit-search-large >>> #search-input")
++browser_click_coordinate(sq.rect.cx, sq.rect.cy)
++# Typing can't use selector (shadow); use browser_type_focused on the focused input
++browser_type_focused(text="python")
++browser_screenshot()
++browser_press("Escape")
++```
++
++### Search LinkedIn and dismiss without submitting
++
++```
++browser_navigate("https://www.linkedin.com/feed/", wait_until="load")
++sleep(3)
++browser_wait_for_selector("input[data-testid='typeahead-input']", timeout_ms=5000)
++rect = browser_get_rect("input[data-testid='typeahead-input']")
++browser_click_coordinate(rect.cx, rect.cy)
++browser_type("input[data-testid='typeahead-input']", "anthropic", clear_first=True)
++# Dropdown shows real live suggestions
++browser_screenshot()
++browser_press("Escape", selector="input[data-testid='typeahead-input']")
++```
++
++## Debugging checklist when a click / type "didn't work"
++
++1. **Send button stays disabled after typing?** Two possible causes. (a) You didn't click the input first, so React never saw a native focus event. `browser_type` now clicks automatically — but if you're using raw `Input.dispatchKeyEvent`, click first yourself. (b) You're using per-character `keyDown` on a Lexical / Draft.js editor, and those editors dropped the keys because they listen for `beforeinput` with a specific shape. Switch to `browser_type(selector, text)` (which now uses `Input.insertText` by default) or, at a lower level, call CDP `Input.insertText` directly. Always `browser_evaluate` the submit button's `disabled` / `aria-disabled` state before clicking send; if still disabled after those fixes, the framework never saw real input.
++2. **Did the selector match anything?** Run `browser_get_rect(selector)` — if it returns `visible=False` or zero rect, the element isn't laid out yet. Wait longer or use a different selector.
++3. **Is the element inside a shadow root?** Try `browser_shadow_query(path)`. If your selector is light-DOM only, switch to the screenshot + coordinate strategy.
++4. **Did the click hit something on top of the element?** Register a temporary event listener via `browser_evaluate` on the target element, click, then read `window.__hits` to see what actually received the click. If something else is intercepting (overlay, modal, floating button), dismiss it first.
++5. **Did `type_text` find the element but fail to insert text?** Some editors (Draft.js on X, ProseMirror on some sites, Monaco) require a small `delay_ms` between keystrokes. Try `delay_ms=20`.
++6. **Is this a keyboard shortcut that doesn't fire?** Make sure you're using `browser_press(key, modifiers=[...])` — not raw `browser_evaluate` with `dispatchEvent`. Chrome ignores shortcut key events that lack `code` and `windowsVirtualKeyCode`.
++7. **Did the navigation actually complete?** Check the return value of `browser_navigate` — it now returns a real `url` and `title`. An empty title usually means a blank page or a hung load.
++8. **Is your screenshot stale?** The highlight overlay stays for 10 s; if the screenshot was taken later, the annotation is gone but the click was real. Check the logs of `browser_click_coordinate` to see the coordinates that were actually sent.
+diff --git a/core/framework/skills/_preset_skills/linkedin-automation/SKILL.md b/core/framework/skills/_preset_skills/linkedin-automation/SKILL.md
+new file mode 100644
+index 00000000..a2e49655
+--- /dev/null
++++ b/core/framework/skills/_preset_skills/linkedin-automation/SKILL.md
+@@ -0,0 +1,397 @@
++---
++name: hive.linkedin-automation
++description: Read before automating LinkedIn with browser_* tools. LinkedIn combines shadow DOM (#interop-outlet), strict Trusted Types CSP that silently drops innerHTML, Lexical composer, native beforeunload dialogs that hang the bridge, and aggressive spam filters — each has bitten us at least once. Verified flows for profile messaging, connection-request acceptance, feed composition, and search. Requires hive.browser-automation. Verified against logged-in production 2026-04-11.
++metadata:
++  author: hive
++  type: default-skill
++  version: "1.0"
++  verified: 2026-04-11
++  requires_skill: hive.browser-automation
++---
++
++# LinkedIn Automation
++
++LinkedIn is the hardest mainstream site to automate because it combines **shadow DOM** (`#interop-outlet` for messaging), **strict Trusted Types CSP** (silently drops `innerHTML`), **heavy React reconciliation** (injected nodes get stripped on re-render), **native `beforeunload` draft dialogs** (hang the bridge), and **aggressive spam filters**. Every one of those has bit us at least once. This skill documents what actually works.
++
++**Always activate `browser-automation` first.** This skill assumes you already know about CSS-px coordinates, `browser_type`/`browser_type_focused`, and `browser_shadow_query`. The guidance below is LinkedIn-specific; general browser rules are there.
++
++## Rule #0: screenshot + coordinates, not selectors
++
++LinkedIn changes class names aggressively and hides composers inside shadow roots AND iframes. **Selectors break constantly.** Your default strategy on every LinkedIn page should be:
++
++1. `browser_screenshot()` — see the page visually
++2. Pick the target's position from the image
++3. `browser_coords(image_x, image_y)` → get CSS pixels
++4. `browser_click_coordinate(css_x, css_y)` — reaches shadow DOM, iframes, and React elements indifferently
++5. `browser_type(use_insert_text=True, text=...)` — types into whatever is focused, including Lexical composers
++
++**If `browser_evaluate(...querySelectorAll...)` returns `[]` even once, do not try a different selector.** Stop, screenshot, and click. The "what if I try `.artdeco-list__item` next" instinct has burned ~50 tool calls in real sessions before the agent pivoted. Don't fall into that loop.
++
++The selectors in the table below are **only** for when you already know the target is in the light DOM and you want a faster path than screenshot+coord. **When in doubt, default to coordinates.**
++
++## Invitation manager — inline message button path is BROKEN
++
++If the user asks to message a connection request **from the invitation manager page without accepting first**, the inline "Message" button opens a composer inside a nested **iframe overlay** (not a shadow root). The iframe's `contentDocument` is either cross-origin-blocked or not hydrated at access time. This path is **not reliably automatable today.**
++
++**Redirect:** click the person's name/profile link on the card, go to the profile page, and use the standard Profile Message flow below. The profile flow is battle-tested; the inline-iframe flow isn't.
++
++If you end up writing `document.activeElement.tagName === 'IFRAME'` inside a `browser_evaluate`, you've hit this trap. Stop and go to the profile page.
++
++## Timing expectations
++
++- `browser_navigate(wait_until="load")` — LinkedIn takes **4–5 seconds** to load the feed cold.
++- After navigation, **always `sleep(3)`** to let React hydrate the profile/feed chrome before querying selectors. Without the sleep `wait_for_selector` will flake on elements that exist moments later.
++- Composer modal slide-in takes **~2 seconds** after you click the Message button.
++
++## Verified selectors
++
++| Target | Selector | Notes |
++|---|---|---|
++| Global search input | `input[data-testid='typeahead-input']` | Light DOM, straightforward |
++| Own profile link | `a[href*='linkedin.com/in/']` | Top nav; filter to the one near top-left |
++| Profile **Message** action | `a[href*='/messaging/compose/']` filtered by `NON_SELF_PROFILE_VIEW` AND no `body=` param AND `x < 700` | **Is an `<a>`**, not a `<button>`. Multiple match; filter carefully. |
++| Modal composer textarea | `div.msg-form__contenteditable` (inside `#interop-outlet` shadow) | **Multiple instances exist** — pick largest-area **in-viewport** one. |
++| Modal Send button | `button.msg-form__send-button` (inside `#interop-outlet` shadow) | Same multi-instance trap — filter by `y + height <= innerHeight`. |
++| Invitation manager | navigate to `https://www.linkedin.com/mynetwork/invitation-manager/received/` | Direct URL is faster than nav-link clicking |
++| Pending connection card | `.invitation-card, .invitations-card, [data-test-incoming-invitation-card]` | Filter out "invited you to follow" / "subscribe" cards |
++| Accept button | `button[aria-label*="Accept"]` within the card scope | Per-card scoping is critical — there are many Accept buttons on the page |
++
++LinkedIn changes class names aggressively. If a class-based selector breaks, fall back to **`browser_screenshot` → visual identification → `browser_click_coordinate`** with the pixel you read straight off the image (screenshots are CSS-sized, no conversion). The screenshot + coord path works regardless of class-name churn and regardless of shadow DOM.
++
++## Profile Message flow (verified end-to-end 2026-04-11)
++
++```
++# 1. Load the profile
++browser_navigate("https://www.linkedin.com/in/<username>/", wait_until="load")
++sleep(3)
++
++# 2. Strip onbeforeunload before any state-mutating work — prevents draft-dialog deadlock later
++browser_evaluate("""
++  (function(){
++    window.onbeforeunload = null;
++    window.addEventListener('beforeunload', e => e.stopImmediatePropagation(), true);
++  })();
++""")
++
++# 3. Find the profile Message link (NOT a button, and multiple exist)
++msg_btn = browser_evaluate("""
++  (function(){
++    const links = Array.from(document.querySelectorAll('a[href*="/messaging/compose/"]'));
++    for (const a of links){
++      const href = a.href || '';
++      if (!href.includes('NON_SELF_PROFILE_VIEW')) continue;
++      if (href.includes('body=')) continue;            // reject Premium upsell
++      const r = a.getBoundingClientRect();
++      if (r.width === 0 || r.x > 700) continue;        // reject sidebar / "More profiles for you"
++      return {cx: r.x + r.width / 2, cy: r.y + r.height / 2};
++    }
++    return null;
++  })();
++""")
++browser_click_coordinate(msg_btn['cx'], msg_btn['cy'])
++sleep(2.5)  # composer modal slide-in
++
++# 4. Find the modal composer textarea (pick biggest in-viewport; reject pinned chat bar)
++textarea = browser_evaluate("""
++  (function(){
++    const vh = window.innerHeight, vw = window.innerWidth;
++    const candidates = [];
++    function walk(root){
++      const els = root.querySelectorAll ?
++        root.querySelectorAll('div.msg-form__contenteditable') : [];
++      for (const el of els){
++        const r = el.getBoundingClientRect();
++        if (r.width <= 0 || r.height <= 0) continue;
++        if (r.y < 0 || r.y + r.height > vh) continue;  // reject pinned bar (below viewport)
++        if (r.x < 0 || r.x + r.width > vw) continue;
++        candidates.push({cx: r.x + r.width/2, cy: r.y + r.height/2, area: r.width * r.height});
++      }
++      const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
++      for (const host of all){ if (host.shadowRoot) walk(host.shadowRoot); }
++    }
++    walk(document);
++    if (!candidates.length) return null;
++    candidates.sort((a, b) => b.area - a.area);
++    return candidates[0];
++  })();
++""")
++
++# 5. Click to focus the modal composer (click-first is mandatory for Lexical)
++browser_click_coordinate(textarea['cx'], textarea['cy'])
++sleep(0.6)
++
++# 6. Insert text via browser_type_focused. This dispatches CDP
++#    Input.insertText to document.activeElement — the same underlying
++#    mechanism as execCommand('insertText') but with no JSON escaping,
++#    no browser_evaluate round trip, and built-in retry. The click in
++#    step 5 already focused Lexical, so insertText lands in the editor
++#    regardless of the shadow wrapping around #interop-outlet.
++#
++#    Use browser_type_focused (not browser_type) here — browser_type
++#    requires a selector, which cannot see past the #interop-outlet
++#    shadow root. browser_type_focused targets document.activeElement
++#    directly, sidestepping shadow boundaries entirely.
++browser_type_focused(text=message_text)
++sleep(1.0)   # let Lexical commit state + enable Send button
++
++# 7. Find the modal Send button (filter by in-viewport, reject pinned bar)
++send = browser_evaluate("""
++  (function(){
++    const vh = window.innerHeight;
++    function walk(root){
++      const btns = root.querySelectorAll ? root.querySelectorAll('button') : [];
++      for (const b of btns){
++        const cls = (b.className || '').toString();
++        const txt = (b.textContent || '').trim();
++        if (!cls.includes('send-button') && txt !== 'Send') continue;
++        const r = b.getBoundingClientRect();
++        if (r.width <= 0 || r.y + r.height > vh) continue;
++        return {
++          cx: r.x + r.width/2, cy: r.y + r.height/2,
++          disabled: b.disabled || b.getAttribute('aria-disabled') === 'true',
++        };
++      }
++      const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
++      for (const host of all){
++        if (host.shadowRoot){
++          const got = walk(host.shadowRoot);
++          if (got) return got;
++        }
++      }
++      return null;
++    }
++    return walk(document);
++  })();
++""")
++
++# 8. ONLY click Send if it's enabled — if disabled, the insertText
++#    didn't land. DO NOT retry with a different tool; the fix is
++#    always: re-click the composer rect, re-run browser_type_focused(text=...),
++#    re-check. The Send button's `disabled` state IS the ground truth —
++#    if Lexical registered your text, it enables the button. If it's
++#    still disabled, your text did not reach the editor, regardless
++#    of what any tool call claims.
++if send['disabled']:
++    # The editor didn't receive your text. Do NOT click Send. Do NOT
++    # fall back to browser_type with a selector (see anti-pattern in
++    # Common Pitfalls — selector-based type can't reach the shadow-DOM
++    # composer). Instead: re-click the textarea rect from step 4, wait
++    # a beat, re-run browser_type_focused(text=message_text) from
++    # step 6. If that still fails after 2 retries, bail and surface —
++    # the modal may have been reclaimed by a stale state or auth wall.
++    raise Exception("Send button disabled after insertText — editor did not receive input")
++
++browser_click_coordinate(send['cx'], send['cy'])
++sleep(2.5)  # wait for send + bubble render
++```
++
++**Verify post-send**: the composer textarea should now be empty (`innerText === ''`) and `.msg-s-event-listitem__message-bubble` count should have grown by 1. Walk the shadow tree via `browser_evaluate` to check.
++
++## Connection request acceptance flow
++
++Daily outbound pattern — accept pending connection requests and send a templated welcome message.
++
++```
++browser_navigate("https://www.linkedin.com/mynetwork/invitation-manager/received/",
++                 wait_until="load")
++sleep(4)
++browser_evaluate("(function(){window.onbeforeunload=null;})()")
++
++# Scan pending connection cards — FILTER OUT follow/subscribe invitations
++cards = browser_evaluate("""
++  (function(){
++    const out = [];
++    const cards = document.querySelectorAll('[data-test-incoming-invitation-card], .invitation-card');
++    for (const c of cards){
++      const text = (c.textContent || '').toLowerCase();
++      if (text.includes('invited you to follow')) continue;
++      if (text.includes('invited you to subscribe')) continue;
++      const nameEl = c.querySelector('a[href*="/in/"], strong');
++      const name = nameEl ? nameEl.textContent.trim().split(/\\s+/)[0] : '';
++      const accept = c.querySelector('button[aria-label*="Accept"]');
++      if (!accept) continue;
++      const r = accept.getBoundingClientRect();
++      out.push({
++        first_name: name,
++        cx: r.x + r.width/2, cy: r.y + r.height/2,
++      });
++      if (out.length >= 25) break;   // strict daily cap — see rate limits below
++    }
++    return out;
++  })();
++""")
++
++# Process cards one at a time with human-like cadence
++for card in cards[:25]:
++    browser_click_coordinate(card['cx'], card['cy'])   # click Accept
++    sleep(2)
++    # After accepting, a "Message" button appears on the card — navigate to
++    # the profile and run the profile Message flow above, personalized by first_name.
++    # OR: if the "Message" button is inline on the card, click it directly and
++    # use the shadow-root composer flow.
++    sleep(random.uniform(5, 10))  # human-like delay BETWEEN targets
++```
++
++**Don't do 25 back-to-back sends with zero delay.** LinkedIn's spam filter catches this. 5–10 second randomized sleeps between sends, hard cap at 25 per 24h window.
++
++## Feed post composer flow
++
++```
++browser_navigate("https://www.linkedin.com/feed/", wait_until="load")
++sleep(4)
++browser_evaluate("(function(){window.onbeforeunload=null;})()")
++
++# Click the "Start a post" trigger
++start_trigger = browser_get_rect("button.share-box-feed-entry__trigger, [aria-label*='Start a post']")
++browser_click_coordinate(start_trigger.cx, start_trigger.cy)
++sleep(1.5)  # modal slide-in
++
++# Find the post editor inside the modal (also contenteditable, may not be in shadow)
++editor = browser_get_rect("div[contenteditable=true][aria-placeholder*='talk about']")
++browser_click_coordinate(editor.cx, editor.cy)
++sleep(0.5)
++browser_type("div[contenteditable=true][aria-placeholder*='talk about']", post_text)
++sleep(1.0)
++
++# Verify Post button enabled before clicking
++state = browser_evaluate("""
++  (function(){
++    const btn = document.querySelector('button.share-actions__primary-action');
++    if (!btn) return {found: false};
++    return {
++      found: true,
++      disabled: btn.disabled || btn.getAttribute('aria-disabled') === 'true',
++    };
++  })();
++""")
++if state['found'] and not state['disabled']:
++    browser_click("button.share-actions__primary-action")
++```
++
++## Posting WITH an image attached
++
++**Do NOT click the "Add media" / image icon inside the feed post composer to pick a file.** LinkedIn renders a styled button that opens Chrome's native OS file picker when clicked, and that dialog is unreachable via CDP — the automation will hang on an invisible modal. Use `browser_upload` directly against the hidden `<input type='file'>`:
++
++```python
++# After the post modal is open and the editor has text:
++# (A) First, click "Add media" to surface the file input
++#     (clicking THIS button reveals the input but does NOT itself open
++#     the OS picker on current LinkedIn — the picker only opens if
++#     you click the inner "Choose from your device" entry).
++media_btn = browser_get_rect("button[aria-label*='image'], button[aria-label*='photo']")
++browser_click_coordinate(media_btn.cx, media_btn.cy)
++sleep(0.8)
++
++# (B) Enumerate file inputs to find the right one
++inputs = browser_evaluate("""
++  (function(){
++    return Array.from(document.querySelectorAll('input[type="file"]'))
++      .map((el, i) => ({
++        idx: i,
++        accept: el.accept || '',
++        name: el.name || '',
++      }));
++  })();
++""")
++# Expect to see one with accept='image/*' or accept containing 'image/jpeg'
++
++# (C) Set the file programmatically — no dialog
++browser_upload(
++    selector="input[type='file'][accept*='image']",
++    file_paths=["/absolute/path/to/logo.png"],
++)
++sleep(3)  # LinkedIn shows an upload-progress bar + preview
++
++# (D) Verify the image preview rendered before clicking Post
++preview_ok = browser_evaluate("""
++  (function(){
++    // LinkedIn shows the preview as an <img> inside
++    // .share-creation-state__image-preview or similar.
++    return !!document.querySelector(
++      '.share-creation-state__preview img, .image-preview-container img'
++    );
++  })();
++""")
++if not preview_ok:
++    raise Exception("LinkedIn image upload did not render — do NOT click Post")
++
++# (E) Now click Post as usual
++browser_click("button.share-actions__primary-action")
++sleep(4)  # media post takes longer to commit than text-only
++```
++
++If the image isn't already on disk, write it first with `write_file(absolute_path, bytes)`. `browser_upload` only accepts absolute paths.
++
++## Rate limits and safety
++
++LinkedIn's abuse detection is aggressive. Beware of the limits, let user know but dare to break them if user confirms.:
++
++| Action | Limit |
++|---|---|
++| Outbound messages to non-connections | **Do not attempt** — will get you warned or restricted |
++| Outbound messages to new 1st-degree connections | **25/day max**, 5–10s randomized delays |
++| Connection request sends | **100/week max**, spread across days, warm intros preferred |
++| Profile views | Several hundred/day is usually fine but varies by account age |
++| Post publications | 1–5/day, no URL-only posts |
++
++Signals you're being throttled:
++- "Message failed to send" with no error detail
++- Redirect to `https://www.linkedin.com/checkpoint/challenge/...`
++- Profile views showing stale data
++- Connection requests auto-withdrawn after a few hours
++
++If any of those show up, **stop the run, screenshot the state, and surface the issue to the human operator.** Do not retry.
++
++## Common pitfalls
++
++- **`innerHTML` injection is silently dropped** — LinkedIn's Trusted Types CSP discards any `innerHTML = "<...>"` from injected scripts, no console error. Always use `createElement` + `appendChild` + `setAttribute` for DOM injection. `textContent`, `style.cssText`, and `.value` assignments are fine.
++- **Use `browser_type_focused` (not `browser_type`) on the message composer.** The Lexical contenteditable lives inside the `#interop-outlet` shadow root which `document.querySelector` (what `browser_type`'s selector path uses under the hood) cannot see. `browser_type` requires a selector and will fail with "Element not found". The reliable insert path is: (1) `browser_click_coordinate` on the composer rect — the response's `focused_element` confirms Lexical received focus → (2) `browser_type_focused(text=message_text)` — CDP `Input.insertText` dispatches to `document.activeElement` regardless of shadow wrapping.
++- **Per-char keyDown on the message composer produces empty text** — Lexical intercepts `beforeinput` and drops raw keys. Use `browser_type_focused(text=..., use_insert_text=True)` after click-coordinate focused the composer. The CDP `Input.insertText` method commits as if IME fired, which Lexical accepts cleanly.
++- **Multiple Send buttons on the page** — the pinned bottom-right messaging bar has its own `msg-form__send-button` that's usually below `innerHeight`. Filter by in-viewport before clicking.
++- **`window.onbeforeunload` hangs navigation/close** — after typing in a composer, any `browser_navigate` or `close_tab` can pop a native "unsent message, leave?" confirm dialog that deadlocks the bridge. Always strip `onbeforeunload` before any navigation, and wrap composer flows in a `try/finally` that runs the cleanup block:
++
++```
++# Cleanup on exit — run even if the flow crashed mid-type.
++browser_evaluate("""
++  (function(){
++    window.onbeforeunload = null;
++    const h = document.getElementById('__hive_hl');
++    if (h) { try { h.__hiveStop && h.__hiveStop(); } catch(_){}; h.remove(); }
++  })();
++""")
++```
++
++- **SPA reconciliation strips injected overlays** — LinkedIn's React reconciler removes foreign children of `documentElement` on re-render. The framework highlight overlay survives (re-mount observer + bounded retries), but test overlays injected via raw `browser_evaluate` may not. If you need a stable test overlay, append it to `document.documentElement` AND wrap in a `MutationObserver` that re-appends on removal, capped at ~20 retries.
++- **Profile page chrome is not in the AX snapshot** — `browser_snapshot` on a profile misses a lot of the structured layout. Use `browser_screenshot` to orient; use specific selectors or the shadow-walk pattern for actions.
++- **Name parsing from a connection card is fragile** — the card layout changes every few months. Prefer `.textContent.split(/\s+/)[0]` on the first link inside the card rather than relying on a class like `.invitation-card-name`.
++
++## Auth wall detection
++
++If you see a "Log in" / "Join LinkedIn" prompt instead of the logged-in feed, **stop immediately** and surface the issue to user. Do NOT attempt to log in via automation — LinkedIn's bot detection will flag the account.
++
++Check via:
++```
++is_logged_in = browser_evaluate("""
++  (function(){
++    return !!document.querySelector('nav.global-nav') ||
++           !!document.querySelector('[data-test-global-nav-me]');
++  })();
++""")
++```
++
++## Deduplication pattern
++
++Dedup is handled by the colony progress queue, not a separate JSON file. For any daily loop (connection acceptance, profile visits, DMs), the queen enqueues one row in the `tasks` table per `(profile_url, action)` pair; workers claim, act, and mark done. Already-`done` rows are skipped on the next claim — that's your crash-resume and cross-day dedup. See `hive.colony-progress-tracker` for the full claim/update protocol.
++
++If you need to check whether a given `(profile_url, action)` has already been handled in a prior run before enqueuing a new row, query the queue directly:
++
++```bash
++sqlite3 "<db_path>" "SELECT status FROM tasks WHERE payload LIKE '%\"profile_url\":\"<url>\"%' AND payload LIKE '%\"action\":\"<action>\"%';"
++```
++
++Empty → not yet enqueued, safe to add. Otherwise honor the existing row's status.
++
++## See also
++
++- `browser-automation` skill — general CDP/coord/screenshot rules, the click-then-type pattern, shadow-DOM strategy
++- `x-automation` skill — X/Twitter equivalent
+diff --git a/core/framework/skills/_preset_skills/x-automation/SKILL.md b/core/framework/skills/_preset_skills/x-automation/SKILL.md
+new file mode 100644
+index 00000000..0632fbb8
+--- /dev/null
++++ b/core/framework/skills/_preset_skills/x-automation/SKILL.md
+@@ -0,0 +1,402 @@
++---
++name: hive.x-automation
++description: Read before automating X / Twitter with browser_* tools. Verified flows for post, reply, delete, search-and-engage, plus the Draft.js compose quirks that silently disable the send button. Includes the daily-reply and job-market-reply playbooks. Requires hive.browser-automation for the underlying screenshot + coordinate workflow. Verified 2026-04-11.
++metadata:
++  author: hive
++  type: default-skill
++  version: "1.0"
++  verified: 2026-04-11
++  requires_skill: hive.browser-automation
++---
++
++# X / Twitter Automation
++
++X uses **Draft.js** (the original Facebook rich-text editor) for the compose text area, which was the original canary for all the rich-text editor quirks the `browser-automation` skill now documents. Most of the site is otherwise stable — `data-testid` attributes have held up for years, the SPA is reasonably honest about what it renders, and shadow DOM is minimal. The hard parts are the composer, rate limiting, and the occasional anti-bot challenge.
++
++**Always activate `browser-automation` first.** This skill assumes you already know about CSS-px coordinates, click-first typing, and `Input.insertText`. The guidance below is X-specific.
++
++## Timing expectations
++
++- `browser_navigate(wait_until="load")` returns in **1.3–1.6 s** on a warm cache.
++- After navigation, **`sleep(2–3)`** for SPA hydration before querying selectors.
++- Compose modal slide-in: **~1.5 s** after clicking reply / compose.
++- First 1–2 characters typed into the compose editor **may be dropped** — see "Draft.js quirks" below.
++
++## Verified selectors (2026-04-11)
++
++| Target | Selector |
++|---|---|
++| Home nav link | `a[data-testid='AppTabBar_Home_Link']` |
++| Explore nav link | `a[data-testid='AppTabBar_Explore_Link']` |
++| Notifications | `a[data-testid='AppTabBar_Notifications_Link']` |
++| Main search input | `input[data-testid='SearchBox_Search_Input']` |
++| Compose text area | `[data-testid='tweetTextarea_0']` (Draft.js contenteditable) |
++| Post / Tweet submit button | `[data-testid='tweetButton']` |
++| Reply button (on feed / tweet detail) | `[data-testid='reply']` |
++| Like button | `[data-testid='like']` |
++| Retweet / repost button | `[data-testid='retweet']` |
++| Caret (⋯) menu on a post | `[data-testid='caret']` |
++| Confirmation sheet confirm button | `[data-testid='confirmationSheetConfirm']` |
++| Tweet article wrapper | `article[data-testid='tweet']` |
++| Close modal / composer | `[aria-label='Close']` or press `Escape` |
++
++All of these are light-DOM `data-testid` attributes — `wait_for_selector` and `browser_type(selector=...)` work on them directly, no shadow piercing needed.
++
++## Post new tweet flow
++
++```
++browser_navigate("https://x.com/home", wait_until="load")
++sleep(3)
++
++# Open the compose UI (click the post-new-tweet nav or use shortcut N)
++browser_press("n")   # keyboard shortcut — opens compose modal
++sleep(1.5)
++
++# Click the textarea to make sure Draft.js is in edit mode
++ta_rect = browser_get_rect("[data-testid='tweetTextarea_0']")
++browser_click_coordinate(ta_rect.cx, ta_rect.cy)
++sleep(0.5)
++
++# Type — browser_type handles Draft.js correctly now via Input.insertText
++browser_type("[data-testid='tweetTextarea_0']", tweet_text)
++sleep(1.0)  # let Draft.js commit state
++
++# Verify the Post button is enabled — never click blindly, Draft.js sometimes
++# doesn't register the input even with a prior click.
++state = browser_evaluate("""
++  (function(){
++    const btn = document.querySelector('[data-testid="tweetButton"]');
++    if (!btn) return {found: false};
++    return {
++      found: true,
++      disabled: btn.disabled || btn.getAttribute('aria-disabled') === 'true',
++    };
++  })();
++""")
++if state['found'] and not state['disabled']:
++    browser_click("[data-testid='tweetButton']")
++    sleep(2)
++    browser_press("Escape")  # close any leftover modal
++```
++
++## Posting a tweet WITH an image
++
++**Critical: NEVER click the photo button.** On `x.com/compose/post` the media button is a styled `<button>` that triggers Chrome's native OS file picker when clicked — that dialog is unreachable via CDP and will wedge the automation. Instead, set the file directly on the hidden `<input type='file'>` element using `browser_upload`:
++
++```python
++# 1. Open the compose modal as usual
++browser_press("n")
++sleep(1.5)
++browser_click_coordinate(ta_rect.cx, ta_rect.cy)
++sleep(0.5)
++browser_type("[data-testid='tweetTextarea_0']", tweet_text)
++
++# 2. Find the hidden file input X uses for media uploads.
++#    X's input is marked with data-testid='fileInput' and accepts
++#    image/*,video/*. It's hidden (display:none) but still mounted.
++inputs = browser_evaluate("""
++  (function(){
++    return Array.from(document.querySelectorAll('input[type="file"]'))
++      .map(el => ({
++        testid: el.getAttribute('data-testid') || '',
++        accept: el.accept || '',
++        multiple: el.multiple,
++      }));
++  })();
++""")
++# Expect to see: [{testid: 'fileInput', accept: 'image/jpeg,...', multiple: true}]
++
++# 3. Set the file WITHOUT opening any dialog
++browser_upload(
++    selector="input[data-testid='fileInput']",
++    file_paths=["/absolute/path/to/photo.png"],
++)
++sleep(2)  # X takes ~1-2s to show the preview thumbnail
++
++# 4. Verify the preview rendered before posting — if not, the upload
++#    didn't land and Post button will fail.
++preview = browser_evaluate("""
++  (function(){
++    // X renders uploaded media as an <img> with data-testid='attachments'
++    // (or similar) inside the composer.
++    const att = document.querySelector('[data-testid="attachments"] img');
++    return { hasPreview: !!att };
++  })();
++""")
++if not preview['hasPreview']:
++    raise Exception("Upload didn't render in composer — do NOT click Post")
++
++# 5. Now click Post as usual
++browser_click("[data-testid='tweetButton']")
++sleep(3)  # media upload + post takes longer than text-only
++browser_press("Escape")
++```
++
++If you don't already have the image file on disk, write it first: `write_file("/tmp/x_upload.png", base64_bytes)` or copy from a known location. `browser_upload` requires an absolute file path — relative paths and `~` expansion are not supported.
++
++## Reply to a post flow
++
++The reply flow is the same shape as posting, with a few scroll / find-and-click steps before.
++
++```
++browser_navigate("https://x.com/home", wait_until="load")
++sleep(3)
++
++# Load content by scrolling — X lazy-loads feed items
++browser_scroll(direction="down", amount=2000)
++sleep(1.5)
++
++# Find replyable tweets — reply buttons, in visual/feed order
++candidates = browser_evaluate("""
++  (function(){
++    const tweets = document.querySelectorAll('article[data-testid="tweet"]');
++    const out = [];
++    tweets.forEach((t, i) => {
++      const reply = t.querySelector('[data-testid="reply"]');
++      if (!reply) return;
++      const r = reply.getBoundingClientRect();
++      if (r.width <= 0 || r.y < 0 || r.y > window.innerHeight) return;
++      const text = (t.textContent || '').slice(0, 120);
++      out.push({
++        index: i,
++        preview: text,
++        cx: r.x + r.width/2,
++        cy: r.y + r.height/2,
++      });
++    });
++    return out;
++  })();
++""")
++
++# For each unreplied candidate...
++for c in candidates:
++    if already_replied(c['preview']):
++        continue  # see dedup pattern below
++
++    # Click reply
++    browser_click_coordinate(c['cx'], c['cy'])
++    sleep(1.5)  # composer slide-in
++
++    # Click the textarea to focus Draft.js
++    ta = browser_get_rect("[data-testid='tweetTextarea_0']")
++    browser_click_coordinate(ta.cx, ta.cy)
++    sleep(0.5)
++
++    # Type the reply
++    browser_type("[data-testid='tweetTextarea_0']", reply_text)
++    sleep(1.5)   # Draft.js state commit takes a beat
++
++    # Verify button enabled
++    state = browser_evaluate("""
++      (function(){
++        const b = document.querySelector('[data-testid="tweetButton"]');
++        return b ? {d: b.disabled || b.getAttribute('aria-disabled') === 'true'} : {d: true};
++      })();
++    """)
++    if state['d']:
++        # Recovery: click the textarea again + one extra character toggles React state
++        browser_click_coordinate(ta.cx, ta.cy)
++        browser_press("End")
++        browser_press(" ")
++        browser_press("Backspace")
++        sleep(0.5)
++    else:
++        browser_click("[data-testid='tweetButton']")
++        sleep(2)
++        # Mark the task done in progress.db — see hive.colony-progress-tracker
++
++    # Close the composer (press Escape or click the Close button)
++    browser_press("Escape")
++    sleep(random.uniform(10, 20))   # human cadence — see rate limits
++```
++
++## Search-and-engage flow
++
++For "daily reply to live posts matching query X" — e.g. job-market replies.
++
++```
++query = "job market"
++url = f"https://x.com/search?q={urllib.parse.quote(query)}&src=typed_query&f=live"
++browser_navigate(url, wait_until="load")
++sleep(3)
++browser_scroll("down", 2000)
++sleep(1.5)
++
++# Same replyable-tweets probe as above, then same reply-to-tweet loop
++```
++
++## Delete a post flow
++
++```
++browser_navigate("https://x.com/<your_username>/with_replies", wait_until="load")
++sleep(3)
++
++# Find the target article (by text match or index)
++target_caret = browser_evaluate("""
++  (function(target_text){
++    const tweets = document.querySelectorAll('article[data-testid="tweet"]');
++    for (const t of tweets){
++      if (!(t.textContent || '').includes(target_text)) continue;
++      const caret = t.querySelector('[data-testid="caret"]');
++      if (!caret) continue;
++      const r = caret.getBoundingClientRect();
++      return {cx: r.x + r.width/2, cy: r.y + r.height/2};
++    }
++    return null;
++  })();
++""", target_text)
++
++browser_click_coordinate(target_caret['cx'], target_caret['cy'])
++sleep(0.8)   # menu animation
++
++# The Delete menuitem doesn't have a stable data-testid — find by text
++delete_rect = browser_evaluate("""
++  (function(){
++    const items = document.querySelectorAll('[role="menuitem"]');
++    for (const el of items){
++      if ((el.textContent || '').trim() === 'Delete'){
++        const r = el.getBoundingClientRect();
++        return {cx: r.x + r.width/2, cy: r.y + r.height/2};
++      }
++    }
++    return null;
++  })();
++""")
++browser_click_coordinate(delete_rect['cx'], delete_rect['cy'])
++sleep(0.8)
++
++# Confirmation sheet — this one DOES have a stable testid
++browser_click("[data-testid='confirmationSheetConfirm']")
++sleep(1.5)
++```
++
++## Draft.js quirks
++
++X's compose editor is the canonical test case for every rich-text-editor bug the GCU bridge has ever had. What you need to know:
++
++- **Click the textarea first.** Mandatory. Without a native click-sourced focus event, Draft.js's editor state never enters edit mode, and the Post button stays disabled regardless of how much text you type. `browser_type` now does this click automatically.
++
++- **`browser_type` uses CDP `Input.insertText` by default**, which Draft.js accepts cleanly. The older approach — per-character `Input.dispatchKeyEvent` with `delay_ms=20` — *also* works, but insertText is more reliable and faster. Only pass `delay_ms > 0` (which falls back to per-char dispatch) if you're specifically testing the keystroke timing path.
++
++- **First 1–2 characters may be eaten** on the per-char dispatch path (not on insertText). If you see `"estin"` instead of `"testin"`, prepend a throwaway character or use insertText.
++
++- **Verify `tweetButton`'s `disabled` state** before clicking. Draft.js's internal state can disagree with the DOM text — verify framework state via a targeted `browser_evaluate` on `aria-disabled`.
++
++- **If the button stays disabled after typing**, use the recovery dance: click the textarea again, press `End`, press a space, press `Backspace`. This forces React to recompute `hasRealContent` and usually flips the button on.
++
++- **URL previews take a beat to render.** If your tweet ends with a URL, wait 2–3 s after typing so the link-card preview loads before you post — otherwise the tweet publishes without the card.
++
++## Rate limits and safety
++
++| Action | Limit |
++|---|---|
++| Tweets per hour | ~50 before throttling |
++| Replies per session | **5–10 per run**, randomized 10–20 s delays |
++| DMs per day | Varies by account age; 50–100 for established accounts |
++| Follow/unfollow | <400/day spread over time |
++| Like per day | 1000 max; 200–300 is safer |
++
++Signals you're being rate-limited or flagged:
++- 429 status in network responses (not always visible to the agent)
++- "You are unable to Tweet" banner
++- Redirect to `https://x.com/account/access` (anti-bot check)
++- Posts appearing to publish but not visible on your profile
++- Reply button click opens but composer never receives focus
++
++If any of these appear, **stop the run, screenshot the state, and surface the issue.** Do not retry immediately.
++
++## Deduplication pattern
++
++Dedup is handled by the colony progress queue, not a separate JSON file. The queen enqueues one row in the `tasks` table per reply target (keyed by tweet URL); workers claim, reply, and mark done. Already-`done` rows are skipped on the next claim — that's your crash-resume and cross-day dedup, for free. See `hive.colony-progress-tracker` for the full claim/update protocol.
++
++Extract the tweet URL via `browser_evaluate` so the queen can use it as the task key:
++
++```
++url = browser_evaluate("""
++  (function(article_index){
++    const t = document.querySelectorAll('article[data-testid="tweet"]')[article_index];
++    if (!t) return null;
++    const link = t.querySelector('a[href*="/status/"]');
++    return link ? link.href : null;
++  })();
++""", article_index)
++```
++
++If you need to check whether a given tweet URL has already been replied to in a prior run (e.g., scanning live search results before enqueuing), query the queue directly:
++
++```bash
++sqlite3 "<db_path>" "SELECT status FROM tasks WHERE payload LIKE '%\"tweet_url\":\"<url>\"%';"
++```
++
++Empty → not yet enqueued, safe to add. Otherwise honor the existing row's status.
++
++## Reply style guidelines
++
++These are soft rules derived from the backed-up `x-daily-replies` and `x-job-market-replies` skills — tune per your operator's preference.
++
++**Daily replies (siren_fs persona, dark humorous):**
++- 2 sentences MAX
++- Dark, humorous, insightful, trendy
++- Must feel like a real person with opinions and edge
++- Must NOT sound like AI, use corporate speak, or be corny
++- Tie to current news/culture when possible
++- English only
++- Target: 5–8 replies per run
++- Skip posts that are purely images/video with no text context
++- Prioritize high-engagement accounts
++- Skip ads unless genuinely interesting
++
++**Job-market replies (casual slang + prediction-market CTA):**
++- 2–3 short sentences max
++- Casual slang, alt spellings: "u", "fr", "lmao", "lol"
++- Always include a profile-level CTA ("check my profile if u wanna see…")
++- Tie the reply to the economic / career angle of the original post
++- Vary templates — never identical text across replies
++- Max 10 replies per session
++
++## Common pitfalls
++
++- **Typing without clicking first → send button stays disabled.** Draft.js only enters edit mode after a native focus event. `browser_type` handles this automatically now, but if you're using raw CDP calls, click first.
++
++- **First 1–2 chars eaten on per-char dispatch.** Stick with `browser_type` default (uses `Input.insertText`). Only use `delay_ms=20` fallback if you need per-keystroke timing.
++
++- **Clicking Post with Draft.js state disagreeing.** Always verify `[data-testid="tweetButton"]`'s `disabled` / `aria-disabled` before clicking. If disabled, run the recovery dance.
++
++- **Anti-bot challenge mid-run.** X occasionally shows a JavaScript challenge or redirects to `/account/access`. Detect by checking the URL after navigation and the presence of the home nav:
++  ```
++  challenged = browser_evaluate("""
++    (function(){
++      return window.location.href.includes('/account/access') ||
++             !document.querySelector('a[data-testid="AppTabBar_Home_Link"]');
++    })();
++  """)
++  ```
++  If challenged, stop and surface to the operator. Do not try to solve it.
++
++- **Composer modal fails to open on rapid clicks.** X debounces the reply button click. Always `sleep(1.5)` after clicking before trying to query the textarea.
++
++- **Navigation inside the SPA is preferred over full page loads.** Clicking a tweet to open its detail view keeps the compose state; using `browser_navigate` reloads everything and slows the run. Use `browser_click` on internal links when possible.
++
++- **X's `window.innerHeight` changes on compose modal open.** The modal takes over most of the viewport. Don't cache viewport dimensions across a compose open; re-query after the modal slide-in.
++
++- **URL-only tweets post without a link card if you click Post too fast.** Wait 2–3 s after typing a URL before clicking Post so the card preview renders.
++
++## Auth wall detection
++
++Check logged-in state before any action:
++
++```
++logged_in = browser_evaluate("""
++  (function(){
++    return !!document.querySelector('a[data-testid="AppTabBar_Home_Link"]') &&
++           !window.location.href.includes('/i/flow/login');
++  })();
++""")
++```
++
++If not logged in, **stop immediately** and surface. Do not attempt to log in via automation.
++
++## See also
++
++- `browser-automation` skill — general CDP/coord/screenshot rules, click-then-type pattern, Input.insertText
++- `linkedin-automation` skill — LinkedIn equivalent
+diff --git a/core/framework/skills/authoring.py b/core/framework/skills/authoring.py
+new file mode 100644
+index 00000000..065a1403
+--- /dev/null
++++ b/core/framework/skills/authoring.py
+@@ -0,0 +1,203 @@
++"""Shared skill authoring primitives.
++
++Validates and materializes a skill folder. Used by three callers:
++
++1. Queen's ``create_colony`` tool (``queen_lifecycle_tools.py``) — inline
++   content passed by the queen during colony creation.
++2. HTTP POST / PUT routes under ``/api/**/skills`` — UI-driven creation.
++3. Future ``create_learned_skill`` tool — runtime learning.
++
++Keeping the validators and writer here ensures the three paths share one
++authority; changes to the name regex or frontmatter layout happen in one
++place.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++import shutil
++from dataclasses import dataclass, field
++from pathlib import Path
++
++logger = logging.getLogger(__name__)
++
++# Framework skill names include dots (``hive.note-taking``), so the
++# validator needs to allow them even though the queen's ``create_colony``
++# tool historically forbade dots. User-created skills without dots still
++# pass; the dot cap just prevents us from rejecting existing framework
++# names when the UI toggles them via ``validate_skill_name``.
++_SKILL_NAME_RE = re.compile(r"^[a-z0-9.-]+$")
++_MAX_NAME_LEN = 64
++_MAX_DESC_LEN = 1024
++
++
++@dataclass
++class SkillFile:
++    """Supporting file bundled with a skill (relative path + content)."""
++
++    rel_path: Path
++    content: str
++
++
++@dataclass
++class SkillDraft:
++    """Validated skill content ready to be written to disk."""
++
++    name: str
++    description: str
++    body: str
++    files: list[SkillFile] = field(default_factory=list)
++
++    @property
++    def skill_md_text(self) -> str:
++        """Assemble the final SKILL.md text (frontmatter + body)."""
++        body_norm = self.body.rstrip() + "\n"
++        return f"---\nname: {self.name}\ndescription: {self.description}\n---\n\n{body_norm}"
++
++
++def validate_skill_name(raw: str) -> tuple[str | None, str | None]:
++    """Return ``(normalized_name, error)``. Either side may be None."""
++    name = (raw or "").strip() if isinstance(raw, str) else ""
++    if not name:
++        return None, "skill_name is required"
++    if not _SKILL_NAME_RE.match(name):
++        return None, f"skill_name '{name}' must match [a-z0-9-] pattern"
++    if name.startswith("-") or name.endswith("-") or "--" in name:
++        return None, f"skill_name '{name}' has leading/trailing/consecutive hyphens"
++    if len(name) > _MAX_NAME_LEN:
++        return None, f"skill_name '{name}' exceeds {_MAX_NAME_LEN} chars"
++    return name, None
++
++
++def validate_description(raw: str) -> tuple[str | None, str | None]:
++    desc = (raw or "").strip() if isinstance(raw, str) else ""
++    if not desc:
++        return None, "skill_description is required"
++    if len(desc) > _MAX_DESC_LEN:
++        return None, f"skill_description must be 1–{_MAX_DESC_LEN} chars"
++    # Frontmatter descriptions are line-oriented — the parser reads one value.
++    if "\n" in desc or "\r" in desc:
++        return None, "skill_description must be a single line (no newlines)"
++    return desc, None
++
++
++def validate_files(raw: list[dict] | None) -> tuple[list[SkillFile] | None, str | None]:
++    if not raw:
++        return [], None
++    if not isinstance(raw, list):
++        return None, "skill_files must be an array"
++    out: list[SkillFile] = []
++    for entry in raw:
++        if not isinstance(entry, dict):
++            return None, "each skill_files entry must be an object with 'path' and 'content'"
++        rel_raw = entry.get("path")
++        content = entry.get("content")
++        if not isinstance(rel_raw, str) or not rel_raw.strip():
++            return None, "skill_files entry missing non-empty 'path'"
++        if not isinstance(content, str):
++            return None, f"skill_files entry '{rel_raw}' missing string 'content'"
++        rel_stripped = rel_raw.strip()
++        # Allow './foo' but reject '/foo' — relativizing absolute paths silently
++        # has bitten other tools; make the intent loud instead.
++        if rel_stripped.startswith("./"):
++            rel_stripped = rel_stripped[2:]
++        rel_path = Path(rel_stripped)
++        if rel_stripped.startswith("/") or rel_path.is_absolute() or ".." in rel_path.parts:
++            return None, f"skill_files path '{rel_raw}' must be relative and inside the skill folder"
++        if rel_path.as_posix() == "SKILL.md":
++            return None, "skill_files must not contain SKILL.md — pass skill_body instead"
++        out.append(SkillFile(rel_path=rel_path, content=content))
++    return out, None
++
++
++def build_draft(
++    *,
++    skill_name: str,
++    skill_description: str,
++    skill_body: str,
++    skill_files: list[dict] | None = None,
++) -> tuple[SkillDraft | None, str | None]:
++    """Validate all inputs and return an immutable draft ready for writing."""
++    name, err = validate_skill_name(skill_name)
++    if err or name is None:
++        return None, err
++    desc, err = validate_description(skill_description)
++    if err or desc is None:
++        return None, err
++    body = skill_body if isinstance(skill_body, str) else ""
++    if not body.strip():
++        return None, (
++            "skill_body is required — the operational procedure the colony worker needs to run this job unattended"
++        )
++    files, err = validate_files(skill_files)
++    if err or files is None:
++        return None, err
++    return SkillDraft(name=name, description=desc, body=body, files=list(files)), None
++
++
++def write_skill(
++    draft: SkillDraft,
++    *,
++    target_root: Path,
++    replace_existing: bool = True,
++) -> tuple[Path | None, str | None, bool]:
++    """Write the draft under ``target_root/{draft.name}/``.
++
++    ``target_root`` is the parent scope dir (e.g.
++    ``~/.hive/agents/queens/{id}/skills`` or
++    ``{colony_dir}/.hive/skills``). The function creates it if needed.
++
++    Returns ``(installed_path, error, replaced)``. On success ``error`` is
++    ``None``; on failure ``installed_path`` is ``None`` and the target is
++    left as it was before the call (best-effort).
++
++    When ``replace_existing=False`` and the target dir already exists,
++    the write is refused with a non-fatal error (caller decides whether
++    to surface it as a 409 or a warning).
++    """
++    try:
++        target_root.mkdir(parents=True, exist_ok=True)
++    except OSError as e:
++        return None, f"failed to create skills root: {e}", False
++
++    target = target_root / draft.name
++    replaced = False
++    try:
++        if target.exists():
++            if not replace_existing:
++                return None, f"skill '{draft.name}' already exists", False
++            # Remove the old dir outright so stale files from a prior
++            # version don't linger alongside the new ones.
++            replaced = True
++            shutil.rmtree(target)
++        target.mkdir(parents=True, exist_ok=False)
++        (target / "SKILL.md").write_text(draft.skill_md_text, encoding="utf-8")
++        for sf in draft.files:
++            full_path = target / sf.rel_path
++            full_path.parent.mkdir(parents=True, exist_ok=True)
++            full_path.write_text(sf.content, encoding="utf-8")
++    except OSError as e:
++        return None, f"failed to write skill folder {target}: {e}", replaced
++    return target, None, replaced
++
++
++def remove_skill(target_root: Path, skill_name: str) -> tuple[bool, str | None]:
++    """Rm-tree the skill directory under ``target_root/{skill_name}/``.
++
++    Returns ``(removed, error)``. ``removed=False, error=None`` means
++    the directory didn't exist (idempotent). Name is validated on the
++    way in so an attacker with UI access can't traverse out of the
++    scope root.
++    """
++    name, err = validate_skill_name(skill_name)
++    if err or name is None:
++        return False, err
++    target = target_root / name
++    if not target.exists():
++        return False, None
++    try:
++        shutil.rmtree(target)
++    except OSError as e:
++        return False, f"failed to remove skill folder {target}: {e}"
++    return True, None
+diff --git a/core/framework/skills/catalog.py b/core/framework/skills/catalog.py
+index 45a65dc5..29d9cf49 100644
+--- a/core/framework/skills/catalog.py
++++ b/core/framework/skills/catalog.py
+@@ -34,12 +34,8 @@
+ - When a skill drives external API writes (Gmail, Calendar, GitHub, etc.),
+   assume rate limits: prefer fewer larger writes, avoid tight one-item loops,
+   serialize bursts when possible, and respect 429/Retry-After.
+-
+-
+-The following skills provide specialized instructions for specific tasks.
+-Use `read_file` to load a skill's SKILL.md when the task matches its description.
+-When a skill file references a relative path, resolve it against the
+-skill directory (parent of SKILL.md) and use that absolute path in tool commands."""
++- When a selected skill references a relative path, resolve it against the
++  skill directory (parent of SKILL.md) and use that absolute path in tool commands."""
+ 
+ _MANDATORY_HEADER_COMPACT = """## Skills (mandatory)
+ Before replying: scan <available_skills> <name> entries.
+@@ -50,12 +46,8 @@
+ - When a skill drives external API writes (Gmail, Calendar, GitHub, etc.),
+   assume rate limits: prefer fewer larger writes, avoid tight one-item loops,
+   serialize bursts when possible, and respect 429/Retry-After.
+-
+-
+-The following skills provide specialized instructions for specific tasks.
+-Use `read_file` to load a skill's SKILL.md when the task matches its name.
+-When a skill file references a relative path, resolve it against the
+-skill directory (parent of SKILL.md) and use that absolute path in tool commands."""
++- When a selected skill references a relative path, resolve it against the
++  skill directory (parent of SKILL.md) and use that absolute path in tool commands."""
+ 
+ 
+ class SkillCatalog:
+diff --git a/core/framework/skills/discovery.py b/core/framework/skills/discovery.py
+index cd0ab6eb..661b877f 100644
+--- a/core/framework/skills/discovery.py
++++ b/core/framework/skills/discovery.py
+@@ -7,7 +7,7 @@
+ from __future__ import annotations
+ 
+ import logging
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from pathlib import Path
+ 
+ from framework.skills.parser import ParsedSkill, parse_skill_md
+@@ -30,16 +30,40 @@
+ )
+ 
+ # Scope priority (higher = takes precedence)
++# ``preset`` sits between framework and user: bundled alongside the
++# framework distribution, but off by default — capability packs the user
++# opts into per queen/colony rather than globally-enabled infra.
+ _SCOPE_PRIORITY = {
+     "framework": 0,
+-    "user": 1,
+-    "project": 2,
++    "preset": 1,
++    "user": 2,
++    "queen_ui": 3,
++    "colony_ui": 4,
++    "project": 5,
+ }
+ 
+ # Within the same scope, Hive-specific paths override cross-client paths.
+ # We encode this by scanning cross-client first, then Hive-specific (later wins).
+ 
+ 
++@dataclass
++class ExtraScope:
++    """Additional scope dir to scan beyond the standard five.
++
++    Used by :class:`framework.skills.manager.SkillsManager` to surface
++    per-queen (``queen_ui``) and per-colony (``colony_ui``) skill
++    directories created through the UI. The ``label`` feeds
++    :attr:`ParsedSkill.source_scope` so downstream consumers (trust
++    gate, UI provenance resolver) can distinguish scope origins.
++    """
++
++    directory: Path
++    label: str
++    # Kept for forward-compat with the priority table; discovery itself
++    # relies on scan order for last-wins resolution.
++    priority: int = 0
++
++
+ @dataclass
+ class DiscoveryConfig:
+     """Configuration for skill discovery."""
+@@ -49,6 +73,10 @@ class DiscoveryConfig:
+     skip_framework_scope: bool = False
+     max_depth: int = 4
+     max_dirs: int = 2000
++    # Additional scope dirs scanned between user and project scopes,
++    # in the order they are provided. Use ``ExtraScope`` to tag each
++    # with its logical label (``queen_ui`` / ``colony_ui``).
++    extra_scopes: list[ExtraScope] = field(default_factory=list)
+ 
+ 
+ class SkillDiscovery:
+@@ -82,13 +110,22 @@ def discover(self) -> list[ParsedSkill]:
+         all_skills: list[ParsedSkill] = []
+         self._scanned_dirs = []
+ 
+-        # Framework scope (lowest precedence)
++        # Framework scope (lowest precedence) — always-on infra skills.
+         if not self._config.skip_framework_scope:
+             framework_dir = Path(__file__).parent / "_default_skills"
+             if framework_dir.is_dir():
+                 self._scanned_dirs.append(framework_dir)
+                 all_skills.extend(self._scan_scope(framework_dir, "framework"))
+ 
++            # Preset scope — bundled capability packs that ship with the
++            # framework but default to OFF. User opts in per queen/colony
++            # via the Skills Library. ``skip_framework_scope`` covers both
++            # bundled directories since they live side-by-side on disk.
++            preset_dir = Path(__file__).parent / "_preset_skills"
++            if preset_dir.is_dir():
++                self._scanned_dirs.append(preset_dir)
++                all_skills.extend(self._scan_scope(preset_dir, "preset"))
++
+         # User scope
+         if not self._config.skip_user_scope:
+             home = Path.home()
+@@ -105,6 +142,13 @@ def discover(self) -> list[ParsedSkill]:
+                 self._scanned_dirs.append(user_hive)
+                 all_skills.extend(self._scan_scope(user_hive, "user"))
+ 
++        # Extra scopes (queen_ui / colony_ui), scanned between user and project
++        # so colony overrides beat queen overrides, and both beat user-scope.
++        for extra in self._config.extra_scopes:
++            if extra.directory.is_dir():
++                self._scanned_dirs.append(extra.directory)
++                all_skills.extend(self._scan_scope(extra.directory, extra.label))
++
+         # Project scope (highest precedence)
+         if self._config.project_root:
+             root = self._config.project_root
+diff --git a/core/framework/skills/manager.py b/core/framework/skills/manager.py
+index 54249cab..99e2f175 100644
+--- a/core/framework/skills/manager.py
++++ b/core/framework/skills/manager.py
+@@ -23,6 +23,7 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import logging
+ from dataclasses import dataclass, field
+ from pathlib import Path
+@@ -44,6 +45,18 @@ class SkillsManagerConfig:
+             even when ``project_root`` is set.
+         interactive: Whether trust gating can prompt the user interactively.
+             When ``False``, untrusted project skills are silently skipped.
++        queen_id: Optional queen identifier. When set, enables the
++            ``queen_ui`` scope and per-queen override file.
++        queen_overrides_path: Path to
++            ``~/.hive/agents/queens/{queen_id}/skills_overrides.json``.
++            When set, the store is loaded and its entries override
++            discovery results (disable skills, record provenance).
++        colony_name: Optional colony identifier; mirrors ``queen_id`` for
++            the ``colony_ui`` scope.
++        colony_overrides_path: Per-colony override file path.
++        extra_scope_dirs: Extra scope dirs scanned between user and
++            project scopes. Typically populated by the caller with the
++            queen/colony UI skill directories.
+     """
+ 
+     skills_config: SkillsConfig = field(default_factory=SkillsConfig)
+@@ -51,6 +64,15 @@ class SkillsManagerConfig:
+     skip_community_discovery: bool = False
+     interactive: bool = True
+ 
++    # Override support
++    queen_id: str | None = None
++    queen_overrides_path: Path | None = None
++    colony_name: str | None = None
++    colony_overrides_path: Path | None = None
++    # Typed at the call site as ``list[ExtraScope]`` — not imported here
++    # to keep this module free of discovery-layer dependencies.
++    extra_scope_dirs: list = field(default_factory=list)
++
+ 
+ class SkillsManager:
+     """Unified skill lifecycle: discovery → loading → prompt renderation.
+@@ -65,13 +87,21 @@ def __init__(self, config: SkillsManagerConfig | None = None) -> None:
+         self._config = config or SkillsManagerConfig()
+         self._loaded = False
+         self._catalog: object = None  # SkillCatalog, set after load()
++        self._all_skills: list = []  # list[ParsedSkill], pre-override-filter
+         self._catalog_prompt: str = ""
+         self._protocols_prompt: str = ""
+         self._allowlisted_dirs: list[str] = []
+         self._default_mgr: object = None  # DefaultSkillManager, set after load()
++        # Override stores (loaded lazily in _do_load). Queen-scope and
++        # colony-scope are read together; colony entries win on collision.
++        self._queen_overrides: object = None  # SkillOverrideStore | None
++        self._colony_overrides: object = None  # SkillOverrideStore | None
+         # Hot-reload state
+         self._watched_dirs: list[str] = []
++        self._watched_files: list[str] = []
+         self._watcher_task: object = None  # asyncio.Task, set by start_watching()
++        # Serializes in-process mutations (HTTP handlers + create_colony).
++        self._mutation_lock = asyncio.Lock()
+ 
+     # ------------------------------------------------------------------
+     # Factory for backwards-compat bridge
+@@ -119,6 +149,7 @@ def _do_load(self) -> None:
+         from framework.skills.catalog import SkillCatalog
+         from framework.skills.defaults import DefaultSkillManager
+         from framework.skills.discovery import DiscoveryConfig, SkillDiscovery
++        from framework.skills.overrides import SkillOverrideStore
+ 
+         skills_config = self._config.skills_config
+ 
+@@ -128,12 +159,13 @@ def _do_load(self) -> None:
+             DiscoveryConfig(
+                 project_root=self._config.project_root,
+                 skip_framework_scope=False,
++                extra_scopes=list(self._config.extra_scope_dirs or []),
+             )
+         )
+         discovered = discovery.discover()
+         self._watched_dirs = discovery.scanned_directories
+ 
+-        # Trust-gate project-scope skills (AS-13)
++        # Trust-gate project-scope skills (AS-13). UI scopes bypass.
+         if self._config.project_root is not None and not self._config.skip_community_discovery:
+             from framework.skills.trust import TrustGate
+ 
+@@ -141,6 +173,31 @@ def _do_load(self) -> None:
+                 discovered, project_dir=self._config.project_root
+             )
+ 
++        # 1b. Load per-scope override stores. Missing files → empty stores.
++        queen_store = None
++        if self._config.queen_overrides_path is not None:
++            queen_store = SkillOverrideStore.load(
++                self._config.queen_overrides_path,
++                scope_label=f"queen:{self._config.queen_id or ''}",
++            )
++        colony_store = None
++        if self._config.colony_overrides_path is not None:
++            colony_store = SkillOverrideStore.load(
++                self._config.colony_overrides_path,
++                scope_label=f"colony:{self._config.colony_name or ''}",
++            )
++        self._queen_overrides = queen_store
++        self._colony_overrides = colony_store
++        self._watched_files = [
++            str(p) for p in (self._config.queen_overrides_path, self._config.colony_overrides_path) if p is not None
++        ]
++
++        # 1c. Apply override filtering. Colony entries take precedence over
++        # queen entries on name collision; the store's ``is_disabled`` keeps
++        # the resolution rule in one place.
++        self._all_skills = list(discovered)
++        discovered = self._apply_overrides(discovered, skills_config, queen_store, colony_store)
++
+         catalog = SkillCatalog(discovered)
+         self._catalog = catalog
+         self._allowlisted_dirs = catalog.allowlisted_dirs
+@@ -174,6 +231,101 @@ def _do_load(self) -> None:
+                 len(catalog_prompt),
+             )
+ 
++    # ------------------------------------------------------------------
++    # Override application
++    # ------------------------------------------------------------------
++
++    @staticmethod
++    def _apply_overrides(
++        discovered: list,
++        skills_config: SkillsConfig,
++        queen_store: object,
++        colony_store: object,
++    ) -> list:
++        """Filter ``discovered`` per the queen + colony override stores.
++
++        Resolution rule:
++          1. Tombstoned names (``deleted_ui_skills``) drop out.
++          2. An explicit ``enabled=False`` override drops the skill.
++          3. An explicit ``enabled=True`` override keeps it (wins over
++             ``all_defaults_disabled`` for framework defaults AND over the
++             preset-scope default-off rule).
++          4. Otherwise: preset-scope skills are off by default; everything
++             else inherits :meth:`SkillsConfig.is_default_enabled`.
++        """
++        from framework.skills.overrides import SkillOverrideStore
++
++        stores: list[SkillOverrideStore] = [s for s in (queen_store, colony_store) if s is not None]
++
++        tombstones: set[str] = set()
++        for store in stores:
++            tombstones |= set(store.deleted_ui_skills)
++
++        out = []
++        for skill in discovered:
++            if skill.name in tombstones:
++                continue
++            # Check colony first so colony overrides win over queen's.
++            explicit: bool | None = None
++            master_disabled = False
++            for store in reversed(stores):  # colony, then queen
++                entry = store.get(skill.name)
++                if entry is not None and entry.enabled is not None:
++                    explicit = entry.enabled
++                    break
++                if store.all_defaults_disabled:
++                    master_disabled = True
++            if explicit is False:
++                continue
++            if explicit is True:
++                out.append(skill)
++                continue
++            # Preset-scope capability packs are bundled but ship OFF; the
++            # user must explicitly enable them per queen or colony. This
++            # runs even when no store is present so bare agents don't
++            # silently load x-automation etc.
++            if skill.source_scope == "preset":
++                continue
++            # No explicit entry — master switch takes effect against framework defaults.
++            default_enabled = skills_config.is_default_enabled(skill.name)
++            if master_disabled and default_enabled and skill.source_scope == "framework":
++                continue
++            if default_enabled:
++                out.append(skill)
++        return out
++
++    # ------------------------------------------------------------------
++    # Override accessors
++    # ------------------------------------------------------------------
++
++    @property
++    def queen_overrides(self) -> object:
++        """The queen-scope :class:`SkillOverrideStore` or ``None``."""
++        return self._queen_overrides
++
++    @property
++    def colony_overrides(self) -> object:
++        """The colony-scope :class:`SkillOverrideStore` or ``None``."""
++        return self._colony_overrides
++
++    @property
++    def mutation_lock(self) -> asyncio.Lock:
++        """Serializes in-process override mutations (routes + queen tools)."""
++        return self._mutation_lock
++
++    def reload(self) -> None:
++        """Re-run discovery and rebuild cached prompts. Public wrapper for ``_reload``."""
++        self._reload()
++
++    def enumerate_skills_with_source(self) -> list:
++        """Return every discovered skill, including ones disabled by overrides.
++
++        The UI relies on this: a disabled framework skill needs to render
++        in the list so the user can toggle it back on. The post-filter
++        catalog omits those entries.
++        """
++        return list(self._all_skills)
++
+     # ------------------------------------------------------------------
+     # Hot-reload: watch skill directories for SKILL.md changes.
+     # ------------------------------------------------------------------
+@@ -181,14 +333,14 @@ def _do_load(self) -> None:
+     async def start_watching(self) -> None:
+         """Start a background task watching skill directories for changes.
+ 
+-        When a ``SKILL.md`` file is added/modified/removed, the cached
+-        ``skills_catalog_prompt`` is rebuilt.  The next node iteration picks
+-        up the new prompt automatically via the ``dynamic_prompt_provider``.
++        Triggers a reload when any ``SKILL.md`` changes or an override
++        JSON file is modified. The next node iteration picks up the new
++        prompt via the ``dynamic_prompt_provider`` / per-worker
++        ``dynamic_skills_catalog_provider``.
+ 
+-        Silently no-ops when ``watchfiles`` is not installed or when no
+-        directories are being watched (e.g. bare mode, no project_root).
++        Silently no-ops when ``watchfiles`` is not installed or there
++        are no paths to watch.
+         """
+-        import asyncio
+ 
+         try:
+             import watchfiles  # noqa: F401 -- optional dep check
+@@ -196,7 +348,7 @@ async def start_watching(self) -> None:
+             logger.debug("watchfiles not installed; skill hot-reload disabled")
+             return
+ 
+-        if not self._watched_dirs:
++        if not self._watched_dirs and not self._watched_files:
+             logger.debug("No skill directories to watch; hot-reload skipped")
+             return
+ 
+@@ -208,14 +360,13 @@ async def start_watching(self) -> None:
+             name="skills-hot-reload",
+         )
+         logger.info(
+-            "Skill hot-reload enabled (watching %d directories)",
++            "Skill hot-reload enabled (watching %d dirs, %d override files)",
+             len(self._watched_dirs),
++            len(self._watched_files),
+         )
+ 
+     async def stop_watching(self) -> None:
+         """Cancel the background watcher task (if running)."""
+-        import asyncio
+-
+         task = self._watcher_task
+         if task is None:
+             return
+@@ -228,22 +379,35 @@ async def stop_watching(self) -> None:
+                 pass
+ 
+     async def _watch_loop(self) -> None:
+-        """Background coroutine that watches SKILL.md files and triggers reload."""
+-        import asyncio
+-
++        """Watch SKILL.md + override JSON files and trigger reload on change."""
+         import watchfiles
+ 
+         def _filter(_change: object, path: str) -> bool:
+-            return path.endswith("SKILL.md")
++            return path.endswith("SKILL.md") or path.endswith("skills_overrides.json")
++
++        # watchfiles accepts a mix of dirs and files; file watches survive
++        # a tmp+rename (the containing dir sees the event).
++        watch_targets = list(self._watched_dirs)
++        for f in self._watched_files:
++            # watchfiles needs the parent dir for file-level events to fire
++            # reliably through atomic replace; adding the file path directly
++            # works on Linux/macOS inotify/FSEvents but a dir watch is
++            # belt-and-braces.
++            parent = str(Path(f).parent)
++            if parent not in watch_targets:
++                watch_targets.append(parent)
++
++        if not watch_targets:
++            return
+ 
+         try:
+             async for changes in watchfiles.awatch(
+-                *self._watched_dirs,
++                *watch_targets,
+                 watch_filter=_filter,
+                 debounce=1000,
+             ):
+                 paths = [p for _, p in changes]
+-                logger.info("SKILL.md changes detected: %s", paths)
++                logger.info("Skill state changes detected: %s", paths)
+                 try:
+                     self._reload()
+                 except Exception:
+diff --git a/core/framework/skills/overrides.py b/core/framework/skills/overrides.py
+new file mode 100644
+index 00000000..1dd65b25
+--- /dev/null
++++ b/core/framework/skills/overrides.py
+@@ -0,0 +1,254 @@
++"""Per-scope skill override store.
++
++Sits between :mod:`framework.skills.discovery` and
++:class:`framework.skills.catalog.SkillCatalog`: records the user's
++per-queen and per-colony decisions about which skills are enabled,
++who created them (provenance), and any parameter tweaks.
++
++Two well-known paths back this module:
++
++* Queen scope:   ``~/.hive/agents/queens/{queen_id}/skills_overrides.json``
++* Colony scope:  ``~/.hive/colonies/{colony_name}/skills_overrides.json``
++
++The schema is intentionally small; see :class:`SkillOverrideStore` for
++the JSON shape. Atomic writes mirror
++:class:`framework.skills.trust.TrustedRepoStore` (tmp + rename).
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++from dataclasses import dataclass, field
++from datetime import UTC, datetime
++from enum import StrEnum
++from pathlib import Path
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++_SCHEMA_VERSION = 1
++
++
++class Provenance(StrEnum):
++    """Where a skill came from.
++
++    The override store is the authoritative provenance ledger for anything
++    the UI or the queen tools touched. Framework / user-dropped /
++    project-dropped skills don't need an entry unless they've been
++    explicitly configured.
++    """
++
++    FRAMEWORK = "framework"
++    PRESET = "preset"
++    USER_DROPPED = "user_dropped"
++    USER_UI_CREATED = "user_ui_created"
++    QUEEN_CREATED = "queen_created"
++    LEARNED_RUNTIME = "learned_runtime"
++    PROJECT_DROPPED = "project_dropped"
++    # Catch-all for skills with no recorded authorship: legacy rows from
++    # before the override store existed, PATCHes that precede any CREATE,
++    # etc. Keeps the ledger honest rather than forcing a guess.
++    OTHER = "other"
++
++
++@dataclass
++class OverrideEntry:
++    """Per-skill override record inside a scope's store."""
++
++    enabled: bool | None = None
++    provenance: Provenance = Provenance.FRAMEWORK
++    trust: str | None = None
++    param_overrides: dict[str, Any] = field(default_factory=dict)
++    notes: str | None = None
++    created_at: datetime | None = None
++    created_by: str | None = None
++
++    def clone(self) -> OverrideEntry:
++        """Return a deep-enough copy (dict fields are re-allocated)."""
++        return OverrideEntry(
++            enabled=self.enabled,
++            provenance=self.provenance,
++            trust=self.trust,
++            param_overrides=dict(self.param_overrides),
++            notes=self.notes,
++            created_at=self.created_at,
++            created_by=self.created_by,
++        )
++
++    def to_dict(self) -> dict[str, Any]:
++        out: dict[str, Any] = {"provenance": str(self.provenance)}
++        if self.enabled is not None:
++            out["enabled"] = bool(self.enabled)
++        if self.trust is not None:
++            out["trust"] = self.trust
++        if self.param_overrides:
++            out["param_overrides"] = dict(self.param_overrides)
++        if self.notes is not None:
++            out["notes"] = self.notes
++        if self.created_at is not None:
++            out["created_at"] = self.created_at.isoformat()
++        if self.created_by is not None:
++            out["created_by"] = self.created_by
++        return out
++
++    @classmethod
++    def from_dict(cls, raw: dict[str, Any]) -> OverrideEntry:
++        created_at_raw = raw.get("created_at")
++        created_at: datetime | None = None
++        if isinstance(created_at_raw, str):
++            try:
++                created_at = datetime.fromisoformat(created_at_raw)
++            except ValueError:
++                created_at = None
++        provenance_raw = raw.get("provenance") or Provenance.FRAMEWORK
++        try:
++            provenance = Provenance(provenance_raw)
++        except ValueError:
++            logger.warning("override: unknown provenance %r; defaulting to framework", provenance_raw)
++            provenance = Provenance.FRAMEWORK
++        enabled = raw.get("enabled")
++        return cls(
++            enabled=enabled if isinstance(enabled, bool) else None,
++            provenance=provenance,
++            trust=raw.get("trust") if isinstance(raw.get("trust"), str) else None,
++            param_overrides=dict(raw.get("param_overrides") or {}),
++            notes=raw.get("notes") if isinstance(raw.get("notes"), str) else None,
++            created_at=created_at,
++            created_by=raw.get("created_by") if isinstance(raw.get("created_by"), str) else None,
++        )
++
++
++@dataclass
++class SkillOverrideStore:
++    """Persistent per-scope override file.
++
++    The file is created lazily on first save; a missing file behaves like
++    an empty store (all skills inherit defaults, no metadata recorded).
++    """
++
++    path: Path
++    scope_label: str = ""
++    version: int = _SCHEMA_VERSION
++    all_defaults_disabled: bool = False
++    overrides: dict[str, OverrideEntry] = field(default_factory=dict)
++    deleted_ui_skills: set[str] = field(default_factory=set)
++
++    # ------------------------------------------------------------------
++    # Factory
++    # ------------------------------------------------------------------
++
++    @classmethod
++    def load(cls, path: Path, scope_label: str = "") -> SkillOverrideStore:
++        """Load the store from disk; return an empty store if the file is absent.
++
++        Permissive on parse errors: logs and returns an empty store rather
++        than raising, so a corrupted file never takes down skill loading.
++        """
++        store = cls(path=path, scope_label=scope_label)
++        try:
++            raw = json.loads(path.read_text(encoding="utf-8"))
++        except FileNotFoundError:
++            return store
++        except Exception as exc:
++            logger.warning("override: failed to read %s (%s); starting empty", path, exc)
++            return store
++        if not isinstance(raw, dict):
++            logger.warning("override: %s is not an object; starting empty", path)
++            return store
++
++        store.version = int(raw.get("version", _SCHEMA_VERSION))
++        store.all_defaults_disabled = bool(raw.get("all_defaults_disabled", False))
++        raw_overrides = raw.get("overrides") or {}
++        if isinstance(raw_overrides, dict):
++            for name, entry_raw in raw_overrides.items():
++                if not isinstance(name, str) or not isinstance(entry_raw, dict):
++                    continue
++                store.overrides[name] = OverrideEntry.from_dict(entry_raw)
++        deleted = raw.get("deleted_ui_skills") or []
++        if isinstance(deleted, list):
++            store.deleted_ui_skills = {s for s in deleted if isinstance(s, str)}
++        return store
++
++    # ------------------------------------------------------------------
++    # Mutations
++    # ------------------------------------------------------------------
++
++    def upsert(self, skill_name: str, entry: OverrideEntry) -> None:
++        """Insert or replace a skill's override entry."""
++        self.overrides[skill_name] = entry
++        # If we're explicitly managing this skill again, lift any tombstone.
++        self.deleted_ui_skills.discard(skill_name)
++
++    def set_enabled(self, skill_name: str, enabled: bool, *, provenance: Provenance | None = None) -> None:
++        """Convenience: toggle enabled without rewriting other fields."""
++        existing = self.overrides.get(skill_name)
++        if existing is None:
++            existing = OverrideEntry(
++                enabled=enabled,
++                provenance=provenance or Provenance.FRAMEWORK,
++            )
++        else:
++            existing.enabled = enabled
++            if provenance is not None:
++                existing.provenance = provenance
++        self.overrides[skill_name] = existing
++
++    def remove(self, skill_name: str, *, tombstone: bool = True) -> None:
++        """Drop a skill's override entry; optionally leave a tombstone.
++
++        Tombstones matter for UI-created skills: if the user deletes a
++        queen-scope skill via the UI, we rm-tree its directory, but the
++        file watcher might lag or a background process might have an
++        open handle. A tombstone ensures the loader treats the skill as
++        gone even if a stale SKILL.md lingers.
++        """
++        self.overrides.pop(skill_name, None)
++        if tombstone:
++            self.deleted_ui_skills.add(skill_name)
++
++    def is_disabled(self, skill_name: str, *, default_enabled: bool) -> bool:
++        """Return True when this scope's override force-disables the skill."""
++        if self.all_defaults_disabled and default_enabled:
++            # Caller says "default enabled"; master switch flips it off unless
++            # an explicit enabled=True override re-enables.
++            entry = self.overrides.get(skill_name)
++            if entry is not None and entry.enabled is True:
++                return False
++            return True
++        entry = self.overrides.get(skill_name)
++        if entry is None:
++            return not default_enabled
++        if entry.enabled is None:
++            return not default_enabled
++        return not entry.enabled
++
++    def effective_enabled(self, skill_name: str, *, default_enabled: bool) -> bool:
++        """The inverse of :meth:`is_disabled`, for readability at call sites."""
++        return not self.is_disabled(skill_name, default_enabled=default_enabled)
++
++    def get(self, skill_name: str) -> OverrideEntry | None:
++        return self.overrides.get(skill_name)
++
++    # ------------------------------------------------------------------
++    # Persistence
++    # ------------------------------------------------------------------
++
++    def save(self) -> None:
++        """Atomic write: tmp + rename. Creates the parent dir if needed."""
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        payload: dict[str, Any] = {
++            "version": self.version,
++            "all_defaults_disabled": self.all_defaults_disabled,
++            "overrides": {name: entry.to_dict() for name, entry in sorted(self.overrides.items())},
++        }
++        if self.deleted_ui_skills:
++            payload["deleted_ui_skills"] = sorted(self.deleted_ui_skills)
++        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
++        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
++        tmp.replace(self.path)
++
++
++def utc_now() -> datetime:
++    """Single source of truth for override timestamps."""
++    return datetime.now(tz=UTC)
+diff --git a/core/framework/skills/tool_gating.py b/core/framework/skills/tool_gating.py
+index 3c20793e..426d30b4 100644
+--- a/core/framework/skills/tool_gating.py
++++ b/core/framework/skills/tool_gating.py
+@@ -20,9 +20,17 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
+-_DEFAULT_SKILLS_DIR = Path(__file__).parent / "_default_skills"
+-
+-# (tool-name prefix, default skill directory name, display name)
++# Bundled skills live in two sibling dirs: ``_default_skills`` (always-on
++# infra) and ``_preset_skills`` (capability packs, off by default but
++# still bundled). Tool-gated pre-activation walks both so ``browser_*``
++# tools still pull in the browser-automation preset even though it isn't
++# default-enabled in the catalog.
++_BUNDLED_DIRS: tuple[Path, ...] = (
++    Path(__file__).parent / "_default_skills",
++    Path(__file__).parent / "_preset_skills",
++)
++
++# (tool-name prefix, skill directory name, display name)
+ _TOOL_GATED_SKILLS: list[tuple[str, str, str]] = [
+     ("browser_", "browser-automation", "hive.browser-automation"),
+ ]
+@@ -31,12 +39,23 @@
+ 
+ 
+ def _load_body(dir_name: str) -> str:
+-    """Load the markdown body of a framework default skill, cached."""
++    """Load the markdown body of a bundled skill, cached. Searches every
++    bundled directory (default + preset) so the mapping table doesn't
++    need to know which dir a skill lives in.
++    """
+     if dir_name in _BODY_CACHE:
+         return _BODY_CACHE[dir_name]
+ 
+-    path = _DEFAULT_SKILLS_DIR / dir_name / "SKILL.md"
++    path: Path | None = None
++    for parent in _BUNDLED_DIRS:
++        candidate = parent / dir_name / "SKILL.md"
++        if candidate.exists():
++            path = candidate
++            break
+     body = ""
++    if path is None:
++        _BODY_CACHE[dir_name] = body
++        return body
+     try:
+         raw = path.read_text(encoding="utf-8")
+         # Strip YAML frontmatter (between the first two '---' fences)
+diff --git a/core/framework/skills/trust.py b/core/framework/skills/trust.py
+index e18ae637..11ff0e2a 100644
+--- a/core/framework/skills/trust.py
++++ b/core/framework/skills/trust.py
+@@ -318,13 +318,19 @@ def filter_and_gate(
+     ) -> list[ParsedSkill]:
+         """Return the subset of skills that are trusted for loading.
+ 
+-        - Framework and user-scope skills: always included.
++        - Framework, user, queen_ui, and colony_ui scopes: always included.
++          (UI-created skills are authenticated by the user creating them
++          through the authenticated UI — they do not go through the
++          trusted_repos.json flow.)
+         - Project-scope skills: classified; consent prompt shown if untrusted.
+         """
+         import os
+ 
+-        # Separate project skills from always-trusted scopes
+-        always_trusted = [s for s in skills if s.source_scope != "project"]
++        # UI-authored scopes bypass the trust gate — they're implicitly
++        # trusted because the user authored them through the UI. ``preset``
++        # ships with the framework distribution, so it's trusted too.
++        _bypass_scopes = {"framework", "preset", "user", "queen_ui", "colony_ui"}
++        always_trusted = [s for s in skills if s.source_scope in _bypass_scopes]
+         project_skills = [s for s in skills if s.source_scope == "project"]
+ 
+         if not project_skills:

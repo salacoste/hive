@@ -1,0 +1,32 @@
+{
+  "generated_at_utc": "2026-04-25T19:55:35Z",
+  "wave": "Wave16-R9T",
+  "title": "Loader MCP registry canonical default alias lane precheck",
+  "scope": [
+    "core/framework/loader/mcp_registry.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/loader/mcp_registry.py",
+      "add": 2,
+      "del": 2,
+      "total": 4
+    }
+  },
+  "delta_summary": [
+    "default local server canonical name uses `hive-tools`",
+    "stale alias cleanup keeps backward mapping for older `hive_tools` entry"
+  ],
+  "risk_signals": [
+    {
+      "type": "canonical-server-name-contract",
+      "evidence": "active queen/runtime expect canonical `hive-tools` registry entry",
+      "impact": "reverting alias/canonical mapping can break default tool bootstrap on fresh registries"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_mcp_registry.py -k 'ensure_defaults or stale or hive_tools or hive-tools' -q",
+    "uv run --package framework pytest core/tests/test_mcp_registry_cli.py -k 'defaults or list or info or config' -q"
+  ],
+  "decision_gate": "prefer keep_local if canonical naming contract is preserved and MCP registry bundles are green"
+}

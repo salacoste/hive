@@ -1,0 +1,24 @@
+{
+  "generated_at_utc": "2026-04-27T10:18:44Z",
+  "wave": "Wave16-R12F",
+  "title": "Autonomous wave transition baseline continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify baseline continuity during post-closure wave transition across run-cycle/tick/evaluate/auto-next/report",
+    "establish bounded transition checkpoint for subsequent lane expansion"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_run_cycle_report_endpoint",
+    "pipeline_loop_run_cycle_summary_outcomes",
+    "pipeline_loop_tick_all_endpoint",
+    "pipeline_loop_tick_resolves_execution_failed_from_event_log",
+    "pipeline_dispatch_next_rejects_when_active_run_exists",
+    "pipeline_evaluate_endpoint_uses_checks_and_updates_report",
+    "pipeline_evaluate_github_includes_pr_review_feedback_in_report",
+    "pipeline_auto_next_endpoint",
+    "pipeline_report_endpoint"
+  ]
+}

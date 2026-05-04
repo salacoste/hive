@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-26T18:30:13Z",
+  "wave": "Wave16-R10Y",
+  "title": "Autonomous GitHub evaluate + auto-next extended continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "GitHub evaluate endpoint continuity for review-feedback ingestion and summary-comment path remains stable",
+      "auto-next policy continuity remains stable across success/manual-pending/no-token variants",
+      "no regressions observed in extended evaluate/auto-next targeted bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_endpoint or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_rejects_execution_stage or pipeline_auto_next_deferred_without_token_in_manual_mode' -q",
+        "result": "pass",
+        "summary": "9 passed, 184 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10Y lane closed as keep-local with green extended GitHub evaluate/auto-next continuity bundle",
+      "next lane extends mixed payload and fallback continuity around evaluate/auto-next loop coupling"
+    ]
+  }
+}

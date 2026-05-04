@@ -1,0 +1,42 @@
+{
+  "generated_at_utc": "2026-04-25T00:31:56Z",
+  "item": 289,
+  "lane": "ND-5E",
+  "title": "Agent-loop types micro-lane execution",
+  "scope": [
+    "core/framework/agent_loop/types.py",
+    "core/framework/agent_loop/internals/types.py"
+  ],
+  "inputs": {
+    "patch": "docs/ops/upstream-migration/wave15-nd5e-agentloop-types.patch",
+    "probe": "docs/ops/upstream-migration/wave15-nd5e-agentloop-types-probe-2026-04-25.json",
+    "replay_plan": "docs/ops/upstream-migration/wave15-nd5e-agentloop-types-replay-plan-2026-04-25.md"
+  },
+  "execution": {
+    "patch_apply": {
+      "command": "git apply docs/ops/upstream-migration/wave15-nd5e-agentloop-types.patch",
+      "result": "pass"
+    },
+    "change_summary": [
+      "Added dynamic_prompt_suffix_provider and dynamic_skills_catalog_provider fields to AgentLoopContext metadata",
+      "Added compaction_buffer_ratio documentation/default in LoopConfig"
+    ],
+    "targeted_validation": {
+      "command": "uv run pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q",
+      "result": "pass",
+      "summary": "163 passed, 4 skipped"
+    },
+    "full_gate_validation": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "execution and validation complete",
+      "lane ready for handoff to next bounded item"
+    ]
+  }
+}

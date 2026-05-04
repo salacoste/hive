@@ -9,8 +9,8 @@ Nodes that need browser access declare ``tools: {policy: "all"}`` in their
 agent.json config.
 
 Note: the canonical source of truth for browser automation guidance is
-the ``browser-automation`` default skill at
-``core/framework/skills/_default_skills/browser-automation/SKILL.md``.
+the ``browser-automation`` preset skill at
+``core/framework/skills/_preset_skills/browser-automation/SKILL.md``.
 Activate that skill for the full decision tree. This module holds a
 compact subset suitable for direct inlining into a node's system prompt
 when a skill activation is not desired.

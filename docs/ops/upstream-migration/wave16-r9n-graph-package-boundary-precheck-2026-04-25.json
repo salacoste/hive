@@ -1,0 +1,34 @@
+{
+  "generated_at_utc": "2026-04-25T13:17:11Z",
+  "wave": "Wave16-R9N",
+  "title": "Graph package boundary lane precheck",
+  "scope": [
+    "core/framework/graph/__init__.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/graph/__init__.py",
+      "add": 65,
+      "del": 0,
+      "total": 65
+    }
+  },
+  "delta_summary": [
+    "local package initializer exports stable graph public surface (`__all__`)",
+    "aggregates core graph symbols for compatibility with `from framework.graph import ...` imports"
+  ],
+  "risk_signals": [
+    {
+      "type": "import-boundary-contract",
+      "evidence": "without package exports, callers rely on deep module paths and become brittle",
+      "impact": "upstream replay can break import contracts used by runtime/server/tests"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_event_loop_node.py -q",
+    "uv run --package framework pytest core/tests/test_runtime.py -q",
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'execution or queen' -q",
+    "uv run --package framework python - <<'PY' ... import framework.graph export check ... PY"
+  ],
+  "decision_gate": "prefer keep_local if public graph package exports remain required and validation stays green"
+}

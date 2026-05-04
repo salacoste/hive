@@ -13,7 +13,7 @@ from framework.config import get_hive_config
 # Built-in defaults requested for this workspace.
 DEFAULT_MODEL_ROUTING: dict[str, list[str]] = {
     # Heavy/complex reasoning and solving.
-    "heavy": ["claude-opus-4-6", "gpt-5.4"],
+    "heavy": ["claude-opus-4-6", "gpt-5.4", "openai/glm-5.1"],
     # Implementation/execution path.
     # Use OpenAI-compatible routing in container-first deployments.
     "implementation": ["openai/gemini-3.1-pro-high", "openai/glm-5.1"],

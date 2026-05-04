@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-26T13:09:10Z",
+  "wave": "Wave16-R10F",
+  "title": "Cursor persistence event/trigger formatting compatibility lane execution",
+  "scope": [
+    "core/framework/agent_loop/internals/cursor_persistence.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "current persistence keeps real client input verbatim and still marks external events explicitly",
+      "trigger batching remains byte-stable without timestamp prefix noise",
+      "event-loop and conversation-store bundles are green"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local cursor_persistence formatting contract"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_loop_node.py -k 'inject_event or cursor' -q",
+        "result": "pass",
+        "summary": "2 passed, 67 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_node_conversation.py -q",
+        "result": "pass",
+        "summary": "98 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10F lane closed with explicit keep-local decision",
+      "next candidate lane: queen lifecycle prompt alias compatibility"
+    ]
+  }
+}

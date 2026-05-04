@@ -1,0 +1,30 @@
+{
+  "generated_at_utc": "2026-04-25T11:12:18Z",
+  "wave": "Wave16-R9D",
+  "title": "Compaction behavior lane precheck",
+  "scope": [
+    "core/framework/agent_loop/internals/compaction.py"
+  ],
+  "observed_delta_summary": {
+    "numstat": {"add": 8, "del": 44, "total": 52},
+    "themes": [
+      "removal of preserve_user_messages mode from llm_compact path",
+      "simplification of system prompt construction",
+      "compaction prompt user-message section normalized to single policy"
+    ]
+  },
+  "risk_notes": [
+    "behavioral impact on manual compact-and-fork expectations where verbatim user-message preservation was previously explicit",
+    "touches compaction prompt semantics used by long-conversation continuation"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q",
+        "result": "pass",
+        "summary": "163 passed, 4 skipped"
+      }
+    ]
+  },
+  "status": "precheck_complete"
+}

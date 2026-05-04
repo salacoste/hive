@@ -1,0 +1,43 @@
+{
+  "generated_at_utc": "2026-04-26T02:17:38Z",
+  "wave": "Wave16-R10C",
+  "title": "Agent host + colony runtime cancel timeout/noise lane precheck",
+  "scope": [
+    "core/framework/host/agent_host.py",
+    "core/framework/host/colony_runtime.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": [
+      {
+        "path": "core/framework/host/agent_host.py",
+        "add": 5,
+        "del": 1,
+        "total": 6
+      },
+      {
+        "path": "core/framework/host/colony_runtime.py",
+        "add": 5,
+        "del": 1,
+        "total": 6
+      }
+    ]
+  },
+  "delta_summary": [
+    "cancel_all_tasks() now handles concurrent.futures.TimeoutError separately",
+    "timeout case is downgraded to debug-level signal with explicit message",
+    "non-timeout failures preserve warning-level logging with traceback"
+  ],
+  "risk_signals": [
+    {
+      "type": "operational-noise",
+      "evidence": "upstream merges timeout and failures into single warning path",
+      "impact": "expected timeout windows can inflate warning logs"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q",
+    "uv run --package framework pytest core/tests/test_run_parallel_workers_tool.py -q",
+    "uv run --package framework pytest core/tests/test_create_colony_tool.py -q"
+  ],
+  "decision_gate": "keep_local acceptable if cancellation semantics remain intact and host/runtime worker tests stay green"
+}

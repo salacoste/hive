@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-26T02:02:29Z",
+  "wave": "Wave16-R9Z",
+  "title": "Execution manager cancellation-grace logging lane precheck",
+  "scope": [
+    "core/framework/host/execution_manager.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/host/execution_manager.py",
+      "add": 5,
+      "del": 1,
+      "total": 6
+    }
+  },
+  "delta_summary": [
+    "bounded delta in ExecutionManager.stop() cancellation-grace branch only",
+    "local variant keeps info-level observability with stream_id instead of warning-noise message"
+  ],
+  "risk_signals": [
+    {
+      "type": "operational-noise",
+      "evidence": "upstream warns when cancellation exceeds 5s grace window",
+      "impact": "warning volume can spike in expected cancellation windows"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'execution' -q",
+    "uv run --package framework pytest core/tests/test_runtime.py -q",
+    "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q"
+  ],
+  "decision_gate": "keep_local acceptable if behavior remains non-functional and execution lifecycle tests are green"
+}

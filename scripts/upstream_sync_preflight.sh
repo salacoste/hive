@@ -27,6 +27,10 @@ echo "-- upstream changed files --"
 git diff --name-status "HEAD..${TARGET_REF}" || true
 
 echo
+echo "-- destructive lane guardrail --"
+uv run python scripts/check_upstream_destructive_lanes.py --base-ref HEAD --upstream-ref "${TARGET_REF}"
+
+echo
 echo "-- hotspot overlap (local dirty files) --"
 DIRTY_FILES="$(git status --porcelain | awk '{print $2}' || true)"
 if [[ -n "${DIRTY_FILES}" ]]; then

@@ -39,7 +39,7 @@ _DEFAULT_CONFIG = {
 # suite without having to run `hive mcp add` manually. ``cwd`` is filled in
 # at registration time with the absolute path to the ``tools/`` directory.
 _DEFAULT_LOCAL_SERVERS: dict[str, dict[str, Any]] = {
-    "hive_tools": {
+    "hive-tools": {
         "description": "Hive tools: web search, email, CRM, calendar, and 100+ integrations",
         "args": ["run", "python", "mcp_server.py", "--stdio"],
     },
@@ -57,7 +57,7 @@ _DEFAULT_LOCAL_SERVERS: dict[str, dict[str, Any]] = {
 # When we see one of these stale entries, drop it before seeding the canonical
 # name so the active agents (queen, credential_tester) can find their tools.
 _STALE_DEFAULT_ALIASES: dict[str, str] = {
-    "hive_tools": "hive-tools",
+    "hive-tools": "hive_tools",
 }
 
 

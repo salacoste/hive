@@ -1,0 +1,52 @@
+{
+  "generated_at_utc": "2026-04-24T16:03:28Z",
+  "lane": "ND-4B",
+  "title": "Frontend conversation/runtime UX bounded replay execution",
+  "mode": "reconcile",
+  "scope_files": [
+    "core/frontend/src/api/execution.ts",
+    "core/frontend/src/api/sessions.ts",
+    "core/frontend/src/components/AppHeader.tsx",
+    "core/frontend/src/components/ChatPanel.tsx",
+    "core/frontend/src/components/ColonyWorkersPanel.tsx",
+    "core/frontend/src/components/QueenProfilePanel.tsx",
+    "core/frontend/src/components/SettingsModal.tsx",
+    "core/frontend/src/lib/chat-helpers.test.ts",
+    "core/frontend/src/lib/chat-helpers.ts",
+    "core/frontend/src/lib/colony-session-restore.ts",
+    "core/frontend/src/pages/colony-chat.tsx",
+    "core/frontend/src/pages/queen-dm.tsx"
+  ],
+  "reconcile_summary": {
+    "upstream_checkout_applied": [
+      "core/frontend/src/components/AppHeader.tsx",
+      "core/frontend/src/components/ChatPanel.tsx",
+      "core/frontend/src/components/ColonyWorkersPanel.tsx",
+      "core/frontend/src/components/QueenProfilePanel.tsx",
+      "core/frontend/src/components/SettingsModal.tsx",
+      "core/frontend/src/lib/colony-session-restore.ts"
+    ],
+    "three_way_merge_clean": [
+      "core/frontend/src/api/sessions.ts",
+      "core/frontend/src/pages/colony-chat.tsx"
+    ],
+    "three_way_merge_with_manual_conflict_resolution": [
+      "core/frontend/src/api/execution.ts",
+      "core/frontend/src/lib/chat-helpers.test.ts",
+      "core/frontend/src/lib/chat-helpers.ts",
+      "core/frontend/src/pages/queen-dm.tsx"
+    ]
+  },
+  "validation": {
+    "frontend_tests": {
+      "command": "cd core/frontend && npm test -- --run",
+      "result": "53 passed"
+    },
+    "frontend_build": {
+      "command": "cd core/frontend && npm run build",
+      "result": "ok"
+    },
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  }
+}

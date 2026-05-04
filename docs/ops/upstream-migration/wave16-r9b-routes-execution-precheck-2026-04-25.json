@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-25T11:04:32Z",
+  "wave": "Wave16-R9B",
+  "title": "Routes execution medium-lane precheck",
+  "scope": [
+    "core/framework/server/routes_execution.py"
+  ],
+  "observed_delta_summary": {
+    "numstat": {"add": 150, "del": 23, "total": 173},
+    "themes": [
+      "project-level concurrency queue controls (APP_KEY_PROJECT_EXEC_QUEUE)",
+      "runtime abstraction helper (_session_runtime) and active execution counting",
+      "policy-aware execution admission via resolve_effective_policy",
+      "client message metadata propagation for web chat events"
+    ]
+  },
+  "risk_notes": [
+    "medium/high API-surface lane touching trigger/inject/chat execution control paths",
+    "behavioral sensitivity for queueing/admission and project policy enforcement"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q",
+        "result": "pass",
+        "summary": "29 passed, 164 deselected"
+      }
+    ],
+    "gate_reference": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "latest run ok=7 failed=0"
+    }
+  },
+  "status": "precheck_complete"
+}

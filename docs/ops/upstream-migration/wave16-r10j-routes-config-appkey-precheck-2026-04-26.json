@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-26T13:15:19Z",
+  "wave": "Wave16-R10J",
+  "title": "Routes config AppKey contract refresh lane precheck",
+  "scope": [
+    "core/framework/server/routes_config.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/server/routes_config.py",
+      "add": 3,
+      "del": 2,
+      "total": 5
+    }
+  },
+  "delta_summary": [
+    "switches manager and credential_store access to typed AppKey constants",
+    "prevents aiohttp string-key warning drift for routes_config hot-swap and key resolution paths",
+    "behavioral intent unchanged"
+  ],
+  "risk_signals": [
+    {
+      "type": "runtime-appkey-contract",
+      "evidence": "request.app access path changed for manager/credential store",
+      "impact": "mis-bound AppKeys could break llm config read/update endpoints"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_model_catalog.py -q",
+    "uv run --package framework pytest core/tests/test_litellm_provider.py -q"
+  ],
+  "decision_gate": "keep_local acceptable if model-catalog/provider bundles remain green with typed AppKey access"
+}

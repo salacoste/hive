@@ -1,0 +1,124 @@
+{
+  "date": "2026-04-24",
+  "generated_at_utc": "2026-04-24T13:54:48.432690+00:00",
+  "base_ref": "HEAD",
+  "upstream_ref": "upstream/main",
+  "lane_id": "ND-2-examples-templates",
+  "summary": {
+    "total": 15,
+    "config": 12,
+    "code_bearing": 3,
+    "low_risk": 12,
+    "medium_risk": 3
+  },
+  "entries": [
+    {
+      "status": "M",
+      "path": "examples/templates/competitive_intel_agent/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/deep_research_agent/agent.py",
+      "class": "code-bearing-template",
+      "risk": "medium"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/deep_research_agent/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/deep_research_agent/nodes/__init__.py",
+      "class": "code-bearing-template",
+      "risk": "medium"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/email_inbox_management/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/email_reply_agent/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/job_hunter/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/local_business_extractor/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/meeting_scheduler/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/meeting_scheduler/nodes/__init__.py",
+      "class": "code-bearing-template",
+      "risk": "medium"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/sdr_agent/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/tech_news_reporter/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/twitter_news_agent/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/vulnerability_assessment/mcp_registry.json",
+      "class": "config",
+      "risk": "low"
+    },
+    {
+      "status": "M",
+      "path": "examples/templates/vulnerability_assessment/mcp_servers.json",
+      "class": "config",
+      "risk": "low"
+    }
+  ],
+  "recommended_first_bounded_candidate": {
+    "id": "ND-2A-config-only",
+    "paths": [
+      "examples/templates/competitive_intel_agent/mcp_servers.json",
+      "examples/templates/deep_research_agent/mcp_servers.json",
+      "examples/templates/email_inbox_management/mcp_servers.json",
+      "examples/templates/email_reply_agent/mcp_servers.json",
+      "examples/templates/job_hunter/mcp_servers.json",
+      "examples/templates/local_business_extractor/mcp_servers.json",
+      "examples/templates/meeting_scheduler/mcp_servers.json",
+      "examples/templates/sdr_agent/mcp_servers.json",
+      "examples/templates/tech_news_reporter/mcp_servers.json",
+      "examples/templates/twitter_news_agent/mcp_servers.json",
+      "examples/templates/vulnerability_assessment/mcp_registry.json",
+      "examples/templates/vulnerability_assessment/mcp_servers.json"
+    ],
+    "reason": "config-only template updates; lowest risk subset inside ND-2 lane"
+  }
+}

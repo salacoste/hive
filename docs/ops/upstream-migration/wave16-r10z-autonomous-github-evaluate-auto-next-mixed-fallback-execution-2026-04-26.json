@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-26T18:32:27Z",
+  "wave": "Wave16-R10Z",
+  "title": "Autonomous GitHub evaluate + auto-next mixed payload + fallback continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "evaluate endpoint continuity remains stable under partial/mixed GitHub payloads",
+      "auto-next fallback and deferred-policy continuity remains stable under constrained inputs",
+      "no regressions observed in targeted mixed payload + fallback bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_evaluate_endpoint_accepts_status_field or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_endpoint' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10Z lane closed as keep-local with green mixed payload + fallback continuity bundle",
+      "next lane should continue bounded coverage on autonomous evaluate/dispatch edge continuity"
+    ]
+  }
+}

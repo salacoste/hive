@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T02:00:00Z",
+  "wave": "Wave16-R6",
+  "title": "Runtime warning/noise hardening execution",
+  "scope": [
+    "core/framework/skills/discovery.py",
+    "core/framework/host/execution_manager.py",
+    "core/framework/host/agent_host.py",
+    "core/framework/host/colony_runtime.py",
+    "core/tests/test_skill_discovery.py"
+  ],
+  "changes": [
+    "suppressed expected framework<->preset skill-collision warnings in skill discovery while preserving deterministic override behavior",
+    "kept collision warnings for user/project collisions unchanged to preserve operator signal",
+    "downgraded shutdown cancellation-timeout noise in host cancellation helpers (debug for timeout, warning with stack for real failures)",
+    "downgraded execution-stream stop grace-window timeout from warning to informational shutdown signal",
+    "added tests asserting bundled collision suppression and non-bundled collision warning retention"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_skill_discovery.py -q",
+        "result": "pass",
+        "summary": "10 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      }
+    ],
+    "runtime_probe": {
+      "command": "uv run python - <<'PY' ... SkillDiscovery(DiscoveryConfig(skip_user_scope=True)).discover() ... PY",
+      "result": "pass",
+      "summary": "no SKILL_COLLISION diagnostics emitted for bundled framework/preset duplicates"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "operator-facing warning stream no longer polluted by expected bundled skill-name precedence",
+      "shutdown-related timeout noise reduced without hiding true cancellation errors"
+    ]
+  }
+}

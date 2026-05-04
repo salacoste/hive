@@ -1,0 +1,64 @@
+{
+  "generated_at_utc": "2026-04-24T14:51:28Z",
+  "lane": "ND-3B",
+  "title": "GCU/browser bounded replay",
+  "scope_files": [
+    "tools/src/gcu/__init__.py",
+    "tools/src/gcu/browser/__init__.py",
+    "tools/src/gcu/browser/bridge.py",
+    "tools/src/gcu/browser/tools/inspection.py",
+    "tools/src/gcu/browser/tools/interactions.py",
+    "tools/src/gcu/browser/tools/tabs.py",
+    "tools/tests/test_browser_tools_comprehensive.py"
+  ],
+  "apply": {
+    "command": "git apply docs/ops/upstream-migration/wave15-nd3b-gcu.patch",
+    "result": "ok"
+  },
+  "scope_verification": {
+    "command": "git diff --numstat -- <ND-3B files>",
+    "files": [
+      {
+        "path": "tools/src/gcu/__init__.py",
+        "added": 2,
+        "deleted": 12
+      },
+      {
+        "path": "tools/src/gcu/browser/__init__.py",
+        "added": 1,
+        "deleted": 1
+      },
+      {
+        "path": "tools/src/gcu/browser/bridge.py",
+        "added": 49,
+        "deleted": 38
+      },
+      {
+        "path": "tools/src/gcu/browser/tools/inspection.py",
+        "added": 40,
+        "deleted": 40
+      },
+      {
+        "path": "tools/src/gcu/browser/tools/interactions.py",
+        "added": 1,
+        "deleted": 5
+      },
+      {
+        "path": "tools/src/gcu/browser/tools/tabs.py",
+        "added": 33,
+        "deleted": 10
+      },
+      {
+        "path": "tools/tests/test_browser_tools_comprehensive.py",
+        "added": 4,
+        "deleted": 4
+      }
+    ]
+  },
+  "validation": {
+    "targeted_tests_command": "uv run --package tools pytest tools/tests/test_browser_tools_comprehensive.py -q",
+    "targeted_tests_result": "28 passed",
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  }
+}

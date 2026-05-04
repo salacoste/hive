@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,16 @@ from framework.llm.provider import Tool, ToolResult, ToolUse
 logger = logging.getLogger(__name__)
 
 _INPUT_LOG_MAX_LEN = 500
+
+# Tools whose names match this pattern are assumed to return ImageContent.
+# Matched against the bare tool name (case-insensitive). Used to mark MCP
+# tools with produces_image=True so they can be filtered out for text-only
+# models before the schema is ever shown to the LLM (avoids wasted calls
+# and "screenshot failed" entries polluting memory).
+_IMAGE_TOOL_NAME_RE = re.compile(
+    r"(screenshot|screen_capture|capture_image|render_image|get_image|snapshot_image)",
+    re.IGNORECASE,
+)
 
 # Per-execution context overrides.  Each asyncio task (and thus each
 # concurrent graph execution) gets its own copy, so there are no races
@@ -50,6 +61,33 @@ class ToolRegistry:
     # and auto-injected at call time for tools that accept them.
     CONTEXT_PARAMS = frozenset({"agent_id", "data_dir", "profile"})
 
+    # Tools that perform no filesystem/process/network writes and are safe
+    # to run concurrently with other safe tools in the same assistant turn.
+    # Unknown tools default to unsafe (serialized) - adding a name here is
+    # an explicit promise about that tool's side effects. Keep this list
+    # conservative: anything that mutates state, writes to disk, issues
+    # POST/PUT/DELETE requests, or drives a browser MUST NOT be listed.
+    CONCURRENCY_SAFE_TOOLS = frozenset(
+        {
+            # File system reads
+            "read_file",
+            "list_directory",
+            "grep",
+            "glob",
+            # Web reads
+            "web_search",
+            "web_fetch",
+            # Browser read-only snapshots (mutate-free observations)
+            "browser_screenshot",
+            "browser_snapshot",
+            "browser_console",
+            "browser_get_text",
+            # Background bash polling - reads output buffers only, does
+            # not touch the subprocess itself.
+            "bash_output",
+        }
+    )
+
     # Credential directory used for change detection
     _CREDENTIAL_DIR = Path("~/.hive/credentials/credentials").expanduser()
 
@@ -66,151 +104,65 @@ class ToolRegistry:
         self._mcp_cred_snapshot: set[str] = set()  # Credential filenames at MCP load time
         self._mcp_aden_key_snapshot: str | None = None  # ADEN_API_KEY value at MCP load time
         self._mcp_server_tools: dict[str, set[str]] = {}  # server name -> tool names
+        # tool name -> owning MCPClient (for force-kill on timeout)
+        self._mcp_tool_clients: dict[str, Any] = {}
+        # Per-agent env injected into every MCP server config.env. Kept
+        # here (not on the process-wide os.environ) so parallel workers
+        # in the same interpreter don't clobber each other's identity.
+        self._mcp_extra_env: dict[str, str] = {}
         # Agent dir for re-loading registry MCP after credential resync.
         self._mcp_registry_agent_path: Path | None = None
-        self._register_builtin_data_tools()
+        self._register_builtin_tools()
 
-    @staticmethod
-    def _resolve_data_path(data_dir: str | Path | None, filename: str) -> tuple[Path, Path]:
-        """Resolve *filename* under *data_dir* and prevent path traversal."""
-        exec_ctx = _execution_context.get() or {}
-        ctx_data_dir = str(exec_ctx.get("data_dir") or "").strip()
+    def _register_builtin_tools(self) -> None:
+        """Register framework built-ins required by runtime/tests."""
 
-        chosen_data_dir = str(data_dir or "").strip()
-        # LLMs frequently pass "." or "/app" despite explicit prompt guidance.
-        # Prefer the execution-scoped data_dir when available.
-        if not chosen_data_dir or chosen_data_dir in {".", "./", "/app", "/app/data"}:
-            chosen_data_dir = ctx_data_dir or chosen_data_dir
-
-        if not chosen_data_dir:
-            raise ValueError("data_dir is required")
-        base_path = Path(chosen_data_dir).expanduser()
-        if not base_path.is_absolute() and ctx_data_dir:
-            base = (Path(ctx_data_dir).expanduser() / base_path).resolve()
-        else:
-            base = base_path.resolve()
-        base.mkdir(parents=True, exist_ok=True)
-        candidate = (base / str(filename or "")).resolve()
-        if not str(candidate).startswith(str(base)):
-            raise ValueError("filename must stay within data_dir")
-        return base, candidate
-
-    def _register_builtin_data_tools(self) -> None:
-        """Register framework data/file tools used by template agents."""
-
-        def save_data(filename: str, data: Any, data_dir: str = "") -> dict[str, Any]:
-            _, path = self._resolve_data_path(data_dir, filename)
-            payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, indent=2)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(payload, encoding="utf-8")
-            return {
-                "ok": True,
-                "filename": path.name,
-                "file_path": str(path),
-                "uri": path.as_uri(),
-                "bytes_written": len(payload.encode("utf-8")),
-            }
-
-        def append_data(filename: str, data: Any, data_dir: str = "") -> dict[str, Any]:
-            _, path = self._resolve_data_path(data_dir, filename)
-            payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(payload)
-            return {
-                "ok": True,
-                "filename": path.name,
-                "file_path": str(path),
-                "uri": path.as_uri(),
-                "bytes_appended": len(payload.encode("utf-8")),
-            }
-
-        def edit_data(filename: str, old_text: str, new_text: str, data_dir: str = "") -> dict[str, Any]:
-            _, path = self._resolve_data_path(data_dir, filename)
-            if not path.exists():
-                raise FileNotFoundError(f"File not found: {filename}")
-            content = path.read_text(encoding="utf-8")
-            updated = content.replace(old_text or "", new_text or "")
-            path.write_text(updated, encoding="utf-8")
-            return {
-                "ok": True,
-                "filename": path.name,
-                "file_path": str(path),
-                "uri": path.as_uri(),
-                "bytes_written": len(updated.encode("utf-8")),
-            }
-
-        def load_data(
-            filename: str,
-            data_dir: str = "",
-            offset_bytes: int = 0,
-            limit_bytes: int = 200000,
-        ) -> dict[str, Any]:
-            _, path = self._resolve_data_path(data_dir, filename)
-            if not path.exists():
-                raise FileNotFoundError(f"File not found: {filename}")
-            raw = path.read_bytes()
-            total = len(raw)
-            start = max(0, int(offset_bytes or 0))
-            end = min(total, start + max(1, int(limit_bytes or 1)))
-            chunk = raw[start:end]
-            return {
-                "ok": True,
-                "filename": path.name,
-                "file_path": str(path),
-                "uri": path.as_uri(),
-                "content": chunk.decode("utf-8", errors="replace"),
-                "offset_bytes": start,
-                "returned_bytes": len(chunk),
-                "total_bytes": total,
-                "has_more": end < total,
-                "next_offset_bytes": end if end < total else None,
-            }
-
-        def list_data_files(data_dir: str = "") -> dict[str, Any]:
-            base, _ = self._resolve_data_path(data_dir, ".")
-            files = []
-            for entry in sorted(base.rglob("*")):
-                if not entry.is_file():
-                    continue
-                rel = entry.relative_to(base)
-                files.append(
-                    {
-                        "filename": str(rel),
-                        "file_path": str(entry),
-                        "uri": entry.as_uri(),
-                        "size_bytes": entry.stat().st_size,
-                    }
-                )
-            return {"ok": True, "data_dir": str(base), "files": files}
-
-        def serve_file_to_user(
-            filename: str,
-            data_dir: str = "",
-            label: str = "",
-            open_in_browser: bool = False,
-        ) -> dict[str, Any]:
-            _, path = self._resolve_data_path(data_dir, filename)
-            if not path.exists():
-                raise FileNotFoundError(f"File not found: {filename}")
-            return {
-                "ok": True,
-                "filename": path.name,
-                "label": (label or path.name).strip(),
-                "file_path": str(path),
-                "uri": path.as_uri(),
-                "open_in_browser": bool(open_in_browser),
-            }
-
-        self.register_function(save_data, description="Save data to a file in the execution data directory.")
-        self.register_function(append_data, description="Append data to a file in the execution data directory.")
-        self.register_function(edit_data, description="Replace text in a data file in the execution data directory.")
-        self.register_function(load_data, description="Load data from a file with byte-range pagination support.")
-        self.register_function(list_data_files, description="List data files available in the execution data directory.")
-        self.register_function(
-            serve_file_to_user,
-            description="Return a local file path/URI for user download or opening.",
+        save_data_tool = Tool(
+            name="save_data",
+            description="Save text data to a file inside the execution data directory.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string"},
+                    "data": {"type": "string"},
+                    "data_dir": {"type": "string"},
+                },
+                "required": ["filename", "data"],
+            },
+            concurrency_safe=False,
         )
+
+        def _save_data_executor(inputs: dict[str, Any]) -> dict[str, Any]:
+            filename = str(inputs.get("filename", "")).strip()
+            if not filename:
+                return {"ok": False, "error": "filename is required"}
+
+            # Execution context takes precedence over session context.
+            exec_ctx = _execution_context.get() or {}
+            context_data_dir = exec_ctx.get("data_dir") or self._session_context.get("data_dir")
+            requested_data_dir = inputs.get("data_dir")
+
+            # Treat "." as "use framework-provided execution context directory".
+            if requested_data_dir in (None, "", "."):
+                base_dir = context_data_dir or "."
+            else:
+                base_dir = requested_data_dir
+
+            target_path = Path(str(base_dir)).expanduser() / filename
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(str(inputs.get("data", "")), encoding="utf-8")
+            return {"ok": True, "file_path": str(target_path)}
+
+        self.register("save_data", save_data_tool, _save_data_executor)
+
+    def set_mcp_extra_env(self, env: dict[str, str]) -> None:
+        """Attach per-agent env vars to every MCPServerConfig this registry builds.
+
+        Use this instead of mutating ``os.environ`` — the global env dict
+        is shared across all workers in a single interpreter, so writes
+        from one worker race with MCP spawns from another.
+        """
+        self._mcp_extra_env = dict(env)
 
     def register(
         self,
@@ -280,6 +232,7 @@ class ToolRegistry:
                 "properties": properties,
                 "required": required,
             },
+            concurrency_safe=tool_name in self.CONCURRENCY_SAFE_TOOLS,
         )
 
         def executor(inputs: dict) -> Any:
@@ -346,10 +299,7 @@ class ToolRegistry:
                                         str(e),
                                     )
                                     return {
-                                        "error": (
-                                            f"Invalid JSON response from tool '{tool_name}': "
-                                            f"{str(e)}"
-                                        ),
+                                        "error": (f"Invalid JSON response from tool '{tool_name}': {str(e)}"),
                                         "raw_content": result.content,
                                     }
                             return result
@@ -405,15 +355,21 @@ class ToolRegistry:
                 is_error=False,
             )
 
+        registry_ref = self
+
         def executor(tool_use: ToolUse) -> ToolResult:
-            if tool_use.name not in self._tools:
+            # Check if credential files changed (lightweight dir listing).
+            # If new OAuth tokens appeared, restarts MCP servers to pick them up.
+            registry_ref.resync_mcp_servers_if_needed()
+
+            if tool_use.name not in registry_ref._tools:
                 return ToolResult(
                     tool_use_id=tool_use.id,
                     content=json.dumps({"error": f"Unknown tool: {tool_use.name}"}),
                     is_error=True,
                 )
 
-            registered = self._tools[tool_use.name]
+            registered = registry_ref._tools[tool_use.name]
             try:
                 result = registered.executor(tool_use.input)
 
@@ -463,6 +419,9 @@ class ToolRegistry:
                     is_error=True,
                 )
 
+        # Expose force-kill hook so the timeout handler can tear down a
+        # hung MCP subprocess (asyncio.wait_for alone cannot).
+        executor.kill_for_tool = registry_ref.kill_mcp_for_tool  # type: ignore[attr-defined]
         return executor
 
     def get_registered_names(self) -> list[str]:
@@ -509,15 +468,13 @@ class ToolRegistry:
         """Resolve cwd and script paths for MCP stdio config (Windows compatibility).
 
         Use this when building MCPServerConfig from a config file (e.g. in
-        list_agent_tools, discover_mcp_tools) so hive-tools and other servers
+        list_agent_tools, discover_mcp_tools) so hive_tools and other servers
         work on Windows. Call with base_dir = directory containing the config.
         """
         registry = ToolRegistry()
         return registry._resolve_mcp_server_config(server_config, base_dir)
 
-    def _resolve_mcp_server_config(
-        self, server_config: dict[str, Any], base_dir: Path
-    ) -> dict[str, Any]:
+    def _resolve_mcp_server_config(self, server_config: dict[str, Any], base_dir: Path) -> dict[str, Any]:
         """Resolve cwd and script paths for MCP stdio servers (Windows compatibility).
 
         On Windows, passing cwd to subprocess can cause WinError 267. We use cwd=None
@@ -582,12 +539,22 @@ class ToolRegistry:
             config["cwd"] = str(resolved_cwd)
             return config
 
-        # For coder_tools_server, inject --project-root so writes go to the expected workspace
+        # For coder_tools_server, inject --project-root so reads land
+        # in the expected workspace (hive repo, for framework skills
+        # and docs), and inject --write-root so writes land under
+        # ~/.hive/workspace/ instead of polluting the git checkout
+        # with queen-authored skills, ledgers, and scripts. Without
+        # the split, every ``write_file`` call from the queen landed
+        # in the hive repo root.
         if script_name and "coder_tools" in script_name:
             project_root = str(resolved_cwd.parent.resolve())
             args = list(args)
             if "--project-root" not in args:
                 args.extend(["--project-root", project_root])
+            if "--write-root" not in args:
+                _write_root = Path.home() / ".hive" / "workspace"
+                _write_root.mkdir(parents=True, exist_ok=True)
+                args.extend(["--write-root", str(_write_root)])
             config["args"] = args
 
         if os.name == "nt":
@@ -632,8 +599,7 @@ class ToolRegistry:
             server_list = [{"name": name, **cfg} for name, cfg in config.items()]
 
         resolved_server_list = [
-            self._resolve_mcp_server_config(server_config, base_dir)
-            for server_config in server_list
+            self._resolve_mcp_server_config(server_config, base_dir) for server_config in server_list
         ]
         # Ordered first-wins for duplicate tool names across servers; keep tools.py tools.
         self.load_registry_servers(
@@ -647,6 +613,8 @@ class ToolRegistry:
         self._mcp_cred_snapshot = self._snapshot_credentials()
         self._mcp_aden_key_snapshot = os.environ.get("ADEN_API_KEY")
 
+        self._log_registry_snapshot("after load_mcp_config")
+
     def _register_mcp_server_with_retry(
         self,
         server_config: dict[str, Any],
@@ -655,8 +623,18 @@ class ToolRegistry:
         tool_cap: int | None = None,
         log_collisions: bool = False,
     ) -> tuple[bool, int, str | None]:
-        """Register a single MCP server with one retry for transient failures."""
+        """Register a single MCP server with one retry for transient failures.
+
+        When ``preserve_existing_tools=True`` and the server's tools are
+        already present from a prior registration, ``register_mcp_server``
+        returns ``count=0`` because every tool was shadowed. That's a
+        no-op success, not a failure — don't retry / warn in that case.
+        Otherwise a duplicate-init path (e.g. a worker spawn re-loading
+        the MCP servers the queen already registered) spams shadow
+        warnings, sleeps 2s, and retries for no reason.
+        """
         name = server_config.get("name", "unknown")
+        already_loaded = bool(self._mcp_server_tools.get(name))
         last_error: str | None = None
 
         for attempt in range(2):
@@ -669,7 +647,9 @@ class ToolRegistry:
                 )
                 if count > 0:
                     return True, count, None
-                if bool(server_config.get("allow_zero_tools", False)):
+                if already_loaded and preserve_existing_tools:
+                    # All tools shadowed by the prior registration of
+                    # the same server — nothing to do, server is usable.
                     return True, 0, None
                 last_error = "registered 0 tools"
             except Exception as exc:
@@ -780,16 +760,20 @@ class ToolRegistry:
             Number of tools registered from this server
         """
         try:
-            from framework.runner.mcp_client import MCPClient, MCPServerConfig
-            from framework.runner.mcp_connection_manager import MCPConnectionManager
+            from framework.loader.mcp_client import MCPClient, MCPServerConfig
+            from framework.loader.mcp_connection_manager import MCPConnectionManager
 
-            # Build config object
+            # Build config object. Merge per-agent env on top of the
+            # server's own env so MCP subprocesses receive the identity
+            # of the worker that spawned them (instead of whichever
+            # worker most recently wrote to os.environ).
+            merged_env = {**self._mcp_extra_env, **(server_config.get("env") or {})}
             config = MCPServerConfig(
                 name=server_config["name"],
                 transport=server_config["transport"],
                 command=server_config.get("command"),
                 args=server_config.get("args", []),
-                env=server_config.get("env", {}),
+                env=merged_env,
                 cwd=server_config.get("cwd"),
                 url=server_config.get("url"),
                 headers=server_config.get("headers", {}),
@@ -815,28 +799,37 @@ class ToolRegistry:
             server_name = server_config["name"]
             if server_name not in self._mcp_server_tools:
                 self._mcp_server_tools[server_name] = set()
+
+            # Build admission gate: only admit MCP tools that are either
+            # (a) credential-backed *and* have a configured account, or
+            # (b) credential-less *and* listed in the verified manifest.
+            # Servers that don't expose `__aden_verified_manifest` (third-party
+            # MCP servers) bypass the gate entirely — preserves prior behavior.
+            admit = self._build_mcp_admission_gate(client)
+
             count = 0
-            skipped_existing = 0
-            skipped_cap = 0
-            mcp_tools = list(client.list_tools())
-            discovered_total = len(mcp_tools)
-            for idx, mcp_tool in enumerate(mcp_tools):
+            admitted_names: list[str] = []
+            for mcp_tool in client.list_tools():
+                if not admit(mcp_tool.name):
+                    continue
                 if tool_cap is not None and count >= tool_cap:
-                    skipped_cap = max(0, discovered_total - idx)
                     break
 
                 if preserve_existing_tools and mcp_tool.name in self._tools:
-                    skipped_existing += 1
                     if log_collisions:
-                        origin_server = (
-                            self._find_mcp_origin_server_for_tool(mcp_tool.name) or "<existing>"
-                        )
-                        logger.warning(
-                            "MCP tool '%s' from '%s' shadowed by '%s' (loaded first)",
-                            mcp_tool.name,
-                            server_name,
-                            origin_server,
-                        )
+                        origin_server = self._find_mcp_origin_server_for_tool(mcp_tool.name) or "<existing>"
+                        # Don't warn when a server is being re-registered
+                        # by itself — that's a redundant-init case (e.g.
+                        # the same tool_registry seeing the same server
+                        # twice via pooled reconnect), not a real
+                        # cross-server shadow worth flagging.
+                        if origin_server != server_name:
+                            logger.warning(
+                                "MCP tool '%s' from '%s' shadowed by '%s' (loaded first)",
+                                mcp_tool.name,
+                                server_name,
+                                origin_server,
+                            )
                     # Skip registration; do not update MCP tool bookkeeping for this server.
                     continue
 
@@ -859,17 +852,11 @@ class ToolRegistry:
                                 base_context.update(exec_ctx)
 
                             # Only inject context params the tool accepts
-                            filtered_context = {
-                                k: v for k, v in base_context.items() if k in tool_params
-                            }
+                            filtered_context = {k: v for k, v in base_context.items() if k in tool_params}
                             # Strip context params from LLM inputs — the framework
                             # values are authoritative (prevents the LLM from passing
                             # e.g. data_dir="/data" and overriding the real path).
-                            clean_inputs = {
-                                k: v
-                                for k, v in inputs.items()
-                                if k not in registry_ref.CONTEXT_PARAMS
-                            }
+                            clean_inputs = {k: v for k, v in inputs.items() if k not in registry_ref.CONTEXT_PARAMS}
                             merged_inputs = {**clean_inputs, **filtered_context}
                             result = client_ref.call_tool(tool_name, merged_inputs)
                             # MCP client already extracts content (returns str
@@ -902,7 +889,9 @@ class ToolRegistry:
                     make_mcp_executor(client, mcp_tool.name, self, tool_params),
                 )
                 self._mcp_tool_names.add(mcp_tool.name)
+                self._mcp_tool_clients[mcp_tool.name] = client
                 self._mcp_server_tools[server_name].add(mcp_tool.name)
+                admitted_names.append(mcp_tool.name)
                 count += 1
 
             logger.info(
@@ -910,20 +899,16 @@ class ToolRegistry:
                 extra={
                     "server": config.name,
                     "status": "success",
-                    "tools_discovered": discovered_total,
                     "tools_loaded": count,
-                    "tools_skipped_existing": skipped_existing,
-                    "tools_skipped_cap": skipped_cap,
                     "skipped_reason": None,
                 },
             )
-            if discovered_total > 0 and count == 0 and skipped_existing == discovered_total:
-                logger.info(
-                    "MCP server '%s' registered 0 new tools; all %d discovered tools "
-                    "were already present in registry (first-wins)",
-                    server_name,
-                    discovered_total,
-                )
+            logger.info(
+                "MCP server '%s' admitted %d tool(s): %s",
+                config.name,
+                len(admitted_names),
+                sorted(admitted_names),
+            )
             return count
 
         except Exception as e:
@@ -948,6 +933,104 @@ class ToolRegistry:
             if tool_name in tool_names:
                 return server_name
         return None
+
+    def _log_registry_snapshot(self, context: str) -> None:
+        """Emit a one-line summary of the current tool registry.
+
+        Called after every tool-list mutation (initial load + resync) so that
+        operators can correlate "what tools does the queen have right now"
+        with credential changes and MCP server lifecycle events. Per-server
+        contents are already logged by `register_mcp_server`; this is just the
+        rollup so the resync path also gets a single anchor line.
+        """
+        per_server_counts = {server: len(names) for server, names in self._mcp_server_tools.items()}
+        non_mcp_count = len(self._tools) - len(self._mcp_tool_names)
+        logger.info(
+            "ToolRegistry snapshot (%s): total=%d, mcp=%d, non_mcp=%d, per_server=%s",
+            context,
+            len(self._tools),
+            len(self._mcp_tool_names),
+            non_mcp_count,
+            per_server_counts,
+        )
+
+    _MCP_VERIFIED_MANIFEST_TOOL = "__aden_verified_manifest"
+
+    def _build_mcp_admission_gate(self, client: Any) -> Callable[[str], bool]:
+        """Build a per-server predicate that filters MCP tools at registration.
+
+        Rules:
+          * The sentinel manifest tool itself is never admitted.
+          * Credential-backed tools (provider in `tool_provider_map`) are
+            admitted only when at least one account exists for that provider.
+          * Credential-less tools are admitted only when they appear in the
+            server's verified manifest.
+          * Servers that don't expose a manifest bypass the verified gate
+            entirely (third-party MCP servers behave as before).
+        """
+        verified_names: set[str] = set()
+        manifest_present = False
+        # Only probe the sentinel when the server actually advertises it.
+        # Calling ``__aden_verified_manifest`` unconditionally on every
+        # MCP server at registration time (a) causes a bogus tool call
+        # round-trip to every third-party server, (b) pollutes any
+        # call-capturing fakes in tests, and (c) risks side effects on
+        # servers that eagerly execute unknown tool names. Listing is
+        # cheap and cached by the client; this keeps the manifest gate
+        # active for aden-flavoured servers without penalising others.
+        sentinel_advertised = False
+        try:
+            for t in client.list_tools():
+                if getattr(t, "name", None) == self._MCP_VERIFIED_MANIFEST_TOOL:
+                    sentinel_advertised = True
+                    break
+        except Exception:
+            sentinel_advertised = False
+
+        if sentinel_advertised:
+            try:
+                raw = client.call_tool(self._MCP_VERIFIED_MANIFEST_TOOL, {})
+                parsed: Any = raw
+                if isinstance(raw, str):
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError:
+                        parsed = None
+                # Only treat the response as a manifest when it's a list
+                # of strings. A malformed response shouldn't flip the gate
+                # on and silently hide every real tool from the server.
+                if isinstance(parsed, list) and all(isinstance(n, str) for n in parsed):
+                    verified_names = set(parsed)
+                    manifest_present = True
+            except Exception:
+                # Server advertised the sentinel but errored when called
+                # — treat as no manifest; fall back to third-party bypass.
+                pass
+
+        tool_provider_map: dict[str, str] = {}
+        live_providers: set[str] = set()
+        try:
+            from aden_tools.credentials.store_adapter import CredentialStoreAdapter
+
+            adapter = CredentialStoreAdapter.default()
+            tool_provider_map = adapter.get_tool_provider_map()
+            live_providers = {a.get("provider", "") for a in adapter.get_all_account_info() if a.get("provider")}
+        except Exception:
+            logger.debug("Credential snapshot unavailable for MCP gate", exc_info=True)
+
+        def admit(tool_name: str) -> bool:
+            if tool_name == self._MCP_VERIFIED_MANIFEST_TOOL:
+                return False
+            provider = tool_provider_map.get(tool_name)
+            if provider:
+                # Credentialed tool — needs an account.
+                return provider in live_providers
+            if not manifest_present:
+                # Third-party MCP server: preserve legacy "admit everything".
+                return True
+            return tool_name in verified_names
+
+        return admit
 
     def _convert_mcp_tool_to_framework_tool(self, mcp_tool: Any) -> Tool:
         """
@@ -978,6 +1061,8 @@ class ToolRegistry:
                 "properties": properties,
                 "required": required,
             },
+            produces_image=bool(_IMAGE_TOOL_NAME_RE.search(mcp_tool.name or "")),
+            concurrency_safe=mcp_tool.name in self.CONCURRENCY_SAFE_TOOLS,
         )
 
         return tool
@@ -1044,7 +1129,7 @@ class ToolRegistry:
         """Re-run ``mcp_registry.json`` resolution and register servers (post-resync)."""
         if self._mcp_registry_agent_path is None:
             return
-        from framework.runner.mcp_registry import MCPRegistry
+        from framework.loader.mcp_registry import MCPRegistry
 
         try:
             reg = MCPRegistry()
@@ -1083,6 +1168,11 @@ class ToolRegistry:
         clients and re-loads them so the new subprocess picks up the fresh
         credentials.
 
+        Note: Individual credential TTL/refresh is handled by the MCP server
+        process internally -- it resolves tokens from the credential store
+        on every tool call, not at startup. This method only handles the case
+        where entirely new credential files appear.
+
         Returns True if a resync was performed, False otherwise.
         """
         if not self._mcp_clients or self._mcp_config_path is None:
@@ -1120,6 +1210,7 @@ class ToolRegistry:
             self.reload_registry_mcp_servers_after_resync()
 
         logger.info("MCP server resync complete")
+        self._log_registry_snapshot("after resync_mcp_servers_if_needed")
         return True
 
     def cleanup(self) -> None:
@@ -1136,7 +1227,7 @@ class ToolRegistry:
             server_name = self._mcp_client_servers.get(client_id, client.config.name)
             try:
                 if client_id in self._mcp_managed_clients:
-                    from framework.runner.mcp_connection_manager import MCPConnectionManager
+                    from framework.loader.mcp_connection_manager import MCPConnectionManager
 
                     MCPConnectionManager.get_instance().release(server_name)
                 else:
@@ -1146,6 +1237,33 @@ class ToolRegistry:
         self._mcp_clients.clear()
         self._mcp_client_servers.clear()
         self._mcp_managed_clients.clear()
+        self._mcp_tool_clients.clear()
+
+    def kill_mcp_for_tool(self, tool_name: str) -> bool:
+        """Force-disconnect the MCP client that owns *tool_name*.
+
+        Called from the timeout handler in ``execute_tool`` when a tool
+        call hangs. Plain ``asyncio.wait_for`` cancellation cannot stop
+        a sync executor running inside a thread pool (and therefore
+        cannot stop the MCP subprocess), so we reach through to the
+        client here and tear it down. The next ``call_tool`` triggers
+        an automatic reconnect.
+
+        Returns True if a client was found and disconnect was attempted.
+        """
+        client = self._mcp_tool_clients.get(tool_name)
+        if client is None:
+            return False
+        try:
+            logger.warning(
+                "Force-disconnecting MCP client for hung tool '%s' on server '%s'",
+                tool_name,
+                getattr(client.config, "name", "?"),
+            )
+            client.disconnect()
+        except Exception as exc:
+            logger.warning("Error force-disconnecting MCP client for '%s': %s", tool_name, exc)
+        return True
 
     def __del__(self):
         """Destructor to ensure cleanup."""

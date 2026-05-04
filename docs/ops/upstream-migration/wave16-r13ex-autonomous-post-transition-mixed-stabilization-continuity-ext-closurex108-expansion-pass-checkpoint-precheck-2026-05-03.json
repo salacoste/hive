@@ -1,0 +1,12 @@
+{
+  "lane": "Wave16-R13EX",
+  "date": "2026-05-03",
+  "status": "precheck",
+  "depends_on": "Wave16-R13EW",
+  "summary": "Prepare next bounded mixed stabilization+continuity closurex108 checkpoint lane after R13EW completion.",
+  "checks": [
+    "Execution artifact for R13EW exists and records green bounded pytest bundle.",
+    "Backlog current focus should move from item 567 to item 568.",
+    "Use same bounded pytest bundle before deciding keep_local/replay/reconcile."
+  ]
+}

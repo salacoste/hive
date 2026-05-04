@@ -1,0 +1,57 @@
+{
+  "generated_at_utc": "2026-04-25T10:45:18Z",
+  "wave": "Wave16-R8M",
+  "title": "Micro-lane closure checkpoint (R8A..R8L)",
+  "summary": {
+    "completed_micro_lanes": [
+      "R8A mcp_client",
+      "R8B routes_config",
+      "R8C routes_logs",
+      "R8D loader mcp_registry",
+      "R8E routes_messages shortlist/execute",
+      "R8F loader cli",
+      "R8G server README",
+      "R8H queen mcp_registry include",
+      "R8I residual checkpoint",
+      "R8J execution_manager",
+      "R8K local-additive checkpoint",
+      "R8L agent_host+colony_runtime"
+    ],
+    "gate_baseline": "pass (latest upstream_sync_regression_gate: ok=7 failed=0)"
+  },
+  "residual_buckets": {
+    "intentional_keep_local_micro_contracts": [
+      "mcp/loader naming and AppKey contract lanes",
+      "runtime timeout-noise hardening lanes"
+    ],
+    "local_additive_non_replay": [
+      "core/framework/runtime/tests/__init__.py",
+      "core/framework/runtime/__init__.py",
+      "core/framework/graph/event_loop/__init__.py"
+    ],
+    "medium_size_candidates_13_220": [
+      "core/framework/server/routes_queens.py (146)",
+      "core/framework/server/routes_execution.py (173)",
+      "core/framework/server/project_* bundle",
+      "core/framework/agent_loop/* synthetic_tools/compaction"
+    ]
+  },
+  "recommendation": {
+    "next_wave_mode": "medium_bundle",
+    "selected_next_lane": {
+      "id": "R9A",
+      "path": "core/framework/server/routes_queens.py",
+      "rationale": [
+        "lowest-risk medium candidate with explicit API surface",
+        "isolated route module with existing queen-oriented tests",
+        "natural continuation after AppKey + queue/telegram stabilization"
+      ],
+      "planned_validation": [
+        "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"queen\" -q",
+        "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh"
+      ]
+    }
+  },
+  "status": "checkpoint_complete"
+}

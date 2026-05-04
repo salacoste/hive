@@ -1,0 +1,39 @@
+{
+  "generated_at_utc": "2026-04-26T01:58:31Z",
+  "wave": "Wave16-R9Y",
+  "title": "Routes messages AppKey manager contract lane execution",
+  "scope": [
+    "core/framework/server/routes_messages.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "route manager access remains aligned to typed AppKey contract (`request.app[APP_KEY_MANAGER]`)",
+      "classify route behavior validated in targeted API tests"
+    ]
+  },
+  "changes": [
+    "no additional code patch in R9Y lane (typed AppKey route access retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'messages_classify or classify_route' -q",
+        "result": "pass",
+        "summary": "1 passed, 192 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'messages or classify' -q",
+        "result": "pass",
+        "summary": "1 passed, 192 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9Y lane closed with explicit keep-local decision",
+      "next lane: execution_manager cancellation/diagnostics compatibility"
+    ]
+  }
+}

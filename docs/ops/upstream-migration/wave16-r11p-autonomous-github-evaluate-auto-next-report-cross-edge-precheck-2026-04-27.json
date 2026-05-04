@@ -1,0 +1,23 @@
+{
+  "generated_at_utc": "2026-04-27T00:45:26Z",
+  "wave": "Wave16-R11P",
+  "title": "Autonomous GitHub evaluate + auto-next + report cross-edge continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify GitHub evaluate outputs, auto-next policy decisions, and report/read-model updates remain consistent as one cross-edge flow",
+    "verify cross-edge behavior remains stable across review-feedback/no-checks/fallback/manual-pending/deferred branches"
+  ],
+  "targeted_tests": [
+    "pipeline_evaluate_github_includes_pr_review_feedback_in_report",
+    "pipeline_evaluate_github_can_post_review_summary_comment",
+    "pipeline_evaluate_github_no_checks_success_policy",
+    "pipeline_evaluate_github_uses_pr_url_when_ref_missing",
+    "pipeline_auto_next_no_checks_manual_pending_policy",
+    "pipeline_auto_next_deferred_without_token_in_manual_mode",
+    "pipeline_auto_next_rejects_execution_stage",
+    "pipeline_report_endpoint"
+  ]
+}

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
@@ -375,9 +376,194 @@ def _status_to_dict(c) -> dict:
     }
 
 
+def _resolve_spec(credential_id: str, specs: dict[str, Any]) -> tuple[str, Any] | None:
+    text = (credential_id or "").strip().lower()
+    if not text:
+        return None
+    if text in specs:
+        return text, specs[text]
+    for name, spec in specs.items():
+        if (spec.credential_id or name).strip().lower() == text:
+            return name, spec
+    return None
+
+
+def _default_credential_name(credential_id: str) -> str:
+    return credential_id.replace("_", " ").strip().title()
+
+
+async def handle_list_specs(request: web.Request) -> web.Response:
+    """GET /api/credentials/specs — list credential specs for UI."""
+    try:
+        from aden_tools.credentials import CREDENTIAL_SPECS
+        from framework.credentials.key_storage import load_aden_api_key
+        from framework.credentials.validation import ensure_credential_key_env
+
+        ensure_credential_key_env()
+        load_aden_api_key()
+    except Exception:
+        return web.json_response(
+            {"error": "Failed to load credential specs"},
+            status=500,
+        )
+
+    store = _get_store(request)
+    specs_payload: list[dict[str, Any]] = []
+    now_iso = datetime.now(UTC).isoformat()
+
+    for cred_name, spec in sorted(
+        CREDENTIAL_SPECS.items(),
+        key=lambda kv: (kv[1].credential_id or kv[0]).lower(),
+    ):
+        cred_id = spec.credential_id or cred_name
+        available = _credential_available(store, cred_name, spec)
+        accounts: list[dict[str, Any]] = []
+
+        # Local account projection: a stored credential or env var means this
+        # provider is connected even without Aden OAuth state.
+        if available:
+            accounts.append(
+                {
+                    "provider": _normalize_provider_name(spec.aden_provider_name, cred_id),
+                    "alias": "default",
+                    "identity": {"connected_at": now_iso},
+                    "source": "local",
+                    "credential_id": cred_id,
+                }
+            )
+
+        specs_payload.append(
+            {
+                "credential_name": _default_credential_name(cred_id),
+                "credential_id": cred_id,
+                "env_var": spec.env_var,
+                "description": spec.description or "",
+                "help_url": spec.help_url or "",
+                "api_key_instructions": spec.api_key_instructions or "",
+                "tools": list(spec.tools or []),
+                "aden_supported": bool(spec.aden_supported),
+                "direct_api_key_supported": bool(spec.direct_api_key_supported),
+                "credential_key": spec.credential_key or "access_token",
+                "credential_group": spec.credential_group or "",
+                "available": bool(available),
+                "accounts": accounts,
+            }
+        )
+
+    return web.json_response(
+        {
+            "specs": specs_payload,
+            "has_aden_key": bool(os.environ.get("ADEN_API_KEY")),
+        }
+    )
+
+
+async def handle_resync_credentials(request: web.Request) -> web.Response:
+    """POST /api/credentials/resync — best-effort sync of Aden-backed creds."""
+    try:
+        from aden_tools.credentials import CREDENTIAL_SPECS
+        from framework.credentials.aden.client import AdenClientConfig, AdenCredentialClient
+        from framework.credentials.key_storage import load_aden_api_key
+        from framework.credentials.validation import _presync_aden_tokens, ensure_credential_key_env
+
+        ensure_credential_key_env()
+        load_aden_api_key()
+    except Exception:
+        return web.json_response(
+            {"error": "Failed to initialize credential resync"},
+            status=500,
+        )
+
+    if not os.environ.get("ADEN_API_KEY"):
+        return web.json_response({"synced": False, "accounts_by_provider": {}})
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _presync_aden_tokens, CREDENTIAL_SPECS)
+    except Exception as exc:
+        logger.warning("Credential resync pre-sync failed: %s", exc)
+
+    accounts_by_provider: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    client = AdenCredentialClient(
+        AdenClientConfig(base_url=os.environ.get("ADEN_BASE_URL", "https://api.adenhq.com"))
+    )
+    try:
+        integrations = client.list_integrations()
+        for info in integrations:
+            provider_key = _normalize_provider_name(info.provider, info.provider)
+            base_account = {
+                "provider": provider_key,
+                "alias": info.alias or "default",
+                "identity": {
+                    "email": info.email or "",
+                    "status": info.status or "",
+                    "integration_id": info.integration_id or "",
+                },
+                "source": "aden",
+                "credential_id": provider_key,
+            }
+
+            # Keep provider-native key.
+            accounts_by_provider[provider_key].append(base_account)
+
+            # Also map by matching credential_id so frontend lookups by
+            # spec.credential_id resolve immediately.
+            for cred_name, spec in CREDENTIAL_SPECS.items():
+                cred_id = spec.credential_id or cred_name
+                spec_provider_key = _normalize_provider_name(spec.aden_provider_name, cred_id)
+                if spec_provider_key != provider_key:
+                    continue
+                mapped = dict(base_account)
+                mapped["credential_id"] = cred_id
+                accounts_by_provider[cred_id].append(mapped)
+    finally:
+        client.close()
+
+    return web.json_response(
+        {
+            "synced": True,
+            "accounts_by_provider": {k: v for k, v in sorted(accounts_by_provider.items())},
+        }
+    )
+
+
+async def handle_validate_key(request: web.Request) -> web.Response:
+    """POST /api/credentials/validate-key — lightweight API key validation."""
+    body = await request.json()
+    provider_id = str(body.get("provider_id") or "").strip()
+    api_key = str(body.get("api_key") or "").strip()
+    if not provider_id or not api_key:
+        return web.json_response({"error": "provider_id and api_key are required"}, status=400)
+
+    try:
+        from aden_tools.credentials import CREDENTIAL_SPECS, check_credential_health
+    except Exception:
+        return web.json_response({"valid": None, "message": "Credential checker unavailable"})
+
+    resolved = _resolve_spec(provider_id, CREDENTIAL_SPECS)
+    if resolved is None:
+        return web.json_response({"valid": None, "message": f"Unknown provider: {provider_id}"})
+
+    cred_name, spec = resolved
+    try:
+        result = check_credential_health(
+            cred_name,
+            api_key,
+            health_check_endpoint=spec.health_check_endpoint,
+            health_check_method=spec.health_check_method,
+        )
+        return web.json_response({"valid": bool(result.valid), "message": result.message})
+    except Exception as exc:
+        logger.warning("Credential key validation failed for provider=%s: %s", provider_id, exc)
+        return web.json_response({"valid": None, "message": f"Could not verify key: {exc}"})
+
+
 def register_routes(app: web.Application) -> None:
     """Register credential routes on the application."""
-    # check-agent must be registered BEFORE the {credential_id} wildcard
+    # Static routes must be registered BEFORE the {credential_id} wildcard.
+    app.router.add_get("/api/credentials/specs", handle_list_specs)
+    app.router.add_post("/api/credentials/resync", handle_resync_credentials)
+    app.router.add_post("/api/credentials/validate-key", handle_validate_key)
     app.router.add_post("/api/credentials/check-agent", handle_check_agent)
     app.router.add_get("/api/credentials/readiness", handle_credentials_readiness)
     app.router.add_get("/api/credentials", handle_list_credentials)

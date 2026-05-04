@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-26T13:11:44Z",
+  "wave": "Wave16-R10H",
+  "title": "Skills discovery bundled-collision precedence lane precheck",
+  "scope": [
+    "core/framework/skills/discovery.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/skills/discovery.py",
+      "add": 18,
+      "del": 0,
+      "total": 18
+    }
+  },
+  "delta_summary": [
+    "adds explicit expected-collision handling for framework↔preset skill name overlaps",
+    "treats bundled overrides as deterministic precedence with debug log instead of warning",
+    "reduces false-positive collision noise while preserving user/project collision warnings"
+  ],
+  "risk_signals": [
+    {
+      "type": "discovery-precedence",
+      "evidence": "collision resolver behavior changes for bundled scopes",
+      "impact": "skill selection order can drift if precedence assumptions are incorrect"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_skill_discovery.py -q",
+    "uv run --package framework pytest core/tests/test_skill_integration.py -q"
+  ],
+  "decision_gate": "keep_local acceptable if skill discovery/integration suites remain green with bundled override precedence"
+}

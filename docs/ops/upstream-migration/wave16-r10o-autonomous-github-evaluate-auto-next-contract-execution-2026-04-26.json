@@ -1,0 +1,37 @@
+{
+  "generated_at_utc": "2026-04-26T14:01:06Z",
+  "wave": "Wave16-R10O",
+  "title": "Autonomous GitHub evaluate + auto-next policy contract lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py",
+    "core/framework/server/project_execution.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "GitHub evaluation contract and auto-next policy modes remain stable under current execution-template defaults",
+      "no-checks/manual-pending policy behavior validated through endpoint-level tests",
+      "no runtime mutation required for this lane"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github or pipeline_auto_next' -q",
+        "result": "pass",
+        "summary": "9 passed, 184 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10O lane closed as keep-local with green GitHub evaluate + auto-next contract bundle",
+      "next lane targets run-until-terminal and execute-next endpoint continuity"
+    ]
+  }
+}

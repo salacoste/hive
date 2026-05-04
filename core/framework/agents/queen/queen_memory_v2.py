@@ -1,9 +1,15 @@
 """Queen global memory helpers.
 
-Global memory lives in ``~/.hive/queen/global_memory/`` and stores durable
-cross-session knowledge about the user (profile, preferences, environment,
-feedback).  Each memory is an individual ``.md`` file with optional YAML
-frontmatter (name, type, description).
+Memory hierarchy::
+
+    ~/.hive/memories/
+        global/              # shared across all queens and colonies
+        colonies/{name}/     # colony-scoped memories
+        agents/queens/{name}/ # queen-specific memories
+        agents/{name}/       # per-worker-agent memories
+
+Each memory is an individual ``.md`` file with optional YAML frontmatter
+(name, type, description).
 """
 
 from __future__ import annotations
@@ -13,6 +19,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from framework.config import MEMORIES_DIR
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -20,8 +28,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 GLOBAL_MEMORY_CATEGORIES: tuple[str, ...] = ("profile", "preference", "environment", "feedback")
-
-_HIVE_QUEEN_DIR = Path.home() / ".hive" / "queen"
 
 MAX_FILES: int = 200
 MAX_FILE_SIZE_BYTES: int = 4096  # 4 KB hard limit per memory file
@@ -31,20 +37,30 @@ _HEADER_LINE_LIMIT: int = 30
 
 
 def global_memory_dir() -> Path:
-    """Return the queen-global memory directory."""
-    return _HIVE_QUEEN_DIR / "global_memory"
+    """Return the global memory directory (shared across all queens/colonies)."""
+    return MEMORIES_DIR / "global"
 
 
-def colony_memory_dir(session_id: str) -> Path:
-    """Return per-session colony memory directory.
+def colony_memory_dir(colony_name: str) -> Path:
+    """Return the memory directory for a colony/session id.
 
-    This compatibility helper is imported by server orchestration code for
-    worker-reflection memory wiring.
+    Backward compatibility:
+    - Legacy callers/tests expect the `colony_memory` namespace.
+    - Session ids may contain spaces/slashes, so normalize to a safe slug.
     """
-    normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(session_id or "").strip()).strip("-")
-    if not normalized:
-        normalized = "default"
-    return _HIVE_QUEEN_DIR / "colony_memory" / normalized
+    normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(colony_name)).strip("-")
+    normalized = normalized or "default"
+    return MEMORIES_DIR / "colony_memory" / normalized
+
+
+def queen_memory_dir(queen_name: str = "default") -> Path:
+    """Return the memory directory for a named queen."""
+    return MEMORIES_DIR / "agents" / "queens" / queen_name
+
+
+def agent_memory_dir(agent_name: str) -> Path:
+    """Return the memory directory for a worker agent."""
+    return MEMORIES_DIR / "agents" / agent_name
 
 
 # ---------------------------------------------------------------------------
@@ -220,11 +236,12 @@ def format_memory_manifest(files: list[MemoryFile]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def init_memory_dir(memory_dir: Path | None = None, *, migrate_legacy: bool = False) -> None:
+def init_memory_dir(memory_dir: Path | None = None, migrate_legacy: bool = False) -> None:
     """Create the memory directory if missing.
 
-    ``migrate_legacy`` is kept for backward compatibility with existing callers.
-    The current v2 layout does not require migration, so this is a no-op flag.
+    `migrate_legacy` is accepted for backward compatibility with older callers.
+    The current implementation is a no-op flag.
     """
+    _ = migrate_legacy
     d = memory_dir or global_memory_dir()
     d.mkdir(parents=True, exist_ok=True)

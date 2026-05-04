@@ -7,6 +7,105 @@ import type {
   EntryPoint,
 } from "./types";
 
+const DEFAULT_EVENTS_HISTORY_LIMIT = 2000;
+const MAX_EVENTS_HISTORY_LIMIT = 10000;
+
+export type SessionEventsHistoryResponse = {
+  events: AgentEvent[];
+  session_id: string;
+  total: number;
+  returned: number;
+  truncated: boolean;
+  limit: number;
+};
+
+export type RevealSessionFolderResponse = {
+  path: string;
+  opened: boolean;
+  launcher?: string;
+  error?: string;
+  hint?: string;
+};
+
+export type SessionFileEntry = {
+  path: string;
+  type: "file" | "dir";
+  size: number | null;
+  modified: number;
+};
+
+export type SessionFilesListResponse = {
+  session_id: string;
+  root: string;
+  entries: SessionFileEntry[];
+  total: number;
+  returned: number;
+  truncated: boolean;
+  limit: number;
+};
+
+export type SessionFilePreviewResponse = {
+  session_id: string;
+  path: string;
+  size: number;
+  binary: boolean;
+  encoding: string | null;
+  content: string | null;
+  truncated: boolean;
+  preview_limit_bytes: number;
+};
+
+type SessionEventsHistoryRaw = Partial<SessionEventsHistoryResponse>;
+
+function _resolveHistoryLimit(limit?: number): number {
+  if (typeof limit !== "number" || !Number.isFinite(limit)) {
+    return DEFAULT_EVENTS_HISTORY_LIMIT;
+  }
+  const rounded = Math.trunc(limit);
+  return Math.max(1, Math.min(MAX_EVENTS_HISTORY_LIMIT, rounded));
+}
+
+export function normalizeSessionEventsHistoryResponse(
+  sessionId: string,
+  payload: SessionEventsHistoryRaw,
+  requestedLimit?: number,
+): SessionEventsHistoryResponse {
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  const fallbackLimit = _resolveHistoryLimit(requestedLimit);
+  const limit =
+    typeof payload.limit === "number" && Number.isFinite(payload.limit)
+      ? _resolveHistoryLimit(payload.limit)
+      : fallbackLimit;
+
+  const total =
+    typeof payload.total === "number" && Number.isFinite(payload.total)
+      ? Math.max(0, Math.trunc(payload.total))
+      : events.length;
+
+  const returnedRaw =
+    typeof payload.returned === "number" && Number.isFinite(payload.returned)
+      ? Math.max(0, Math.trunc(payload.returned))
+      : events.length;
+  const returned = Math.min(returnedRaw, events.length);
+
+  const truncated =
+    typeof payload.truncated === "boolean"
+      ? payload.truncated
+      : total > returned;
+
+  return {
+    events,
+    session_id:
+      typeof payload.session_id === "string" && payload.session_id.trim()
+        ? payload.session_id
+        : sessionId,
+    total,
+    returned,
+    truncated,
+    limit,
+  };
+}
+
 export const sessionsApi = {
   // --- Session lifecycle ---
 
@@ -84,6 +183,11 @@ export const sessionsApi = {
       `/sessions/${sessionId}/triggers/${triggerId}/deactivate`,
     ),
 
+  runTrigger: (sessionId: string, triggerId: string) =>
+    api.post<{ status: string; trigger_id: string }>(
+      `/sessions/${sessionId}/triggers/${triggerId}/run`,
+    ),
+
   colonies: (sessionId: string) =>
     api.get<{ colonies: string[] }>(`/sessions/${sessionId}/colonies`),
 
@@ -93,23 +197,32 @@ export const sessionsApi = {
    * clamps to [1, 10000]); older events get dropped and
    * ``truncated: true`` is set so the UI can show an indicator.
    */
-  eventsHistory: (sessionId: string, limit?: number) =>
-    api.get<{
-      events: AgentEvent[];
-      session_id: string;
-      total: number;
-      returned: number;
-      truncated: boolean;
-      limit: number;
-    }>(
+  eventsHistory: async (sessionId: string, limit?: number) => {
+    const payload = await api.get<SessionEventsHistoryRaw>(
       `/sessions/${sessionId}/events/history${
         limit ? `?limit=${limit}` : ""
       }`,
-    ),
+    );
+    return normalizeSessionEventsHistoryResponse(sessionId, payload, limit);
+  },
 
   /** Open the session's data folder in the OS file manager. */
   revealFolder: (sessionId: string) =>
-    api.post<{ path: string }>(`/sessions/${sessionId}/reveal`),
+    api.post<RevealSessionFolderResponse>(`/sessions/${sessionId}/reveal`),
+
+  /** List session files (for in-browser data explorer). */
+  files: (sessionId: string) =>
+    api.get<SessionFilesListResponse>(`/sessions/${sessionId}/files`),
+
+  /** Preview one file from session storage. */
+  previewFile: (sessionId: string, path: string) =>
+    api.get<SessionFilePreviewResponse>(
+      `/sessions/${sessionId}/files/preview?path=${encodeURIComponent(path)}`,
+    ),
+
+  /** Build a direct download URL for a single session file. */
+  fileDownloadUrl: (sessionId: string, path: string) =>
+    `/api/sessions/${encodeURIComponent(sessionId)}/files/download?path=${encodeURIComponent(path)}`,
 
   /** List all queen sessions on disk — live + cold (post-restart). */
   history: () =>

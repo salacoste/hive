@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T10:11:01Z",
+  "wave": "Wave16-R8C",
+  "title": "Routes logs runtime compatibility guard",
+  "scope": [
+    "core/framework/server/routes_logs.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "upstream variant keeps log_store assignment under the early-return block, which can leave log_store unresolved",
+      "local branch safely supports both colony_runtime and graph_runtime lookups",
+      "local branch also keeps backward-compatible graph-scoped node logs route used by current Web UI and tests"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; local runtime/log-route compatibility implementation retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"logs\" -q",
+        "result": "pass",
+        "summary": "8 passed, 185 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      },
+      {
+        "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+        "result": "pass",
+        "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R8C lane completed with explicit keep-local guard",
+      "next candidate lane: loader mcp_registry naming reconcile (hive-tools vs hive_tools)"
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "generated_at_utc": "2026-04-25T00:42:47Z",
+  "item": 290,
+  "lane": "ND-5F",
+  "title": "Agents discovery micro-lane probe",
+  "patch": "docs/ops/upstream-migration/wave15-nd5f-agents-discovery.patch",
+  "scope": [
+    "core/framework/agents/discovery.py"
+  ],
+  "probe": {
+    "command": "git apply --check docs/ops/upstream-migration/wave15-nd5f-agents-discovery.patch",
+    "exit_code": 0,
+    "status": "replay_ready"
+  }
+}

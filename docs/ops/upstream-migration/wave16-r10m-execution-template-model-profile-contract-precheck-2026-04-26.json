@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-26T13:49:47Z",
+  "wave": "Wave16-R10M",
+  "title": "Execution-template model-profile propagation lane precheck",
+  "scope": [
+    "core/framework/server/routes_projects.py",
+    "core/framework/server/routes_config.py",
+    "core/framework/server/tests/test_api.py",
+    "core/tests/test_session_manager_worker_handoff.py"
+  ],
+  "delta_summary": [
+    "R10L closed consumer contract checks for model-catalog/provider/routes-config baseline",
+    "next bounded step verifies model_profile and execution_template propagation from project API to worker/session runtime",
+    "lane remains non-destructive and contract-test driven"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'project_execution_template' -q",
+    "uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q"
+  ],
+  "decision_gate": "close lane only after execution_template/model_profile API and session-handoff contracts remain green with no propagation regressions"
+}

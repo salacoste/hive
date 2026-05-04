@@ -1,0 +1,19 @@
+{
+  "generated_at_utc": "2026-04-26T15:52:26Z",
+  "wave": "Wave16-R10W",
+  "title": "Autonomous backlog create/update contract continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py",
+    "core/framework/server/project_execution.py"
+  ],
+  "delta_summary": [
+    "R10V closed loop-control input-validation contract checks",
+    "next bounded step verifies backlog create/update contract continuity (CI-first defaults, mode override, repo/ref inheritance)",
+    "lane remains non-destructive and API-contract focused"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'backlog_create_ci_first_contract_with_service_matrix or backlog_create_defaults_to_ci_first_when_docker_lane_disabled or backlog_update_validation_contract_and_mode_override or backlog_create_defaults_repo_and_branch_from_project' -q"
+  ],
+  "decision_gate": "close lane only after autonomous backlog create/update contract tests remain green with current execution-template defaults"
+}

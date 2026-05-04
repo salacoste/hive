@@ -1,0 +1,18 @@
+{
+  "generated_at_utc": "2026-04-26T14:06:04Z",
+  "wave": "Wave16-R10Q",
+  "title": "Autonomous loop run-cycle + tick-all contract lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "delta_summary": [
+    "R10P closed run-until-terminal and execute-next endpoint continuity checks",
+    "next bounded step validates loop control surface contracts (`tick_all`, `run_cycle`) including report/summary behavior",
+    "lane is non-destructive and endpoint-contract focused"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle or pipeline_loop_tick_all' -q"
+  ],
+  "decision_gate": "close lane only after loop run-cycle/tick-all endpoint contracts remain green under current autonomous pipeline defaults"
+}

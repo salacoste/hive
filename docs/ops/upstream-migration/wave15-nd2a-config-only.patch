@@ -1,0 +1,373 @@
+diff --git a/examples/templates/competitive_intel_agent/mcp_servers.json b/examples/templates/competitive_intel_agent/mcp_servers.json
+index 66c1fd54..1add5870 100644
+--- a/examples/templates/competitive_intel_agent/mcp_servers.json
++++ b/examples/templates/competitive_intel_agent/mcp_servers.json
+@@ -1,24 +1,14 @@
+ {
+-  "hive-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "mcp_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
+-  },
+-  "gcu-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
+-  }
++    "hive_tools": {
++        "transport": "stdio",
++        "command": "uv",
++        "args": [
++            "run",
++            "python",
++            "mcp_server.py",
++            "--stdio"
++        ],
++        "cwd": "../../../tools",
++        "description": "hive_tools MCP server providing web_search, web_scrape, github tools, and file utilities"
++    }
+ }
+diff --git a/examples/templates/deep_research_agent/mcp_servers.json b/examples/templates/deep_research_agent/mcp_servers.json
+index 66c1fd54..964faa0f 100644
+--- a/examples/templates/deep_research_agent/mcp_servers.json
++++ b/examples/templates/deep_research_agent/mcp_servers.json
+@@ -1,24 +1,14 @@
+ {
+-  "hive-tools": {
++  "hive_tools": {
+     "transport": "stdio",
+     "command": "uv",
+-    "args": ["run", "python", "mcp_server.py", "--stdio"],
++    "args": [
++      "run",
++      "python",
++      "mcp_server.py",
++      "--stdio"
++    ],
+     "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
+-  },
+-  "gcu-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
++    "description": "hive_tools MCP server providing web_search, web_scrape, and write_to_file"
+   }
+ }
+diff --git a/examples/templates/email_inbox_management/mcp_servers.json b/examples/templates/email_inbox_management/mcp_servers.json
+index 66c1fd54..10beb9cb 100644
+--- a/examples/templates/email_inbox_management/mcp_servers.json
++++ b/examples/templates/email_inbox_management/mcp_servers.json
+@@ -1,24 +1,9 @@
+ {
+-  "hive-tools": {
++  "hive_tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "mcp_server.py", "--stdio"],
+     "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
+-  },
+-  "gcu-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
++    "description": "hive_tools MCP server"
+   }
+ }
+diff --git a/examples/templates/email_reply_agent/mcp_servers.json b/examples/templates/email_reply_agent/mcp_servers.json
+index 66c1fd54..10beb9cb 100644
+--- a/examples/templates/email_reply_agent/mcp_servers.json
++++ b/examples/templates/email_reply_agent/mcp_servers.json
+@@ -1,24 +1,9 @@
+ {
+-  "hive-tools": {
++  "hive_tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "mcp_server.py", "--stdio"],
+     "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
+-  },
+-  "gcu-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
++    "description": "hive_tools MCP server"
+   }
+ }
+diff --git a/examples/templates/job_hunter/mcp_servers.json b/examples/templates/job_hunter/mcp_servers.json
+index 66c1fd54..10beb9cb 100644
+--- a/examples/templates/job_hunter/mcp_servers.json
++++ b/examples/templates/job_hunter/mcp_servers.json
+@@ -1,24 +1,9 @@
+ {
+-  "hive-tools": {
++  "hive_tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "mcp_server.py", "--stdio"],
+     "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
+-  },
+-  "gcu-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
++    "description": "hive_tools MCP server"
+   }
+ }
+diff --git a/examples/templates/local_business_extractor/mcp_servers.json b/examples/templates/local_business_extractor/mcp_servers.json
+index 6ab18b6f..d925bb35 100644
+--- a/examples/templates/local_business_extractor/mcp_servers.json
++++ b/examples/templates/local_business_extractor/mcp_servers.json
+@@ -3,22 +3,12 @@
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "mcp_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
++    "cwd": "../../../tools"
+   },
+   "gcu-tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
++    "cwd": "../../../tools"
+   }
+ }
+diff --git a/examples/templates/meeting_scheduler/mcp_servers.json b/examples/templates/meeting_scheduler/mcp_servers.json
+index 66c1fd54..10beb9cb 100644
+--- a/examples/templates/meeting_scheduler/mcp_servers.json
++++ b/examples/templates/meeting_scheduler/mcp_servers.json
+@@ -1,24 +1,9 @@
+ {
+-  "hive-tools": {
++  "hive_tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "mcp_server.py", "--stdio"],
+     "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
+-  },
+-  "gcu-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
++    "description": "hive_tools MCP server"
+   }
+ }
+diff --git a/examples/templates/sdr_agent/mcp_servers.json b/examples/templates/sdr_agent/mcp_servers.json
+index 66c1fd54..cb917898 100644
+--- a/examples/templates/sdr_agent/mcp_servers.json
++++ b/examples/templates/sdr_agent/mcp_servers.json
+@@ -1,24 +1,14 @@
+ {
+-  "hive-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "mcp_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
+-  },
+-  "gcu-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
+-  }
++    "hive_tools": {
++        "transport": "stdio",
++        "command": "uv",
++        "args": [
++            "run",
++            "python",
++            "mcp_server.py",
++            "--stdio"
++        ],
++        "cwd": "../../../tools",
++        "description": "hive_tools MCP server"
++    }
+ }
+diff --git a/examples/templates/tech_news_reporter/mcp_servers.json b/examples/templates/tech_news_reporter/mcp_servers.json
+index 66c1fd54..867d11bf 100644
+--- a/examples/templates/tech_news_reporter/mcp_servers.json
++++ b/examples/templates/tech_news_reporter/mcp_servers.json
+@@ -1,24 +1,9 @@
+ {
+-  "hive-tools": {
++  "hive_tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "mcp_server.py", "--stdio"],
+     "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
+-  },
+-  "gcu-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
++    "description": "hive_tools MCP server providing web_search, web_scrape, save_data, and serve_file_to_user"
+   }
+ }
+diff --git a/examples/templates/twitter_news_agent/mcp_servers.json b/examples/templates/twitter_news_agent/mcp_servers.json
+index 66c1fd54..139c1223 100644
+--- a/examples/templates/twitter_news_agent/mcp_servers.json
++++ b/examples/templates/twitter_news_agent/mcp_servers.json
+@@ -1,24 +1,16 @@
+ {
+-  "hive-tools": {
++  "hive_tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "mcp_server.py", "--stdio"],
+     "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
++    "description": "hive_tools MCP server"
+   },
+   "gcu-tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+     "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
++    "description": "GCU tools for browser automation"
+   }
+ }
+diff --git a/examples/templates/vulnerability_assessment/mcp_registry.json b/examples/templates/vulnerability_assessment/mcp_registry.json
+index 1a5d5151..493a86cd 100644
+--- a/examples/templates/vulnerability_assessment/mcp_registry.json
++++ b/examples/templates/vulnerability_assessment/mcp_registry.json
+@@ -1 +1 @@
+-{ "include": ["hive-tools", "gcu-tools", "files-tools"] }
++{ "include": ["hive_tools"] }
+diff --git a/examples/templates/vulnerability_assessment/mcp_servers.json b/examples/templates/vulnerability_assessment/mcp_servers.json
+index 66c1fd54..10beb9cb 100644
+--- a/examples/templates/vulnerability_assessment/mcp_servers.json
++++ b/examples/templates/vulnerability_assessment/mcp_servers.json
+@@ -1,24 +1,9 @@
+ {
+-  "hive-tools": {
++  "hive_tools": {
+     "transport": "stdio",
+     "command": "uv",
+     "args": ["run", "python", "mcp_server.py", "--stdio"],
+     "cwd": "../../../tools",
+-    "description": "Primary integration server: web, GitHub, Telegram, Google, data stores"
+-  },
+-  "gcu-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "-m", "gcu.server", "--stdio"],
+-    "cwd": "../../../tools",
+-    "description": "Browser automation tools"
+-  },
+-  "files-tools": {
+-    "transport": "stdio",
+-    "command": "uv",
+-    "args": ["run", "python", "files_server.py", "--stdio"],
+-    "cwd": "../../../tools",
+-    "tools": ["write_file", "edit_file", "list_directory", "run_command"],
+-    "description": "Focused file operations server"
++    "description": "hive_tools MCP server"
+   }
+ }

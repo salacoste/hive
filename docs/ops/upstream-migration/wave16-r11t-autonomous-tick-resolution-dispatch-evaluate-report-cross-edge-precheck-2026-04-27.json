@@ -1,0 +1,23 @@
+{
+  "generated_at_utc": "2026-04-27T01:11:53Z",
+  "wave": "Wave16-R11T",
+  "title": "Autonomous tick-resolution/dispatch + evaluate/report cross-edge lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify tick-resolution completion/failure edges remain consistent with dispatch/evaluate/report transitions",
+    "verify report/read-model continuity across tick-derived completion paths and evaluate-driven updates"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_tick_resolves_execution_completed_from_event_log",
+    "pipeline_loop_tick_resolves_execution_failed_from_event_log",
+    "pipeline_loop_tick_dispatches_next_when_idle",
+    "pipeline_dispatch_next_rejects_when_active_run_exists",
+    "pipeline_evaluate_endpoint_uses_checks_and_updates_report",
+    "pipeline_evaluate_github_endpoint",
+    "pipeline_auto_next_endpoint",
+    "pipeline_report_endpoint"
+  ]
+}

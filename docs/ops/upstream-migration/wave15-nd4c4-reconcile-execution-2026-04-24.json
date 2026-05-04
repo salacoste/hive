@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-24T18:02:00Z",
+  "lane": "ND-4C4",
+  "title": "Reconcile blocked queen/llm files execution",
+  "scope": [
+    "core/framework/agents/queen/nodes/__init__.py",
+    "core/framework/llm/litellm.py"
+  ],
+  "actions": [
+    {
+      "path": "core/framework/agents/queen/nodes/__init__.py",
+      "resolution": "upstream direct sync",
+      "aligned_to_upstream": true
+    },
+    {
+      "path": "core/framework/llm/litellm.py",
+      "resolution": "manual reconcile with intentional local divergence",
+      "details": [
+        "kept local proxy/runtime queue/failover guardrails as authoritative",
+        "reviewed upstream delta and preserved local compatibility contracts",
+        "removed duplicated json_object hint branch in async completion path"
+      ]
+    }
+  ],
+  "validation": {
+    "targeted_tests": {
+      "command": "uv run pytest core/tests/test_litellm_provider.py core/tests/test_litellm_streaming.py core/tests/test_queen_nodes_prompt.py core/tests/test_queen_memory.py core/tests/test_trigger_fires_into_queen.py -q",
+      "result": "145 passed, 9 skipped"
+    },
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  },
+  "deferred_destructive": [
+    "core/framework/llm/fallback.py"
+  ]
+}

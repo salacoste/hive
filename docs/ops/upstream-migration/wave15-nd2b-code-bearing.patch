@@ -1,0 +1,242 @@
+diff --git a/examples/templates/deep_research_agent/agent.py b/examples/templates/deep_research_agent/agent.py
+index 3f47d3ae..3ab32230 100644
+--- a/examples/templates/deep_research_agent/agent.py
++++ b/examples/templates/deep_research_agent/agent.py
+@@ -95,73 +95,23 @@
+         source="intake",
+         target="research",
+         condition=EdgeCondition.ON_SUCCESS,
+-        input_mapping={
+-            "research_brief": "research_brief",
+-            "source": "source",
+-            "autonomous_mode": "autonomous_mode",
+-            "task": "task",
+-            "topic": "topic",
+-            "user_request": "user_request",
+-            "contract": "contract",
+-        },
+         priority=1,
+     ),
+-    # research -> review (interactive mode)
++    # research -> review
+     EdgeSpec(
+         id="research-to-review",
+         source="research",
+         target="review",
+-        condition=EdgeCondition.CONDITIONAL,
+-        condition_expr=(
+-            "not ("
+-            "(\"autonomous_mode\" in buffer and str(buffer[\"autonomous_mode\"]).lower() == \"true\") "
+-            "or (\"source\" in buffer and str(buffer[\"source\"]).lower() == \"autonomous_pipeline\")"
+-            ")"
+-        ),
+-        input_mapping={
+-            "findings": "findings",
+-            "sources": "sources",
+-            "gaps": "gaps",
+-            "research_brief": "research_brief",
+-            "source": "source",
+-            "autonomous_mode": "autonomous_mode",
+-        },
++        condition=EdgeCondition.ON_SUCCESS,
+         priority=1,
+     ),
+-    # research -> report (autonomous mode shortcut)
+-    EdgeSpec(
+-        id="research-to-report-autonomous",
+-        source="research",
+-        target="report",
+-        condition=EdgeCondition.CONDITIONAL,
+-        condition_expr=(
+-            "("
+-            "(\"autonomous_mode\" in buffer and str(buffer[\"autonomous_mode\"]).lower() == \"true\") "
+-            "or (\"source\" in buffer and str(buffer[\"source\"]).lower() == \"autonomous_pipeline\")"
+-            ")"
+-        ),
+-        input_mapping={
+-            "findings": "findings",
+-            "sources": "sources",
+-            "research_brief": "research_brief",
+-            "source": "source",
+-            "autonomous_mode": "autonomous_mode",
+-        },
+-        priority=2,
+-    ),
+     # review -> research (feedback loop)
+     EdgeSpec(
+         id="review-to-research-feedback",
+         source="review",
+         target="research",
+         condition=EdgeCondition.CONDITIONAL,
+-        condition_expr="str(needs_more_research).lower() == 'true'",
+-        input_mapping={
+-            "feedback": "feedback",
+-            "research_brief": "research_brief",
+-            "source": "source",
+-            "autonomous_mode": "autonomous_mode",
+-        },
++        condition_expr="needs_more_research == True",
+         priority=1,
+     ),
+     # review -> report (user satisfied)
+@@ -170,23 +120,34 @@
+         source="review",
+         target="report",
+         condition=EdgeCondition.CONDITIONAL,
+-        condition_expr="str(needs_more_research).lower() != 'true'",
+-        input_mapping={
+-            "findings": "findings",
+-            "sources": "sources",
+-            "research_brief": "research_brief",
+-            "source": "source",
+-            "autonomous_mode": "autonomous_mode",
+-        },
++        condition_expr="needs_more_research == False",
+         priority=2,
+     ),
++    # report -> research (user wants deeper research on current topic)
++    EdgeSpec(
++        id="report-to-research",
++        source="report",
++        target="research",
++        condition=EdgeCondition.CONDITIONAL,
++        condition_expr="str(next_action).lower() == 'more_research'",
++        priority=2,
++    ),
++    # report -> intake (user wants a new topic — default when not more_research)
++    EdgeSpec(
++        id="report-to-intake",
++        source="report",
++        target="intake",
++        condition=EdgeCondition.CONDITIONAL,
++        condition_expr="str(next_action).lower() != 'more_research'",
++        priority=1,
++    ),
+ ]
+ 
+ # Graph configuration
+ entry_node = "intake"
+ entry_points = {"start": "intake"}
+ pause_nodes = []
+-terminal_nodes = ["report"]
++terminal_nodes = []
+ 
+ 
+ class DeepResearchAgent:
+diff --git a/examples/templates/deep_research_agent/nodes/__init__.py b/examples/templates/deep_research_agent/nodes/__init__.py
+index 0c77a7d9..00a7bbb5 100644
+--- a/examples/templates/deep_research_agent/nodes/__init__.py
++++ b/examples/templates/deep_research_agent/nodes/__init__.py
+@@ -11,7 +11,7 @@
+     node_type="event_loop",
+     client_facing=True,
+     max_node_visits=0,
+-    input_keys=["task", "topic", "user_request", "contract", "source", "autonomous_mode"],
++    input_keys=["user_request"],
+     output_keys=["research_brief"],
+     success_criteria=(
+         "The research brief is specific and actionable: it states the topic, "
+@@ -26,11 +26,6 @@
+ - The research happens in the NEXT stage after you complete intake
+ - Do NOT ask for or expect web_search or web_scrape tools
+ 
+-If autonomous_mode is true OR source == "autonomous_pipeline":
+-- Do not ask clarifying questions.
+-- Build a concise research brief directly from task/topic/user_request.
+-- Immediately call set_output("research_brief", "...") and finish this node.
+-
+ **STEP 1 — Read and respond (text only, NO tool calls):**
+ 1. Read the user_request provided
+ 2. If it's vague, ask 1-2 clarifying questions (scope, angle, depth, budget, preferences)
+@@ -55,7 +50,7 @@
+     description="Search the web, fetch source content, and compile findings",
+     node_type="event_loop",
+     max_node_visits=0,
+-    input_keys=["research_brief", "feedback", "source", "autonomous_mode", "task", "topic", "user_request"],
++    input_keys=["research_brief", "feedback"],
+     output_keys=["findings", "sources", "gaps"],
+     nullable_output_keys=["feedback"],
+     success_criteria=(
+@@ -67,10 +62,6 @@
+ 
+ If feedback is provided, this is a follow-up round — focus on the gaps identified.
+ 
+-If autonomous_mode is true OR source == "autonomous_pipeline":
+-- Keep the run bounded and deterministic: target 3-5 strong sources, then finalize outputs.
+-- Do not wait for extra user interaction in this node.
+-
+ Work in phases:
+ 1. **Search**: Use web_search with 3-5 diverse queries covering different angles.
+    Prioritize authoritative sources (.edu, .gov, established publications).
+@@ -93,7 +84,6 @@
+ references remain in the conversation — use load_data() to recover any content you need.
+ - Use append_data('research_notes.md', ...) to maintain a running log of key findings \
+ as you go. This survives compaction and helps the report node produce a detailed report.
+-- Never pass data_dir="." or data_dir="/app". Omit data_dir and let runtime inject it.
+ 
+ When done, use set_output (one key at a time, separate turns):
+ - set_output("findings", "Structured summary: key findings with source URLs for each claim. \
+@@ -120,7 +110,7 @@
+     node_type="event_loop",
+     client_facing=True,
+     max_node_visits=0,
+-    input_keys=["findings", "sources", "gaps", "research_brief", "source", "autonomous_mode"],
++    input_keys=["findings", "sources", "gaps", "research_brief"],
+     output_keys=["needs_more_research", "feedback"],
+     success_criteria=(
+         "The user has been presented with findings and has explicitly indicated "
+@@ -129,13 +119,6 @@
+     system_prompt="""\
+ Present the research findings to the user clearly and concisely.
+ 
+-If autonomous_mode is true OR source == "autonomous_pipeline":
+-- Skip user Q&A.
+-- Set outputs immediately:
+-  - set_output("needs_more_research", "false")
+-  - set_output("feedback", "")
+-- Finish this node.
+-
+ **STEP 1 — Present (your first message, text only, NO tool calls):**
+ 1. **Summary** (2-3 sentences of what was found)
+ 2. **Key Findings** (bulleted, with confidence levels)
+@@ -162,7 +145,7 @@
+     node_type="event_loop",
+     client_facing=True,
+     max_node_visits=0,
+-    input_keys=["findings", "sources", "research_brief", "source", "autonomous_mode"],
++    input_keys=["findings", "sources", "research_brief"],
+     output_keys=["delivery_status", "next_action"],
+     success_criteria=(
+         "An HTML report has been saved, the file link has been presented to the user, "
+@@ -273,12 +256,6 @@
+   - set_output("next_action", "new_topic")       — if they want a new topic
+   - set_output("next_action", "more_research")   — if they want deeper research
+ 
+-Autonomous mode override:
+-- If autonomous_mode is true OR source == "autonomous_pipeline", do not wait for user follow-up.
+-- After serving the file, set:
+-  - set_output("delivery_status", "completed")
+-  - set_output("next_action", "new_topic")
+-
+ **IMPORTANT:**
+ - Every factual claim MUST cite its source with [n] notation
+ - Answer the original research questions from the brief
+diff --git a/examples/templates/meeting_scheduler/nodes/__init__.py b/examples/templates/meeting_scheduler/nodes/__init__.py
+index 81394f69..b73a525d 100644
+--- a/examples/templates/meeting_scheduler/nodes/__init__.py
++++ b/examples/templates/meeting_scheduler/nodes/__init__.py
+@@ -22,7 +22,13 @@
+ You are a meeting scheduler assistant.
+ 
+ **STEP 1 — Use ask_user to collect meeting details:**
+-1. Call ask_user to ask for: attendee email, meeting duration (minutes), and meeting title
++1. Call ask_user with a batch of three questions in one call — one
++   entry each for attendee email, meeting duration (minutes), and
++   meeting title. Example: ask_user({"questions": [
++     {"id": "email", "prompt": "Attendee email?"},
++     {"id": "duration", "prompt": "Meeting duration (minutes)?"},
++     {"id": "title", "prompt": "Meeting title?"}
++   ]})
+ 2. Wait for the user's response before proceeding
+ 
+ **STEP 2 — After user provides all details, call set_output:**

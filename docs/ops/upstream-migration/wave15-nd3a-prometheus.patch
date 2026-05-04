@@ -1,0 +1,835 @@
+diff --git a/tools/src/aden_tools/credentials/health_check.py b/tools/src/aden_tools/credentials/health_check.py
+index 4f7b883908cec424ef0fdaf9763b32578e5a3586..f0597c67b3d93e54bc0b49fd839690fe5aa62efd 100644
+--- a/tools/src/aden_tools/credentials/health_check.py
++++ b/tools/src/aden_tools/credentials/health_check.py
+@@ -1045,6 +1045,47 @@ def check(self, api_key: str) -> HealthCheckResult:
+             )
+ 
+ 
++class PrometheusHealthChecker:
++    """Health checker for Prometheus (no authentication)."""
++
++    TIMEOUT = 5.0
++
++    def check(self, base_url: str) -> HealthCheckResult:
++        """
++        Validate Prometheus by hitting /-/ready endpoint.
++        """
++        url = base_url.rstrip("/") + "/-/ready"
++
++        try:
++            with httpx.Client(timeout=self.TIMEOUT) as client:
++                response = client.get(url)
++
++                if response.status_code == 200:
++                    return HealthCheckResult(
++                        valid=True,
++                        message="Prometheus is healthy",
++                    )
++                else:
++                    return HealthCheckResult(
++                        valid=False,
++                        message=f"Prometheus returned status {response.status_code}",
++                        details={"status_code": response.status_code},
++                    )
++
++        except httpx.TimeoutException:
++            return HealthCheckResult(
++                valid=False,
++                message="Prometheus health check timed out",
++                details={"error": "timeout"},
++            )
++        except httpx.RequestError as e:
++            return HealthCheckResult(
++                valid=False,
++                message=f"Failed to connect to Prometheus: {e}",
++                details={"error": str(e)},
++            )
++
++
+ # --- New checkers using BaseHttpHealthChecker ---
+ 
+ 
+@@ -1342,6 +1383,7 @@ class CloudflareHealthChecker(BaseHttpHealthChecker):
+     "notion_token": NotionHealthChecker(),
+     "pinecone": PineconeHealthChecker(),
+     "pipedrive": PipedriveHealthChecker(),
++    "prometheus": PrometheusHealthChecker(),
+     "resend": ResendHealthChecker(),
+     "serpapi": SerpApiHealthChecker(),
+     "slack": SlackHealthChecker(),
+diff --git a/tools/src/aden_tools/credentials/prometheus.py b/tools/src/aden_tools/credentials/prometheus.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b44f5af683a70efaf6ab5d1a0092cc41461c609
+--- /dev/null
++++ b/tools/src/aden_tools/credentials/prometheus.py
+@@ -0,0 +1,41 @@
++from __future__ import annotations
++
++from .base import CredentialSpec
++
++PROMETHEUS_CREDENTIALS = {
++    "prometheus": CredentialSpec(
++        env_var="PROMETHEUS_BASE_URL",
++        tools=[
++            "prometheus_query",
++            "prometheus_query_range",
++        ],
++        required=True,
++        startup_required=False,
++        help_url="https://prometheus.io/docs/prometheus/latest/querying/api/",
++        description="Base URL of Prometheus server",
++        aden_supported=False,
++        direct_api_key_supported=False,
++        api_key_instructions="""To configure Prometheus access:
++
++1. Set your Prometheus base URL:
++   export PROMETHEUS_BASE_URL=http://localhost:9090
++
++Optional authentication:
++
++2. For Bearer Token:
++   export PROMETHEUS_TOKEN=your-token
++
++3. For Basic Auth:
++   export PROMETHEUS_USERNAME=admin
++   export PROMETHEUS_PASSWORD=secret
++
++Notes:
++- PROMETHEUS_BASE_URL is required
++- Authentication is optional (most local setups don’t need it)
++""",
++        health_check_endpoint="/-/ready",
++        health_check_method="GET",
++        credential_id="prometheus",
++        credential_key="base_url",
++    ),
++}
+diff --git a/tools/src/aden_tools/tools/__init__.py b/tools/src/aden_tools/tools/__init__.py
+index a89c5601bd139335f68a8ca4bb933117d320ea84..403a395a674e3fc78d5c8b0e653a643811617644 100644
+--- a/tools/src/aden_tools/tools/__init__.py
++++ b/tools/src/aden_tools/tools/__init__.py
+@@ -16,7 +16,6 @@
+ 
+ from __future__ import annotations
+ 
+-import asyncio
+ from typing import TYPE_CHECKING
+ 
+ from fastmcp import FastMCP
+@@ -106,6 +105,7 @@
+ from .port_scanner import register_tools as register_port_scanner
+ from .postgres_tool import register_tools as register_postgres
+ from .powerbi_tool import register_tools as register_powerbi
++from .prometheus_tool import register_tools as register_prometheus
+ from .pushover_tool import register_tools as register_pushover
+ from .quickbooks_tool import register_tools as register_quickbooks
+ from .razorpay_tool import register_tools as register_razorpay
+@@ -150,26 +150,11 @@
+ from .zoho_crm_tool import register_tools as register_zoho_crm
+ from .zoom_tool import register_tools as register_zoom
+ 
+-
+-def _list_registered_tool_names(mcp: FastMCP) -> list[str]:
+-    """Return tool names across FastMCP versions (v2/v3 compatibility)."""
+-    # FastMCP v2
+-    manager = getattr(mcp, "_tool_manager", None)
+-    if manager is not None and hasattr(manager, "_tools"):
+-        return list(manager._tools.keys())
+-
+-    # FastMCP v3 (async API)
+-    list_tools = getattr(mcp, "list_tools", None)
+-    if callable(list_tools):
+-        tools = asyncio.run(list_tools())
+-        names: list[str] = []
+-        for t in tools or []:
+-            name = getattr(t, "name", None)
+-            if name:
+-                names.append(str(name))
+-        return names
+-
+-    return []
++# Tool names registered by `_register_verified()`. Populated on first call.
++# Consumed by the `__aden_verified_manifest` sentinel tool so downstream
++# registries (e.g. the queen's MCP loader) can gate free/credential-less tools
++# on whether they have been promoted to verified status.
++_VERIFIED_TOOL_NAMES: set[str] = set()
+ 
+ 
+ def _register_verified(
+@@ -177,6 +162,7 @@ def _register_verified(
+     credentials: CredentialStoreAdapter | None = None,
+ ) -> None:
+     """Register verified (stable) tools."""
++    _verified_before = set(mcp._tool_manager._tools.keys())
+     # --- No credentials ---
+     register_example(mcp)
+     if register_web_scrape:
+@@ -254,6 +240,22 @@ def _register_verified(
+     register_notion(mcp, credentials=credentials)
+     register_account_info(mcp, credentials=credentials)
+ 
++    _VERIFIED_TOOL_NAMES.update(set(mcp._tool_manager._tools.keys()) - _verified_before)
++
++
++def _register_manifest(mcp: FastMCP) -> None:
++    """Expose the verified-tool manifest as a sentinel MCP tool.
++
++    Registered after both verified and unverified passes so the manifest tool
++    itself never appears in `_VERIFIED_TOOL_NAMES`. Downstream registries call
++    this to decide whether a credential-less tool is safe to admit.
++    """
++
++    @mcp.tool(name="__aden_verified_manifest")
++    def aden_verified_manifest() -> list[str]:
++        """Return tool names registered by `_register_verified()`."""
++        return sorted(_VERIFIED_TOOL_NAMES)
++
+ 
+ def _register_unverified(
+     mcp: FastMCP,
+@@ -309,6 +311,7 @@ def _register_unverified(
+     register_pipedrive(mcp, credentials=credentials)
+     register_plaid(mcp, credentials=credentials)
+     register_powerbi(mcp, credentials=credentials)
++    register_prometheus(mcp, credentials=credentials)
+     register_pushover(mcp, credentials=credentials)
+     register_quickbooks(mcp, credentials=credentials)
+     register_reddit(mcp, credentials=credentials)
+@@ -356,7 +359,9 @@ def register_all_tools(
+     if include_unverified:
+         _register_unverified(mcp, credentials=credentials)
+ 
+-    return _list_registered_tool_names(mcp)
++    _register_manifest(mcp)
++
++    return list(mcp._tool_manager._tools.keys())
+ 
+ 
+ __all__ = ["register_all_tools"]
+diff --git a/tools/src/aden_tools/tools/prometheus_tool/README.md b/tools/src/aden_tools/tools/prometheus_tool/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c9ea15be56063145340b3458228f491a7bc6478
+--- /dev/null
++++ b/tools/src/aden_tools/tools/prometheus_tool/README.md
+@@ -0,0 +1,158 @@
++# Prometheus Metrics Query Tool
++
++Provides PromQL-based querying tools for agents to fetch real-time and historical metrics from a Prometheus server.
++
++## Authentication
++
++Authentication is **optional** as most prometheus servers are deployed within private infrastructure. If no credentials are set, requests are sent without auth headers (suitable for open/internal Prometheus instances).
++
++When credentials are present, **Bearer token takes priority** over Basic Auth:
++
++| Priority | Mode         | Environment Variables                         |
++| -------- | ------------ | --------------------------------------------- |
++| 1        | Bearer Token | `PROMETHEUS_TOKEN`                            |
++| 2        | Basic Auth   | `PROMETHEUS_USERNAME` + `PROMETHEUS_PASSWORD` |
++| 3        | None         | _(no variables set)_                          |
++
++### Setup
++
++```bash
++# Required
++export PROMETHEUS_BASE_URL="http://your-prometheus-host:9090"
++
++# Optional — Bearer token (takes priority if set)
++export PROMETHEUS_TOKEN="your_token_here"
++
++# Optional — Basic auth
++export PROMETHEUS_USERNAME="admin"
++export PROMETHEUS_PASSWORD="secret"
++```
++
++> \_Note: Base URL can also be configured via the Aden Credential Store under the `prometheus` key.
++
++---
++
++## Tools
++
++| Tool                     | Description                                               |
++| ------------------------ | --------------------------------------------------------- |
++| `prometheus_query`       | Run an instant PromQL query — returns current value(s)    |
++| `prometheus_query_range` | Run a PromQL query over a time range with step resolution |
++
++---
++
++## Tool Reference
++
++### `prometheus_query`
++
++Executes a PromQL expression against `/api/v1/query`. Returns the latest value for matching time series.
++
++**Parameters:**
++
++| Name      | Type | Required | Default | Description                                                       |
++| --------- | ---- | -------- | ------- | ----------------------------------------------------------------- |
++| `query`   | str  | ✅       | —       | PromQL expression (max 1000 chars)                                |
++| `timeout` | int  | ❌       | `5`     | Request timeout in seconds (1–30; out-of-range values reset to 5) |
++
++**Returns:**
++
++```json
++{
++  "success": true,
++  "query": "up",
++  "result": [
++    {
++      "metric": {
++        "__name__": "up",
++        "job": "prometheus",
++        "instance": "localhost:9090"
++      },
++      "value": [1700000000.0, "1"]
++    }
++  ],
++  "raw": {
++    "status": "success",
++    "data": {
++      "resultType": "vector",
++      "result": [
++        {
++          "metric": {
++            "__name__": "up",
++            "job": "prometheus",
++            "instance": "localhost:9090"
++          },
++          "value": [1700000000.0, "1"]
++        }
++      ]
++    }
++  }
++}
++```
++
++---
++
++### `prometheus_query_range`
++
++Executes a PromQL expression against `/api/v1/query_range`. Returns a matrix of values over time — useful for graphing, trends, and historical analysis.
++
++**Parameters:**
++
++| Name      | Type | Required | Default | Description                              |
++| --------- | ---- | -------- | ------- | ---------------------------------------- |
++| `query`   | str  | ✅       | —       | PromQL expression (max 1000 chars)       |
++| `start`   | str  | ✅       | —       | Start time — Unix timestamp or RFC3339   |
++| `end`     | str  | ✅       | —       | End time — Unix timestamp or RFC3339     |
++| `step`    | str  | ❌       | `"60s"` | Resolution step (e.g. `15s`, `5m`, `1h`) |
++| `timeout` | int  | ❌       | `5`     | Request timeout in seconds (1–30)        |
++
++**Returns:**
++
++```json
++{
++  "success": true,
++  "query": "rate(http_requests_total[5m])",
++  "start": "2024-01-01T00:00:00Z",
++  "end": "2024-01-01T01:00:00Z",
++  "step": "60s",
++  "result": [
++    {
++      "metric": { "job": "api-server" },
++      "values": [
++        [1704067200, "3.14"],
++        [1704067260, "3.22"]
++      ]
++    }
++  ]
++}
++```
++
++---
++
++## Error Handling
++
++All tools return structured error dicts on failure.
++
++```json
++{ "error": "Request to Prometheus timed out" }
++{ "error": "Failed to connect to Prometheus", "help": "Check if Prometheus is running and base_url is correct" }
++{ "error": "Prometheus returned status 400", "details": "..." }
++{ "error": "Query must be between 1 and 1000 characters" }
++{ "error": "start and end time are required" }
++{
++  "error": "Missing required credential: <description>",
++  "help": "<setup instructions>",
++  "success": false
++}
++```
++
++---
++
++## Limits & Safeguards
++
++| Guard             | Value                                                               |
++| ----------------- | ------------------------------------------------------------------- |
++| Base URL priority | Credential store (`prometheus`) → fallback to `PROMETHEUS_BASE_URL` |
++| Timeout handling  | Out-of-range values reset to `5s`                                   |
++| Query limit       | Must be 1–1000 characters                                           |
++| URL normalization | Trailing `/` removed using `.rstrip('/')`                           |
++| Timeout range     | 1–30 seconds (values outside reset defaults to 5s)                  |
+diff --git a/tools/src/aden_tools/tools/prometheus_tool/__init__.py b/tools/src/aden_tools/tools/prometheus_tool/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd7243c0af69721ad8946e79cd5be2720a78372d
+--- /dev/null
++++ b/tools/src/aden_tools/tools/prometheus_tool/__init__.py
+@@ -0,0 +1,5 @@
++from __future__ import annotations
++
++from .prometheus_tool import register_tools
++
++__all__ = ["register_tools"]
+diff --git a/tools/src/aden_tools/tools/prometheus_tool/prometheus_tool.py b/tools/src/aden_tools/tools/prometheus_tool/prometheus_tool.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0af75604e8852aca0a36eec31a9705bd9456bd3e
+--- /dev/null
++++ b/tools/src/aden_tools/tools/prometheus_tool/prometheus_tool.py
+@@ -0,0 +1,260 @@
++"""
++Prometheus Tool - Query metrics from a Prometheus server using PromQL.
++
++Required:
++- PROMETHEUS_BASE_URL
++
++Optional Authentication:
++- PROMETHEUS_TOKEN (Bearer token)
++- PROMETHEUS_USERNAME and PROMETHEUS_PASSWORD (Basic Auth)
++
++API Reference: https://prometheus.io/docs/prometheus/latest/querying/api/
++"""
++
++from __future__ import annotations
++
++import os
++
++import httpx
++from fastmcp import FastMCP
++
++from aden_tools.credentials import CREDENTIAL_SPECS
++from aden_tools.credentials.store_adapter import CredentialStoreAdapter
++
++DEFAULT_TIMEOUT = 5
++
++
++def _get_prometheus_base_url(
++    credentials: CredentialStoreAdapter | None,
++) -> str | None:
++    """
++    Return Prometheus base URL.
++
++    Priority:
++    1. Credential store
++    2. Environment variable fallback
++
++    Parameters:
++        credentials: Credential store to query
++
++    Returns:
++        Base URL string or None
++    """
++    base_url: str | None = None
++
++    if credentials:
++        base_url = credentials.get("prometheus")
++
++    if not base_url:
++        base_url = os.getenv("PROMETHEUS_BASE_URL")
++
++    return base_url
++
++
++def _missing_prometheus_credential_response() -> dict:
++    """
++    Return a standardized response for missing Prometheus configuration.
++    """
++    spec = CREDENTIAL_SPECS["prometheus"]
++
++    return {
++        "error": f"Missing required credential: {spec.description}",
++        "help": spec.api_key_instructions,
++        "success": False,
++    }
++
++
++def _get_auth() -> tuple[dict[str, str], httpx.BasicAuth | None]:
++    headers: dict[str, str] = {}
++    auth = None
++
++    # Bearer token
++    token = os.getenv("PROMETHEUS_TOKEN")
++    if token:
++        headers["Authorization"] = f"Bearer {token}"
++        return headers, None
++
++    # Basic auth
++    username = os.getenv("PROMETHEUS_USERNAME")
++    password = os.getenv("PROMETHEUS_PASSWORD")
++    if username and password:
++        auth = httpx.BasicAuth(username, password)
++
++    return headers, auth
++
++
++def register_tools(
++    mcp: FastMCP,
++    credentials: CredentialStoreAdapter | None = None,
++) -> None:
++    """Register Prometheus tools with MCP."""
++
++    @mcp.tool()
++    def prometheus_query(
++        query: str,
++        timeout: int = DEFAULT_TIMEOUT,
++    ) -> dict:
++        """
++        Query Prometheus using PromQL.
++
++        Use this tool to fetch real-time metrics from a Prometheus server.
++
++        Args:
++            query: PromQL query string (e.g., 'up', 'sum(rate(http_requests_total[1m]))')
++            timeout: Request timeout in seconds (1-30)
++
++        Returns:
++            Dict containing query results or error
++        """
++
++        # limit query length
++        if not query or len(query) > 1000:
++            return {"error": "Query must be between 1 and 1000 characters"}
++
++        if timeout < 1 or timeout > 30:
++            timeout = DEFAULT_TIMEOUT
++
++        base_url = _get_prometheus_base_url(credentials)
++
++        if not base_url:
++            return _missing_prometheus_credential_response()
++
++        url = f"{base_url.rstrip('/')}/api/v1/query"
++
++        headers, auth = _get_auth()
++
++        try:
++            response = httpx.get(
++                url,
++                params={"query": query},
++                headers=headers,
++                auth=auth,
++                timeout=timeout,
++            )
++
++            if response.status_code != 200:
++                return {
++                    "error": f"Prometheus returned status {response.status_code}",
++                    "details": response.text,
++                }
++
++            data = response.json()
++
++            if data.get("status") != "success":
++                return {
++                    "error": "Prometheus query failed",
++                    "details": data,
++                }
++
++            return {
++                "success": True,
++                "query": query,
++                "result": data.get("data", {}).get("result", []),
++                "raw": data,
++            }
++
++        except httpx.TimeoutException:
++            return {"error": "Request to Prometheus timed out"}
++
++        except httpx.ConnectError:
++            return {
++                "error": "Failed to connect to Prometheus",
++                "help": "Check if Prometheus is running and base_url is correct",
++            }
++
++        except Exception as e:
++            return {"error": f"Unexpected error: {str(e)}"}
++
++    @mcp.tool()
++    def prometheus_query_range(
++        query: str,
++        start: str,
++        end: str,
++        step: str = "60s",
++        timeout: int = DEFAULT_TIMEOUT,
++    ) -> dict:
++        """
++        Query Prometheus over a time range using PromQL.
++
++        Use this tool to fetch historical metrics and time series data
++        from a Prometheus server. Suitable for trend analysis, graphing,
++        and monitoring over a defined time window.
++
++        Args:
++            query: PromQL query string (e.g., 'rate(http_requests_total[5m])')
++            start: Start time (Unix timestamp or RFC3339 format, e.g., "2024-01-01T00:00:00Z")
++            end: End time (Unix timestamp or RFC3339 format, e.g., "2024-01-01T00:00:00Z")
++            step: Query resolution step (e.g., '15s', '5m', '1h')
++            timeout: Request timeout in seconds (1-30)
++
++        Returns:
++            Dict containing time-series results or error
++        """
++
++        if not query or len(query) > 1000:
++            return {"error": "Query must be between 1 and 1000 characters"}
++
++        if not start or not end:
++            return {"error": "start and end time are required"}
++
++        if timeout < 1 or timeout > 30:
++            timeout = DEFAULT_TIMEOUT
++
++        base_url = _get_prometheus_base_url(credentials)
++
++        if not base_url:
++            return _missing_prometheus_credential_response()
++
++        url = f"{base_url.rstrip('/')}/api/v1/query_range"
++
++        headers, auth = _get_auth()
++
++        try:
++            response = httpx.get(
++                url,
++                params={
++                    "query": query,
++                    "start": start,
++                    "end": end,
++                    "step": step,
++                },
++                headers=headers,
++                auth=auth,
++                timeout=timeout,
++            )
++
++            if response.status_code != 200:
++                return {
++                    "error": f"Prometheus returned status {response.status_code}",
++                    "details": response.text,
++                }
++
++            data = response.json()
++
++            if data.get("status") != "success":
++                return {
++                    "error": "Prometheus range query failed",
++                    "details": data,
++                }
++
++            return {
++                "success": True,
++                "query": query,
++                "start": start,
++                "end": end,
++                "step": step,
++                "result": data.get("data", {}).get("result", []),
++                "raw": data,
++            }
++
++        except httpx.TimeoutException:
++            return {"error": "Request to Prometheus timed out"}
++
++        except httpx.ConnectError:
++            return {
++                "error": "Failed to connect to Prometheus",
++                "help": "Check if Prometheus is running and base_url is correct",
++            }
++
++        except Exception as e:
++            return {"error": f"Unexpected error: {str(e)}"}
+diff --git a/tools/tests/test_health_checks.py b/tools/tests/test_health_checks.py
+index ee5aed3a12dba7681e89c2e2e6c52a8bd1c56c40..246c37ef6cdbc898ed0b8574f488d3f7a267e312 100644
+--- a/tools/tests/test_health_checks.py
++++ b/tools/tests/test_health_checks.py
+@@ -88,6 +88,7 @@ def test_all_expected_checkers_registered(self):
+             "notion_token",
+             "pinecone",
+             "pipedrive",
++            "prometheus",
+             "resend",
+             "serpapi",
+             "slack",
+diff --git a/tools/tests/tools/test_prometheus_tool.py b/tools/tests/tools/test_prometheus_tool.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f1c6ee7e50671ee69d80344768a3e5c5dc5dd35
+--- /dev/null
++++ b/tools/tests/tools/test_prometheus_tool.py
+@@ -0,0 +1,167 @@
++from __future__ import annotations
++
++import httpx
++import pytest
++from fastmcp import FastMCP
++
++from aden_tools.tools.prometheus_tool import register_tools
++
++
++@pytest.fixture
++def mcp() -> FastMCP:
++    server = FastMCP("test")
++    register_tools(server)
++    return server
++
++
++def test_prometheus_query_validation(mcp: FastMCP) -> None:
++    tool_fn = mcp._tool_manager._tools["prometheus_query"].fn
++
++    result = tool_fn(query="")
++
++    assert "error" in result
++
++
++def test_prometheus_query_success(mcp: FastMCP, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("PROMETHEUS_BASE_URL", "http://fake-prometheus:9090")
++    tool_fn = mcp._tool_manager._tools["prometheus_query"].fn
++
++    class MockResponse:
++        status_code = 200
++
++        def json(self):
++            return {
++                "status": "success",
++                "data": {"result": [{"metric": {}, "value": [123, "1"]}]},
++            }
++
++    def mock_get(*args, **kwargs):
++        return MockResponse()
++
++    monkeypatch.setattr("aden_tools.tools.prometheus_tool.prometheus_tool.httpx.get", mock_get)
++
++    result = tool_fn(query="up")
++
++    assert result["success"] is True
++    assert "result" in result
++
++
++def test_prometheus_query_range_success(mcp: FastMCP, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("PROMETHEUS_BASE_URL", "http://fake-prometheus:9090")
++    tool_fn = mcp._tool_manager._tools["prometheus_query_range"].fn
++
++    class MockResponse:
++        status_code = 200
++
++        def json(self):
++            return {
++                "status": "success",
++                "data": {"result": [{"values": [[123, "1"]]}]},
++            }
++
++    monkeypatch.setattr("aden_tools.tools.prometheus_tool.prometheus_tool.httpx.get", lambda *a, **k: MockResponse())
++
++    result = tool_fn(
++        query="up",
++        start="2026-01-01T00:00:00Z",
++        end="2026-01-01T01:00:00Z",
++    )
++
++    assert result["success"] is True
++
++
++def test_prometheus_non_200(mcp: FastMCP, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("PROMETHEUS_BASE_URL", "http://fake-prometheus:9090")
++    tool_fn = mcp._tool_manager._tools["prometheus_query"].fn
++
++    class MockResponse:
++        status_code = 500
++        text = "Internal error"
++
++        def json(self):
++            return {}
++
++    monkeypatch.setattr("aden_tools.tools.prometheus_tool.prometheus_tool.httpx.get", lambda *a, **k: MockResponse())
++
++    result = tool_fn(query="up")
++
++    assert "error" in result
++
++
++def test_timeout(mcp: FastMCP, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("PROMETHEUS_BASE_URL", "http://fake-prometheus:9090")
++    tool_fn = mcp._tool_manager._tools["prometheus_query"].fn
++
++    def mock_query(*args, **kwargs):
++        raise httpx.TimeoutException("Request timed out")
++
++    monkeypatch.setattr(
++        "aden_tools.tools.prometheus_tool.prometheus_tool.httpx.get",
++        mock_query,
++    )
++
++    result = tool_fn(query="up")
++
++    assert "error" in result
++    assert "timed out" in result["error"].lower()
++
++
++def test_prometheus_connection_error(mcp: FastMCP, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("PROMETHEUS_BASE_URL", "http://fake-prometheus:9090")
++    tool_fn = mcp._tool_manager._tools["prometheus_query"].fn
++
++    def mock_get(*args, **kwargs):
++        raise Exception("Connection failed")
++
++    monkeypatch.setattr("aden_tools.tools.prometheus_tool.prometheus_tool.httpx.get", mock_get)
++
++    result = tool_fn(query="up")
++
++    assert "error" in result
++
++
++def test_missing_base_url(mcp: FastMCP, monkeypatch: pytest.MonkeyPatch) -> None:
++    tool_fn = mcp._tool_manager._tools["prometheus_query"].fn
++
++    monkeypatch.delenv("PROMETHEUS_BASE_URL", raising=False)
++
++    result = tool_fn(query="up")
++
++    assert result["success"] is False
++    assert "Missing required credential" in result["error"]
++
++
++def test_base_url_credentials_priority_over_env(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setenv("PROMETHEUS_BASE_URL", "http://fake-prometheus:9090")
++
++    class FakeCredentialStore:
++        def get(self, key: str):
++            return "http://cred-prometheus:9090"
++
++    mcp = FastMCP("test-cred-override")
++    register_tools(mcp, credentials=FakeCredentialStore())
++
++    called_urls = []
++
++    def fake_get(url, *args, **kwargs):
++        called_urls.append(url)
++
++        class Resp:
++            status_code = 200
++
++            def json(self):
++                return {"status": "success", "data": {"result": []}}
++
++        return Resp()
++
++    monkeypatch.setattr("aden_tools.tools.prometheus_tool.prometheus_tool.httpx.get", fake_get)
++
++    tool_fn = mcp._tool_manager._tools["prometheus_query"].fn
++
++    result = tool_fn(query="up")
++
++    assert result["success"] is True
++    assert result["query"] == "up"
++    assert "cred-prometheus:9090" in called_urls[0]

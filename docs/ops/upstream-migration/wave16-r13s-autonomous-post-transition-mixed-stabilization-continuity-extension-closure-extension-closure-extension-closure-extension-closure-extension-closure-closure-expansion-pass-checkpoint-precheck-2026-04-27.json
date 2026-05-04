@@ -1,0 +1,26 @@
+{
+  "generated_at_utc": "2026-04-27T20:48:36Z",
+  "wave": "Wave16-R13S",
+  "title": "Autonomous post-transition mixed stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify mixed post-transition stabilization+continuity extension closure extension closure extension closure extension closure extension closure closure expansion pass checkpoint across run-cycle/tick/evaluate/github-evaluate/auto-next/report",
+    "prepare bounded checkpoint before subsequent mixed wave lanes"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_run_cycle_endpoint",
+    "pipeline_loop_run_cycle_reports_terminal_and_pr_ready",
+    "pipeline_loop_tick_all_endpoint",
+    "pipeline_loop_tick_resolves_execution_completed_from_event_log",
+    "pipeline_loop_tick_resolves_execution_failed_from_event_log",
+    "pipeline_dispatch_next_rejects_when_active_run_exists",
+    "pipeline_evaluate_endpoint_uses_checks_and_updates_report",
+    "pipeline_evaluate_github_includes_pr_review_feedback_in_report",
+    "pipeline_auto_next_endpoint",
+    "pipeline_auto_next_no_checks_manual_pending_policy",
+    "pipeline_report_endpoint"
+  ]
+}

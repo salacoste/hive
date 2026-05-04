@@ -1,0 +1,31 @@
+{
+  "generated_at_utc": "2026-04-25T13:25:12Z",
+  "wave": "Wave16-R9Q",
+  "title": "Runtime tests package marker lane precheck",
+  "scope": [
+    "core/framework/runtime/tests/__init__.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/runtime/tests/__init__.py",
+      "add": 1,
+      "del": 0,
+      "total": 1
+    }
+  },
+  "delta_summary": [
+    "local runtime tests package marker file documents test package boundary"
+  ],
+  "risk_signals": [
+    {
+      "type": "test-discovery-boundary",
+      "evidence": "explicit package marker can stabilize test import/discovery behavior in mixed tooling",
+      "impact": "upstream replay can remove marker and alter discovery/import assumptions"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/runtime/tests -q",
+    "uv run --package framework pytest core/tests/test_runtime.py -q"
+  ],
+  "decision_gate": "prefer keep_local if runtime test discovery bundles remain green"
+}

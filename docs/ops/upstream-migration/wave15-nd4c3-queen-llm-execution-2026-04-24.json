@@ -1,0 +1,37 @@
+{
+  "generated_at_utc": "2026-04-24T16:45:00Z",
+  "lane": "ND-4C3",
+  "title": "Queen + LLM bounded replay execution (reconcile-mode)",
+  "scope_files_total": 15,
+  "applied_upstream_files": [
+    "core/framework/agents/queen/incubating_evaluator.py",
+    "core/framework/agents/queen/mcp_servers.json",
+    "core/framework/agents/queen/queen_memory_v2.py",
+    "core/framework/agents/queen/queen_profiles.py",
+    "core/framework/agents/queen/queen_tools_config.py",
+    "core/framework/agents/queen/queen_tools_defaults.py",
+    "core/framework/agents/queen/recall_selector.py",
+    "core/framework/agents/queen/reflection_agent.py",
+    "core/framework/llm/antigravity.py",
+    "core/framework/llm/mock.py",
+    "core/framework/llm/model_catalog.json",
+    "core/framework/llm/provider.py",
+    "core/framework/llm/stream_events.py"
+  ],
+  "deferred_conflicts": [
+    "core/framework/agents/queen/nodes/__init__.py",
+    "core/framework/llm/litellm.py"
+  ],
+  "classification": {
+    "mode": "reconcile",
+    "note": "conflicting files deferred as intentional local divergence lane"
+  },
+  "validation": {
+    "targeted_tests": {
+      "command": "uv run pytest core/tests/test_litellm_provider.py core/tests/test_litellm_streaming.py core/tests/test_queen_nodes_prompt.py core/tests/test_queen_memory.py core/tests/test_trigger_fires_into_queen.py -q",
+      "result": "145 passed, 9 skipped"
+    },
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  }
+}

@@ -1,0 +1,179 @@
+{
+  "generated_at_utc": "2026-04-24T16:08:25Z",
+  "base_ref": "HEAD",
+  "target_ref": "upstream/main",
+  "scope_prefixes": [
+    "core/framework/skills",
+    "core/framework/agents/queen",
+    "core/framework/llm",
+    "core/framework/loader",
+    "core/framework/host"
+  ],
+  "totals": {
+    "files_total": 34,
+    "status_counts": {
+      "A": 7,
+      "M": 23,
+      "D": 1,
+      "R100": 3
+    },
+    "non_destructive_total": 33
+  },
+  "candidate_nd4c1": {
+    "name": "skills-surface",
+    "files_total": 10,
+    "paths": [
+      "core/framework/skills/_preset_skills/browser-automation/SKILL.md",
+      "core/framework/skills/_preset_skills/linkedin-automation/SKILL.md",
+      "core/framework/skills/_preset_skills/x-automation/SKILL.md",
+      "core/framework/skills/authoring.py",
+      "core/framework/skills/catalog.py",
+      "core/framework/skills/discovery.py",
+      "core/framework/skills/manager.py",
+      "core/framework/skills/overrides.py",
+      "core/framework/skills/tool_gating.py",
+      "core/framework/skills/trust.py"
+    ]
+  },
+  "entries": [
+    {
+      "status": "A",
+      "path": "core/framework/agents/queen/incubating_evaluator.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agents/queen/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agents/queen/nodes/__init__.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agents/queen/queen_memory_v2.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agents/queen/queen_profiles.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/agents/queen/queen_tools_config.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/agents/queen/queen_tools_defaults.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agents/queen/recall_selector.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agents/queen/reflection_agent.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/host/agent_host.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/host/colony_metadata.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/host/colony_runtime.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/host/colony_tools_config.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/host/event_bus.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/llm/antigravity.py"
+    },
+    {
+      "status": "D",
+      "path": "core/framework/llm/fallback.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/llm/litellm.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/llm/mock.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/llm/model_catalog.json"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/llm/provider.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/llm/stream_events.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/loader/agent_loader.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/loader/mcp_client.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/loader/tool_registry.py"
+    },
+    {
+      "status": "R100",
+      "old_path": "core/framework/skills/_default_skills/browser-automation/SKILL.md",
+      "path": "core/framework/skills/_preset_skills/browser-automation/SKILL.md"
+    },
+    {
+      "status": "R100",
+      "old_path": "core/framework/skills/_default_skills/linkedin-automation/SKILL.md",
+      "path": "core/framework/skills/_preset_skills/linkedin-automation/SKILL.md"
+    },
+    {
+      "status": "R100",
+      "old_path": "core/framework/skills/_default_skills/x-automation/SKILL.md",
+      "path": "core/framework/skills/_preset_skills/x-automation/SKILL.md"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/skills/authoring.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/skills/catalog.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/skills/discovery.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/skills/manager.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/skills/overrides.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/skills/tool_gating.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/skills/trust.py"
+    }
+  ]
+}

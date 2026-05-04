@@ -1,0 +1,50 @@
+{
+  "generated_at_utc": "2026-04-25T13:06:59Z",
+  "wave": "Wave16-R9L",
+  "title": "Queen memory v2 behavior lane execution",
+  "scope": [
+    "core/framework/agents/queen/queen_memory_v2.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local `colony_memory` namespace plus session-id normalization preserves stable memory paths for colony/session runtime wiring",
+      "`init_memory_dir(..., migrate_legacy=...)` compatibility matches existing orchestrator/session-manager call contract",
+      "targeted queen/session validation bundles are green with local behavior"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9L lane (local compatibility behavior retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_queen_memory.py -q",
+        "result": "pass",
+        "summary": "32 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_create_colony_tool.py core/tests/test_run_parallel_workers_tool.py -q",
+        "result": "pass",
+        "summary": "21 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q",
+        "result": "pass",
+        "summary": "9 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9L lane closed with explicit keep-local decision",
+      "backlog can transition to terminal-completion mode until next residual wave is queued"
+    ]
+  }
+}

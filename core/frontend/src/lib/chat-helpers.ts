@@ -7,6 +7,29 @@ import type { ChatMessage } from "@/components/ChatPanel";
 import type { AgentEvent } from "@/api/types";
 
 /**
+ * Find the FIFO-correct optimistic user bubble to reconcile with a
+ * server-echoed `client_input_received` message.
+ *
+ * We only match unreconciled optimistic bubbles (`executionId` absent) with
+ * the same content. This prevents late echoes from re-matching an already
+ * reconciled message and creating duplicates.
+ */
+export function findOptimisticUserMatchIndex(
+  messages: ChatMessage[],
+  incoming: ChatMessage,
+): number {
+  if (incoming.type !== "user") return -1;
+  if (!incoming.content) return -1;
+  if (messages.length === 0) return -1;
+  return messages.findIndex(
+    (m) =>
+      m.type === "user" &&
+      !m.executionId &&
+      m.content === incoming.content,
+  );
+}
+
+/**
  * Derive a human-readable display name from a raw agent identifier.
  *
  * Examples:
@@ -147,9 +170,6 @@ export function sseEventToChatMessage(
     case "client_input_received": {
       const userContent = (event.data?.content as string) || "";
       if (!userContent) return null;
-      const clientMessageIdRaw = event.data?.client_message_id;
-      const clientMessageId =
-        typeof clientMessageIdRaw === "string" ? clientMessageIdRaw.trim() : "";
       return {
         id: `user-input-${event.timestamp}`,
         agent: "You",
@@ -159,8 +179,10 @@ export function sseEventToChatMessage(
         type: "user",
         thread,
         createdAt,
+        // Carrying execution_id here lets the optimistic-message reconciler
+        // distinguish server-echoed user bubbles from still-unflushed ones.
+        executionId: event.execution_id || undefined,
         streamId: event.stream_id || undefined,
-        clientMessageId: clientMessageId || undefined,
       };
     }
 
@@ -215,6 +237,34 @@ export function sseEventToChatMessage(
       };
     }
 
+    case "trigger_fired": {
+      // Surface each scheduler/webhook fire as a banner in the chat, so the
+      // user can see exactly when the queen was invoked by a trigger vs. by
+      // a typed message. The banner sits at the start of the turn the queen
+      // is about to run in response.
+      const triggerId = event.data?.trigger_id as string | undefined;
+      if (!triggerId) return null;
+      const payload = {
+        trigger_id: triggerId,
+        trigger_type: event.data?.trigger_type as string | undefined,
+        name: event.data?.name as string | undefined,
+        task: event.data?.task as string | undefined,
+        fire_count: event.data?.fire_count as number | undefined,
+        last_fired_at: event.data?.last_fired_at as number | undefined,
+      };
+      return {
+        id: `trigger-${triggerId}-${payload.last_fired_at ?? event.timestamp}`,
+        agent: "Trigger",
+        agentColor: "",
+        content: JSON.stringify(payload),
+        timestamp: "",
+        type: "trigger",
+        thread,
+        createdAt,
+        streamId: event.stream_id || undefined,
+      };
+    }
+
     default:
       return null;
   }
@@ -226,22 +276,50 @@ export function sseEventToChatMessage(
 
 /**
  * State maintained while replaying an event stream. Tracks per-stream turn
- * counters, the set of active tool calls (so tool_status pill content
- * reflects "tool A done, tool B running" correctly), and a tool_use_id →
- * pill_msg_id map so deferred `tool_call_completed` events can find the
- * pill they belong to after the turn counter moves on.
+ * counters, materialized tool rows, and a pending tool_use_id → row map so
+ * deferred `tool_call_completed` events can find the exact pill they belong
+ * to after the turn counter moves on.
  */
+type ToolRowState = {
+  streamId: string;
+  executionId: string;
+  tools: Record<string, { name: string; done: boolean }>;
+};
+
 export interface ReplayState {
   turnCounters: Record<string, number>;
-  activeToolCalls: Record<
+  toolRows: Record<string, ToolRowState>;
+  toolUseToPill: Record<
     string,
-    { name: string; done: boolean; streamId: string }
+    { msgId: string; toolKey: string; name: string }
   >;
-  toolUseToPill: Record<string, { msgId: string; name: string }>;
+  queenIterText: Record<string, Record<number, string>>;
 }
 
 export function newReplayState(): ReplayState {
-  return { turnCounters: {}, activeToolCalls: {}, toolUseToPill: {} };
+  return {
+    turnCounters: {},
+    toolRows: {},
+    toolUseToPill: {},
+    queenIterText: {},
+  };
+}
+
+function toolLookupKey(
+  streamId: string,
+  executionId: string | null | undefined,
+  toolUseId: string,
+): string {
+  return `${streamId}:${executionId || "exec"}:${toolUseId}`;
+}
+
+function toolRowContent(row: ToolRowState): string {
+  const tools = Object.values(row.tools).map((t) => ({
+    name: t.name,
+    done: t.done,
+  }));
+  const allDone = tools.length > 0 && tools.every((t) => t.done);
+  return JSON.stringify({ tools, allDone });
 }
 
 /**
@@ -267,9 +345,11 @@ export function replayEvent(
   event: AgentEvent,
   thread: string,
   agentDisplayName: string | undefined,
+  queenDisplayName?: string,
 ): ChatMessage[] {
   const streamId = event.stream_id;
   const isQueen = streamId === "queen";
+  const effectiveName = isQueen ? (queenDisplayName || agentDisplayName) : agentDisplayName;
   const role: "queen" | "worker" = isQueen ? "queen" : "worker";
   const turnKey = streamId;
   const currentTurn = state.turnCounters[turnKey] ?? 0;
@@ -279,21 +359,12 @@ export function replayEvent(
 
   const out: ChatMessage[] = [];
 
-  // Update state machine BEFORE the generic converter runs so the
-  // regular message emitted for this event sees the post-update
-  // counter (matches live handler ordering at colony-chat.tsx:525).
+  // Update state machine BEFORE the generic converter runs so regular
+  // messages and synthesized tool pills use the same turn counters in
+  // both live SSE handling and cold replay.
   switch (event.type) {
     case "execution_started":
       state.turnCounters[turnKey] = currentTurn + 1;
-      // New execution for a worker resets its active tools, mirroring
-      // the live handler's setAgentState at colony-chat.tsx:566.
-      if (!isQueen) {
-        const keepActive: typeof state.activeToolCalls = {};
-        for (const [k, v] of Object.entries(state.activeToolCalls)) {
-          if (v.streamId !== streamId) keepActive[k] = v;
-        }
-        state.activeToolCalls = keepActive;
-      }
       break;
     case "llm_turn_complete":
       state.turnCounters[turnKey] = currentTurn + 1;
@@ -302,24 +373,31 @@ export function replayEvent(
       if (!event.node_id) break;
       const toolName = (event.data?.tool_name as string) || "unknown";
       const toolUseId = (event.data?.tool_use_id as string) || "";
-      state.activeToolCalls[toolUseId] = {
+      const pillId = `tool-pill-${streamId}-${event.execution_id || "exec"}-${currentTurn}`;
+      const row =
+        state.toolRows[pillId] ||
+        (state.toolRows[pillId] = {
+          streamId,
+          executionId: event.execution_id || "exec",
+          tools: {},
+        });
+      const toolKey = toolUseId || `anonymous-${Object.keys(row.tools).length}`;
+      row.tools[toolKey] = {
         name: toolName,
         done: false,
-        streamId,
       };
-      const pillId = `tool-pill-${streamId}-${event.execution_id || "exec"}-${currentTurn}`;
       if (toolUseId) {
-        state.toolUseToPill[toolUseId] = { msgId: pillId, name: toolName };
+        state.toolUseToPill[toolLookupKey(streamId, event.execution_id, toolUseId)] = {
+          msgId: pillId,
+          toolKey,
+          name: toolName,
+        };
       }
-      const tools = Object.values(state.activeToolCalls)
-        .filter((t) => t.streamId === streamId)
-        .map((t) => ({ name: t.name, done: t.done }));
-      const allDone = tools.length > 0 && tools.every((t) => t.done);
       out.push({
         id: pillId,
-        agent: agentDisplayName || event.node_id || "Agent",
+        agent: effectiveName || event.node_id || "Agent",
         agentColor: "",
-        content: JSON.stringify({ tools, allDone }),
+        content: toolRowContent(row),
         timestamp: "",
         type: "tool_status",
         role,
@@ -334,23 +412,23 @@ export function replayEvent(
     case "tool_call_completed": {
       if (!event.node_id) break;
       const toolUseId = (event.data?.tool_use_id as string) || "";
-      const tracked = state.toolUseToPill[toolUseId];
-      if (toolUseId) delete state.toolUseToPill[toolUseId];
-      if (toolUseId && state.activeToolCalls[toolUseId]) {
-        state.activeToolCalls[toolUseId].done = true;
-      }
+      const lookupKey = toolLookupKey(streamId, event.execution_id, toolUseId);
+      const tracked = state.toolUseToPill[lookupKey];
+      if (toolUseId) delete state.toolUseToPill[lookupKey];
       if (!tracked) break;
-      const tools = Object.values(state.activeToolCalls)
-        .filter((t) => t.streamId === streamId)
-        .map((t) => ({ name: t.name, done: t.done }));
-      const allDone = tools.length > 0 && tools.every((t) => t.done);
+      const row = state.toolRows[tracked.msgId];
+      if (!row) break;
+      row.tools[tracked.toolKey] = {
+        name: row.tools[tracked.toolKey]?.name || tracked.name,
+        done: true,
+      };
       // Re-emit the SAME pill id with updated content. Caller upserts
       // by id, so this replaces the row from tool_call_started.
       out.push({
         id: tracked.msgId,
-        agent: agentDisplayName || event.node_id || "Agent",
+        agent: effectiveName || event.node_id || "Agent",
         agentColor: "",
-        content: JSON.stringify({ tools, allDone }),
+        content: toolRowContent(row),
         timestamp: "",
         type: "tool_status",
         role,
@@ -368,11 +446,31 @@ export function replayEvent(
   const msg = sseEventToChatMessage(
     event,
     thread,
-    agentDisplayName,
+    effectiveName,
     state.turnCounters[turnKey] ?? 0,
   );
   if (msg) {
-    if (isQueen) msg.role = "queen";
+    if (isQueen) {
+      msg.role = "queen";
+      if (
+        event.execution_id &&
+        (event.type === "client_output_delta" || event.type === "llm_text_delta")
+      ) {
+        const iter = (event.data?.iteration as number | undefined) ?? 0;
+        const inner = (event.data?.inner_turn as number | undefined) ?? 0;
+        const iterKey = `${event.execution_id}:${iter}`;
+        if (!state.queenIterText[iterKey]) {
+          state.queenIterText[iterKey] = {};
+        }
+        state.queenIterText[iterKey][inner] = msg.content;
+        const parts = state.queenIterText[iterKey];
+        const sorted = Object.keys(parts)
+          .map(Number)
+          .sort((a, b) => a - b);
+        msg.content = sorted.map((k) => parts[k]).join("\n");
+        msg.id = `queen-stream-${event.execution_id}-${iter}`;
+      }
+    }
     out.push(msg);
   }
 
@@ -383,27 +481,101 @@ export function replayEvent(
  * Replay an entire event array and return a deduplicated, chronologically
  * sorted ChatMessage list. Used by cold-restore paths so refreshed
  * sessions match the live stream exactly.
+ *
+ * If the events stream contains a ``colony_fork_marker`` event (emitted
+ * by ``fork_session_into_colony`` after compacting the parent transcript),
+ * every message produced from events PRECEDING the marker is folded into
+ * a single ``inherited_block`` ChatMessage. The colony page renders that
+ * block as a collapsible widget so the inherited DM history is one click
+ * away without dominating the colony's own chat.
  */
 export function replayEventsToMessages(
   events: AgentEvent[],
   thread: string,
   agentDisplayName: string | undefined,
+  queenDisplayName?: string,
+  state: ReplayState = newReplayState(),
 ): ChatMessage[] {
-  const state = newReplayState();
   // Upsert by id — later emissions for the same pill replace earlier ones.
   const byId = new Map<string, ChatMessage>();
+
+  // Track the marker (if any) and which message ids belong to the
+  // inherited prefix. A single fork can only happen once per session so
+  // we only need to remember the first marker we encounter.
+  let markerEvent: AgentEvent | null = null;
+  let markerCreatedAt: number | null = null;
+  const inheritedIds = new Set<string>();
+
   for (const evt of events) {
-    for (const m of replayEvent(state, evt, thread, agentDisplayName)) {
-      byId.set(m.id, m);
+    if ((evt.type as string) === "colony_fork_marker") {
+      if (markerEvent === null) {
+        markerEvent = evt;
+        markerCreatedAt = evt.timestamp
+          ? new Date(evt.timestamp).getTime()
+          : Date.now();
+        // Snapshot every id seen so far — those are the ones to fold
+        // into the inherited block.
+        for (const id of byId.keys()) inheritedIds.add(id);
+      }
+      continue;
+    }
+    for (const m of replayEvent(state, evt, thread, agentDisplayName, queenDisplayName)) {
+      const previous = byId.get(m.id);
+      byId.set(
+        m.id,
+        previous ? { ...m, createdAt: previous.createdAt ?? m.createdAt } : m,
+      );
     }
   }
-  return Array.from(byId.values()).sort(
+
+  const all = Array.from(byId.values()).sort(
     (a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0),
   );
+
+  if (markerEvent === null || inheritedIds.size === 0) return all;
+
+  const inherited: ChatMessage[] = [];
+  const native: ChatMessage[] = [];
+  for (const msg of all) {
+    if (inheritedIds.has(msg.id)) inherited.push(msg);
+    else native.push(msg);
+  }
+  if (inherited.length === 0) return all;
+
+  const markerData = markerEvent.data || {};
+  const block: ChatMessage = {
+    id: `inherited-block-${markerEvent.timestamp || "fork"}`,
+    agent: "System",
+    agentColor: "",
+    type: "inherited_block",
+    content: JSON.stringify({
+      parent_session_id: markerData.parent_session_id ?? null,
+      fork_time: markerData.fork_time ?? markerEvent.timestamp ?? null,
+      summary_preview: markerData.summary_preview ?? "",
+      inherited_message_count:
+        typeof markerData.inherited_message_count === "number"
+          ? markerData.inherited_message_count
+          : inherited.length,
+      messages: inherited,
+    }),
+    timestamp: markerEvent.timestamp || "",
+    thread,
+    // Place the block at the marker's timestamp so it sorts immediately
+    // before the first native message (the marker is always written
+    // AFTER the inherited content).
+    createdAt: markerCreatedAt ?? inherited[inherited.length - 1].createdAt ?? 0,
+  };
+
+  return [block, ...native];
 }
 
-type QueenPhase = "planning" | "building" | "staging" | "running" | "independent";
-const VALID_PHASES = new Set<string>(["planning", "building", "staging", "running", "independent"]);
+type QueenPhase = "independent" | "incubating" | "working" | "reviewing";
+const VALID_PHASES = new Set<string>([
+  "independent",
+  "incubating",
+  "working",
+  "reviewing",
+]);
 
 /**
  * Scan an array of persisted events and return the last queen phase seen,

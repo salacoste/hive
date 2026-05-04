@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-26T02:21:24Z",
+  "wave": "Wave16-R10E",
+  "title": "Queen memory compatibility namespace lane precheck",
+  "scope": [
+    "core/framework/agents/queen/queen_memory_v2.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/agents/queen/queen_memory_v2.py",
+      "add": 16,
+      "del": 4,
+      "total": 20
+    }
+  },
+  "delta_summary": [
+    "colony memory path now normalizes session ids and writes under colony_memory namespace",
+    "init_memory_dir accepts migrate_legacy kwarg for compatibility (no-op)",
+    "changes are contract-level backward-compat hardening, not behavior expansion"
+  ],
+  "risk_signals": [
+    {
+      "type": "storage-path-contract",
+      "evidence": "directory namespace switched from colonies/ to colony_memory/ with slug normalization",
+      "impact": "callers/tests relying on old path shape may break without compatibility logic"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_queen_memory.py -q",
+    "uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q"
+  ],
+  "decision_gate": "keep_local acceptable if queen memory and session-manager bundles remain green"
+}

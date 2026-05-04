@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T00:39:39Z",
+  "wave": "Wave16-R11N",
+  "title": "Autonomous run-cycle input-validation + report continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "run-cycle input-validation semantics remain stable while report surfaces stay consistent",
+      "run-cycle/report endpoints remain aligned after validation accept/reject branches",
+      "no regressions observed in targeted run-cycle input-validation/report continuity bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_endpoint or pipeline_loop_run_cycle_rejects_invalid_max_steps or pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11N lane closed as keep-local with green run-cycle input-validation/report continuity bundle",
+      "next lane continues auto-next input-validation/report continuity"
+    ]
+  }
+}

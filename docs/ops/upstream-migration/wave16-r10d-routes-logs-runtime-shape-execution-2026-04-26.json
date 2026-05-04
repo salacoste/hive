@@ -1,0 +1,35 @@
+{
+  "generated_at_utc": "2026-04-26T02:21:44Z",
+  "wave": "Wave16-R10D",
+  "title": "Routes logs runtime-shape compatibility lane execution",
+  "scope": [
+    "core/framework/server/routes_logs.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "runtime fallback (colony_runtime|graph_runtime) keeps logs route compatible across legacy/new session shapes",
+      "graph-scoped node logs alias is required by existing Web UI/tests",
+      "logs/node_logs API regression bundle is green"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local routes_logs runtime-shape and route-alias compatibility contract"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'logs or node_logs' -q",
+        "result": "pass",
+        "summary": "8 passed, 185 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10D lane closed with explicit keep-local decision",
+      "next lane selected from refreshed residual shortlist"
+    ]
+  }
+}

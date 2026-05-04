@@ -1,0 +1,74 @@
+{
+  "date": "2026-04-24",
+  "generated_at_utc": "2026-04-24T13:56:27.433837+00:00",
+  "batch_id": "ND-2A-config-only",
+  "base_ref": "HEAD",
+  "upstream_ref": "upstream/main",
+  "paths": [
+    "examples/templates/competitive_intel_agent/mcp_servers.json",
+    "examples/templates/deep_research_agent/mcp_servers.json",
+    "examples/templates/email_inbox_management/mcp_servers.json",
+    "examples/templates/email_reply_agent/mcp_servers.json",
+    "examples/templates/job_hunter/mcp_servers.json",
+    "examples/templates/local_business_extractor/mcp_servers.json",
+    "examples/templates/meeting_scheduler/mcp_servers.json",
+    "examples/templates/sdr_agent/mcp_servers.json",
+    "examples/templates/tech_news_reporter/mcp_servers.json",
+    "examples/templates/twitter_news_agent/mcp_servers.json",
+    "examples/templates/vulnerability_assessment/mcp_registry.json",
+    "examples/templates/vulnerability_assessment/mcp_servers.json"
+  ],
+  "worktree_status": [
+    {
+      "path": "examples/templates/competitive_intel_agent/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/deep_research_agent/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/email_inbox_management/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/email_reply_agent/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/job_hunter/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/local_business_extractor/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/meeting_scheduler/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/sdr_agent/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/tech_news_reporter/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/twitter_news_agent/mcp_servers.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/vulnerability_assessment/mcp_registry.json",
+      "worktree_status": "clean"
+    },
+    {
+      "path": "examples/templates/vulnerability_assessment/mcp_servers.json",
+      "worktree_status": "clean"
+    }
+  ],
+  "patch_path": "docs/ops/upstream-migration/wave15-nd2a-config-only.patch",
+  "git_apply_check_exit_code": 0,
+  "git_apply_check_stderr": ""
+}

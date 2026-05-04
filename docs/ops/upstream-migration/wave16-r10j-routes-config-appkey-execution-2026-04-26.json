@@ -1,0 +1,50 @@
+{
+  "generated_at_utc": "2026-04-26T13:20:25Z",
+  "wave": "Wave16-R10J",
+  "title": "Routes config AppKey contract refresh lane execution",
+  "scope": [
+    "core/framework/server/routes_config.py",
+    "core/tests/test_routes_config_appkey_contract.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "typed AppKey access removes aiohttp string-key warning drift without changing behavior",
+      "added focused unit coverage for _resolve_api_key and _hot_swap_sessions AppKey paths",
+      "provider/runtime bundle remains green"
+    ]
+  },
+  "changes": [
+    "added core/tests/test_routes_config_appkey_contract.py (3 tests)",
+    "no runtime code patch; retained local routes_config AppKey contract"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_routes_config_appkey_contract.py -q",
+        "result": "pass",
+        "summary": "3 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_litellm_provider.py -q",
+        "result": "pass",
+        "summary": "100 passed"
+      }
+    ],
+    "out_of_lane": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_model_catalog.py -q",
+        "result": "fail",
+        "summary": "5 failed, 9 passed",
+        "classification": "catalog baseline drift (separate lane)"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10J lane closed with explicit keep-local decision",
+      "next lane opened for model-catalog baseline reconciliation"
+    ]
+  }
+}

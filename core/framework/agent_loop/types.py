@@ -182,7 +182,24 @@ class AgentContext:
 
     dynamic_tools_provider: Any = None
     dynamic_prompt_provider: Any = None
+    # Optional Callable[[], str]: when set alongside ``dynamic_prompt_provider``,
+    # the AgentLoop sends the system prompt as two pieces — the result of
+    # ``dynamic_prompt_provider`` is the STATIC block (cached), and this
+    # provider returns the DYNAMIC suffix (not cached). The LLM wrapper
+    # emits them as two Anthropic system content blocks with a cache
+    # breakpoint between them for providers that honor ``cache_control``.
+    # For providers that don't, the two strings are concatenated. Used by
+    # the Queen to keep her persona/role/tools block warm across iterations
+    # while the recall + timestamp tail refreshes per user turn.
+    dynamic_prompt_suffix_provider: Any = None
     dynamic_memory_provider: Any = None
+    # Optional Callable[[], str]: when set, the current skills-catalog
+    # prompt is sourced from this provider each iteration. Lets workers
+    # pick up UI toggles without restarting the run. Queen agents already
+    # rebuild the whole prompt via dynamic_prompt_provider — this field
+    # is a surgical alternative used by colony workers where the rest of
+    # the prompt stays constant and we don't want to thrash the cache.
+    dynamic_skills_catalog_provider: Any = None
 
     skills_catalog_prompt: str = ""
     protocols_prompt: str = ""

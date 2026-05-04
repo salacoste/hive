@@ -1,0 +1,41 @@
+{
+  "generated_at_utc": "2026-04-26T02:05:56Z",
+  "wave": "Wave16-R10A",
+  "title": "Routes execution policy/queue/runtime-shape lane precheck",
+  "scope": [
+    "core/framework/server/routes_execution.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/server/routes_execution.py",
+      "add": 173,
+      "del": 26,
+      "total": 199
+    }
+  },
+  "delta_summary": [
+    "adds project-level execution policy guard and per-project queue endpoint",
+    "adds runtime-shape shim (_session_runtime) for graph_runtime/colony_runtime compatibility",
+    "adds client_message_id/source metadata propagation into queen event bus",
+    "normalizes cancellation outcome handling (True|cancelled) across pause/stop paths",
+    "switches manager access to typed APP_KEY_MANAGER contract"
+  ],
+  "risk_signals": [
+    {
+      "type": "api-contract",
+      "evidence": "new trigger queue semantics (202 queued) and /api/projects/{project_id}/queue endpoint",
+      "impact": "client-side handling for trigger conflicts/queue state may drift"
+    },
+    {
+      "type": "runtime-compatibility",
+      "evidence": "runtime selection now supports graph_runtime and colony_runtime",
+      "impact": "session-shape regressions possible if branch assumptions diverge"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'queue_if_busy or max_concurrent_runs or client_message_id' -q",
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'trigger or pause or stop or replay' -q",
+    "uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k 'session status or run' -q"
+  ],
+  "decision_gate": "prefer keep_local if queue/policy/runtime-shape features are validated and stable in API contract tests"
+}

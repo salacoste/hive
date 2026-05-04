@@ -12,7 +12,10 @@ REQUIRED_TEST_MODULES = [
     "scripts/tests/test_acceptance_gate_presets.py",
     "scripts/tests/test_acceptance_gate_presets_smoke_script.py",
     "scripts/tests/test_acceptance_gate_presets_smoke_behavior.py",
+    "scripts/tests/test_acceptance_weekly_maintenance_script.py",
     "scripts/tests/test_acceptance_ops_summary.py",
+    "scripts/tests/test_acceptance_gate_result_artifact.py",
+    "scripts/tests/test_check_operational_api_contracts.py",
     "scripts/tests/test_autonomous_scheduler_daemon.py",
     "scripts/tests/test_check_acceptance_docs_navigation.py",
     "scripts/tests/test_check_acceptance_gate_toggles_sync.py",
@@ -30,6 +33,7 @@ REQUIRED_TEST_MODULES = [
     "scripts/tests/test_check_backlog_status_drift.py",
     "scripts/tests/test_check_backlog_status_artifacts_index.py",
     "scripts/tests/test_check_backlog_archive_index.py",
+    "scripts/tests/test_acceptance_deep_profile_script.py",
 ]
 
 

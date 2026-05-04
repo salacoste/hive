@@ -1,0 +1,32 @@
+{
+  "generated_at_utc": "2026-04-25T13:01:18Z",
+  "wave": "Wave16-R9K",
+  "title": "Queen lifecycle tools behavior lane precheck",
+  "scope": [
+    "core/framework/tools/queen_lifecycle_tools.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/tools/queen_lifecycle_tools.py",
+      "add": 12,
+      "del": 0,
+      "total": 12
+    }
+  },
+  "delta_summary": [
+    "added backward-compatible aliasing between prompt_building and prompt_independent in QueenPhaseState",
+    "ensures legacy callers/tests that still set prompt_building remain compatible with current prompt_independent flow"
+  ],
+  "risk_signals": [
+    {
+      "type": "phase-prompt-compat",
+      "evidence": "mixed caller population still references prompt_building while newer flow uses prompt_independent",
+      "impact": "without aliasing, phase prompt can be empty or stale in legacy call paths"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_create_colony_tool.py core/tests/test_run_parallel_workers_tool.py core/tests/test_queen_memory.py -q",
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution or colony or queen\" -q"
+  ],
+  "decision_gate": "prefer keep_local if backward compatibility and lifecycle test bundles are green"
+}

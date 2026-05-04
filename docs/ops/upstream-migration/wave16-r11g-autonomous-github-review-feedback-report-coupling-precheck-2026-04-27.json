@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-27T00:04:04Z",
+  "wave": "Wave16-R11G",
+  "title": "Autonomous GitHub review-feedback + report coupling continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify GitHub review-feedback ingestion remains reflected in evaluate report payloads",
+    "verify summary-comment publish path and report read-model continuity across GitHub evaluate updates"
+  ],
+  "targeted_tests": [
+    "pipeline_evaluate_github_endpoint",
+    "pipeline_evaluate_github_includes_pr_review_feedback_in_report",
+    "pipeline_evaluate_github_can_post_review_summary_comment",
+    "pipeline_evaluate_github_uses_pr_url_when_ref_missing",
+    "pipeline_evaluate_endpoint_uses_checks_and_updates_report",
+    "pipeline_report_endpoint"
+  ]
+}

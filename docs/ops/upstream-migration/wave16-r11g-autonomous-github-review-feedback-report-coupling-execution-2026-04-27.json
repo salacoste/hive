@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T00:07:46Z",
+  "wave": "Wave16-R11G",
+  "title": "Autonomous GitHub review-feedback + report coupling continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "GitHub review-feedback ingestion remains reflected in evaluate report payloads",
+      "summary-comment publish path and report read-model continuity remain stable across GitHub evaluate updates",
+      "no regressions observed in targeted review-feedback/report coupling bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_endpoint or pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11G lane closed as keep-local with green GitHub review-feedback/report coupling bundle",
+      "next lane continues GitHub evaluate + auto-next full-contract continuity"
+    ]
+  }
+}

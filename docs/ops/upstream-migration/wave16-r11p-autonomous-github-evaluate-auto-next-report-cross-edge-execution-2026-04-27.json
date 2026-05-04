@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T01:01:02Z",
+  "wave": "Wave16-R11P",
+  "title": "Autonomous GitHub evaluate + auto-next + report cross-edge continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "GitHub evaluate outputs, auto-next policy decisions, and report/read-model updates remain consistent as one cross-edge flow",
+      "cross-edge behavior remains stable across review-feedback, no-checks policy, PR URL fallback, and manual-pending/deferred branches",
+      "no regressions observed in targeted GitHub evaluate/auto-next/report cross-edge bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_github_includes_pr_review_feedback_in_report or pipeline_evaluate_github_can_post_review_summary_comment or pipeline_evaluate_github_no_checks_success_policy or pipeline_evaluate_github_uses_pr_url_when_ref_missing or pipeline_auto_next_no_checks_manual_pending_policy or pipeline_auto_next_deferred_without_token_in_manual_mode or pipeline_auto_next_rejects_execution_stage or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "8 passed, 185 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11P lane closed as keep-local with green GitHub evaluate/auto-next/report cross-edge continuity bundle",
+      "next lane continues full evaluate+auto-next+report contract convergence continuity"
+    ]
+  }
+}

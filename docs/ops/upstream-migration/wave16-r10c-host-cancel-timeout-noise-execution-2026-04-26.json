@@ -1,0 +1,46 @@
+{
+  "generated_at_utc": "2026-04-26T02:19:07Z",
+  "wave": "Wave16-R10C",
+  "title": "Host cancel-timeout/noise micro-lane execution",
+  "scope": [
+    "core/framework/host/agent_host.py",
+    "core/framework/host/colony_runtime.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "delta is logging-severity split only (timeout debug vs generic failure warning)",
+      "cancellation semantics and return contract remain unchanged",
+      "worker/runtime regression bundle is green"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local timeout-specific debug/noise hardening in cancel_all_tasks wrappers"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q",
+        "result": "pass",
+        "summary": "11 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_run_parallel_workers_tool.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_create_colony_tool.py -q",
+        "result": "pass",
+        "summary": "16 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10C lane closed with explicit keep-local decision",
+      "next candidate lane: routes_logs API/runtime-shape compatibility"
+    ]
+  }
+}

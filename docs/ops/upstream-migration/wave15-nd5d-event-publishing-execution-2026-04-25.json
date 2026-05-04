@@ -1,0 +1,38 @@
+{
+  "generated_at_utc": "2026-04-25T00:21:54Z",
+  "item": 288,
+  "lane": "ND-5D",
+  "title": "Event-publishing micro-lane execution",
+  "scope": [
+    "core/framework/agent_loop/internals/event_publishing.py"
+  ],
+  "inputs": {
+    "patch": "docs/ops/upstream-migration/wave15-nd5d-event-publishing.patch",
+    "probe": "docs/ops/upstream-migration/wave15-nd5d-event-publishing-probe-2026-04-25.json",
+    "replay_plan": "docs/ops/upstream-migration/wave15-nd5d-event-publishing-replay-plan-2026-04-25.md"
+  },
+  "execution": {
+    "patch_apply": {
+      "command": "git apply docs/ops/upstream-migration/wave15-nd5d-event-publishing.patch",
+      "result": "pass"
+    },
+    "change_summary": "Restored cache_creation_tokens and cost_usd fields in publish_llm_turn_complete() signature and payload.",
+    "targeted_validation": {
+      "command": "uv run pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q",
+      "result": "pass",
+      "summary": "163 passed, 4 skipped"
+    },
+    "full_gate_validation": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "execution and validation complete",
+      "lane ready for handoff to next bounded item"
+    ]
+  }
+}

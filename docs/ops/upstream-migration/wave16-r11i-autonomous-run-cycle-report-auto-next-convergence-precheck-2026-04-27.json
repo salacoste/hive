@@ -1,0 +1,21 @@
+{
+  "generated_at_utc": "2026-04-27T00:12:05Z",
+  "wave": "Wave16-R11I",
+  "title": "Autonomous run-cycle + report + auto-next convergence continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "intent": [
+    "verify run-cycle/report continuity remains stable when combined with auto-next outcomes",
+    "verify report endpoint consistency across terminal/pr_ready/manual_pending branches"
+  ],
+  "targeted_tests": [
+    "pipeline_loop_run_cycle_reports_terminal_and_pr_ready",
+    "pipeline_loop_run_cycle_summary_outcomes",
+    "pipeline_loop_run_cycle_report_endpoint",
+    "pipeline_report_endpoint",
+    "pipeline_auto_next_endpoint",
+    "pipeline_auto_next_no_checks_manual_pending_policy"
+  ]
+}

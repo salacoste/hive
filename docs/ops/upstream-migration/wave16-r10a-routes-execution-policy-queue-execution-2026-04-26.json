@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-26T02:09:14Z",
+  "wave": "Wave16-R10A",
+  "title": "Routes execution policy/queue/runtime-shape lane execution",
+  "scope": [
+    "core/framework/server/routes_execution.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local routes_execution includes project policy gating and queue semantics absent in upstream baseline",
+      "runtime adapter and event metadata propagation preserve current web/telegram orchestration contracts",
+      "targeted API and bridge bundles are green across trigger/pause/stop/replay and queue policy paths"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local routes_execution policy/queue/runtime-shape contract"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'queue_if_busy or max_concurrent_runs or client_message_id' -q",
+        "result": "pass",
+        "summary": "1 passed, 192 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'trigger or pause or stop or replay' -q",
+        "result": "pass",
+        "summary": "21 passed, 172 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -k 'status or sessions or run' -q",
+        "result": "pass",
+        "summary": "2 passed, 44 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10A lane closed with explicit keep-local decision",
+      "next step: refresh residual shortlist after routes_execution closure"
+    ]
+  }
+}

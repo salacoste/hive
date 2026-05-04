@@ -1,0 +1,35 @@
+{
+  "generated_at_utc": "2026-04-25T11:12:18Z",
+  "wave": "Wave16-R9C",
+  "title": "Cursor persistence behavior lane execution",
+  "scope": [
+    "core/framework/agent_loop/internals/cursor_persistence.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local behavior keeps raw user content without injected timestamp stamps in persisted conversation",
+      "external events retain explicit marker while removing timezone-dependent stamp churn",
+      "trigger queue handling stays aligned with local conversation rendering flow"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; local cursor persistence formatting behavior retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q",
+        "result": "pass",
+        "summary": "163 passed, 4 skipped"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9C lane closed with explicit keep-local behavior contract",
+      "next candidate lane: core/framework/agent_loop/internals/compaction.py"
+    ]
+  }
+}

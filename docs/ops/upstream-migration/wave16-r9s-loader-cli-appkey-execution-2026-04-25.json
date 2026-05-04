@@ -1,0 +1,46 @@
+{
+  "generated_at_utc": "2026-04-25T19:55:01Z",
+  "wave": "Wave16-R9S",
+  "title": "Loader CLI APP_KEY manager contract lane execution",
+  "scope": [
+    "core/framework/loader/cli.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local loader CLI uses typed aiohttp AppKey access (`app[APP_KEY_MANAGER]`) aligned with server APP_KEY contract",
+      "raw-string manager lookup (`app[\"manager\"]`) is intentionally avoided to prevent AppKey drift/warnings",
+      "targeted CLI/server bundles are green; unrelated legacy collection drift is tracked separately"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9S lane (typed APP_KEY manager access retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_runner_cli_frontend.py -q",
+        "result": "pass",
+        "summary": "3 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'execution or health' -q",
+        "result": "pass",
+        "summary": "33 passed, 160 deselected"
+      }
+    ],
+    "known_non_lane_issue": {
+      "command": "uv run --package framework pytest core/tests/test_colony_fork_flow.py -q",
+      "result": "collection_error",
+      "summary": "ImportError: cannot import name '_queen_session_dir' from framework.server.session_manager",
+      "lane_impact": "none (legacy test-drift outside loader/cli AppKey lane)"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9S lane closed with explicit keep-local decision",
+      "next lane: loader MCP registry canonical default alias contract"
+    ]
+  }
+}

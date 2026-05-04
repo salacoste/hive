@@ -1,0 +1,80 @@
+{
+  "generated_at_utc": "2026-04-24T14:44:39Z",
+  "lane": "ND-3A-prometheus",
+  "mode": "reconcile",
+  "files_total": 8,
+  "classification_counts": {
+    "intentional_local_divergence": 2,
+    "aligned_to_upstream": 6
+  },
+  "files": [
+    {
+      "path": "tools/src/aden_tools/credentials/health_check.py",
+      "equal_to_upstream": false,
+      "classification": "intentional_local_divergence",
+      "local_sha256": "52df662c5a3ddc42d96e68e54619cb99ed31cc2dca2f9f5ac1a3c43b62659809",
+      "upstream_sha256": "9f3795330551b4aa239aaa8ebb991641f6eaaaac0b5736f87fa7fbe7d06e5dcc"
+    },
+    {
+      "path": "tools/src/aden_tools/credentials/prometheus.py",
+      "equal_to_upstream": true,
+      "classification": "aligned_to_upstream",
+      "local_sha256": "7f81d22ee403e0cb86e2da8f5c41afe7a64e23c7b9c6467f4f38a006ae24e09c",
+      "upstream_sha256": "7f81d22ee403e0cb86e2da8f5c41afe7a64e23c7b9c6467f4f38a006ae24e09c"
+    },
+    {
+      "path": "tools/src/aden_tools/tools/__init__.py",
+      "equal_to_upstream": false,
+      "classification": "intentional_local_divergence",
+      "local_sha256": "0426a44fdc5a20c34b7181ae60e51ba23b5aaef3283c2186c727dafeec90e9a4",
+      "upstream_sha256": "1b3cdd9549d9c05f49e95bd5cd6de1710b966c18817158a3528bc1e829c41614"
+    },
+    {
+      "path": "tools/src/aden_tools/tools/prometheus_tool/README.md",
+      "equal_to_upstream": true,
+      "classification": "aligned_to_upstream",
+      "local_sha256": "7bfb093aba7ecf0f0d8715a1210012c2eaa6e46fffec56f22b1819ad15322c33",
+      "upstream_sha256": "7bfb093aba7ecf0f0d8715a1210012c2eaa6e46fffec56f22b1819ad15322c33"
+    },
+    {
+      "path": "tools/src/aden_tools/tools/prometheus_tool/__init__.py",
+      "equal_to_upstream": true,
+      "classification": "aligned_to_upstream",
+      "local_sha256": "a76c304b701e499d87b6d695fa4b2d21b25468b70504db6f2b183c219b03d5ca",
+      "upstream_sha256": "a76c304b701e499d87b6d695fa4b2d21b25468b70504db6f2b183c219b03d5ca"
+    },
+    {
+      "path": "tools/src/aden_tools/tools/prometheus_tool/prometheus_tool.py",
+      "equal_to_upstream": true,
+      "classification": "aligned_to_upstream",
+      "local_sha256": "3e4a2caa4b13e64bc36c8e20355a55410b5ea385ebf7d1253b0989a038d3dc6d",
+      "upstream_sha256": "3e4a2caa4b13e64bc36c8e20355a55410b5ea385ebf7d1253b0989a038d3dc6d"
+    },
+    {
+      "path": "tools/tests/test_health_checks.py",
+      "equal_to_upstream": true,
+      "classification": "aligned_to_upstream",
+      "local_sha256": "3f16703db1aff8eb688aa7968c953f451600183cc21d5712e1a335e65dd9a300",
+      "upstream_sha256": "3f16703db1aff8eb688aa7968c953f451600183cc21d5712e1a335e65dd9a300"
+    },
+    {
+      "path": "tools/tests/tools/test_prometheus_tool.py",
+      "equal_to_upstream": true,
+      "classification": "aligned_to_upstream",
+      "local_sha256": "90f13caa054115f51c4d0b0d4f29243c9483e1b746f7edff7f6008b2f118129b",
+      "upstream_sha256": "90f13caa054115f51c4d0b0d4f29243c9483e1b746f7edff7f6008b2f118129b"
+    }
+  ],
+  "applied_actions": [
+    "added upstream-missing files: prometheus README and test_prometheus_tool.py",
+    "aligned preexisting prometheus.py to upstream content",
+    "aligned preexisting prometheus_tool.py to upstream content",
+    "kept intentional local divergence in health_check.py and tools/__init__.py"
+  ],
+  "validation": {
+    "targeted_tests_command": "uv run --package tools pytest tools/tests/test_health_checks.py tools/tests/tools/test_prometheus_tool.py -q",
+    "targeted_tests_result": "48 passed",
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "generated_at_utc": "2026-04-25T07:00:00Z",
+  "wave": "Wave16-R8A",
+  "title": "MCP client teardown lane execution",
+  "scope": [
+    "core/framework/loader/mcp_client.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local branch keeps known anyio cancel-scope cross-task teardown diagnostics at debug level",
+      "non-quirk cleanup failures remain warning-level",
+      "behavior is aligned with Wave16-R6 noise-hardening objective"
+    ]
+  },
+  "changes": [
+    "no additional code change required in this lane; local delta retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_mcp_client.py -q",
+        "result": "pass",
+        "summary": "7 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"mcp or credentials or health\" -q",
+        "result": "pass",
+        "summary": "17 passed, 176 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_telegram_bridge.py -q",
+        "result": "pass",
+        "summary": "46 passed"
+      },
+      {
+        "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+        "result": "pass",
+        "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R8A lane completed without drift or regression",
+      "next candidate lane: R8B (mcp_registry or routes_config/routes_logs micro-lane)"
+    ]
+  }
+}

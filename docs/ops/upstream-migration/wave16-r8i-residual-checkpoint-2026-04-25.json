@@ -1,0 +1,61 @@
+{
+  "generated_at_utc": "2026-04-25T10:36:19Z",
+  "wave": "Wave16-R8I",
+  "title": "Residual shortlist checkpoint after R8F/R8G/R8H",
+  "inventory_commands": [
+    "git diff --numstat upstream/main -- core/framework",
+    "git diff upstream/main -- core/framework/host/execution_manager.py",
+    "git diff upstream/main -- core/framework/runtime/__init__.py",
+    "git diff upstream/main -- core/framework/graph/event_loop/__init__.py"
+  ],
+  "shortlist": [
+    {
+      "path": "core/framework/host/execution_manager.py",
+      "numstat": {"add": 3, "del": 2, "total": 5},
+      "classification": "candidate",
+      "note": "warning-noise hardening (warning -> info with stream id context)"
+    },
+    {
+      "path": "core/framework/runtime/tests/__init__.py",
+      "numstat": {"add": 1, "del": 0, "total": 1},
+      "classification": "local_additive",
+      "note": "local packaging/test marker file (not upstream replay target)"
+    },
+    {
+      "path": "core/framework/runtime/__init__.py",
+      "numstat": {"add": 5, "del": 0, "total": 5},
+      "classification": "local_additive",
+      "note": "local runtime export surface addition"
+    },
+    {
+      "path": "core/framework/graph/event_loop/__init__.py",
+      "numstat": {"add": 6, "del": 0, "total": 6},
+      "classification": "local_additive",
+      "note": "local module boundary/docs init for event loop package"
+    }
+  ],
+  "intentional_keep_local_bucket": [
+    "core/framework/loader/mcp_registry.py",
+    "core/framework/server/routes_config.py",
+    "core/framework/server/routes_logs.py",
+    "core/framework/server/routes_messages.py",
+    "core/framework/loader/cli.py",
+    "core/framework/server/README.md",
+    "core/framework/agents/queen/mcp_registry.json"
+  ],
+  "selected_next_lane": {
+    "id": "R8J",
+    "path": "core/framework/host/execution_manager.py",
+    "rationale": [
+      "small bounded non-additive delta",
+      "directly aligned with runtime warning-noise hardening policy",
+      "clear keep_local contract and low blast radius"
+    ],
+    "planned_validation": [
+      "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"autonomous or execution\" -q",
+      "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+      "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh"
+    ]
+  },
+  "status": "checkpoint_complete"
+}

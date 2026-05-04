@@ -1,0 +1,38 @@
+{
+  "generated_at_utc": "2026-04-25T00:11:37Z",
+  "item": 287,
+  "lane": "ND-5C",
+  "title": "Agent-loop prompting micro-lane execution",
+  "scope": [
+    "core/framework/agent_loop/prompting.py"
+  ],
+  "inputs": {
+    "patch": "docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting.patch",
+    "probe": "docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting-probe-2026-04-25.json",
+    "replay_plan": "docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting-replay-plan-2026-04-25.md"
+  },
+  "execution": {
+    "patch_apply": {
+      "command": "git apply docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting.patch",
+      "result": "pass"
+    },
+    "change_summary": "Restored dynamic_skills_catalog_provider fallback path in build_prompt_spec().",
+    "targeted_validation": {
+      "command": "uv run pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q",
+      "result": "pass",
+      "summary": "163 passed, 4 skipped"
+    },
+    "full_gate_validation": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "Upstream Sync Regression Gate summary: ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "execution complete and validated",
+      "lane ready for handoff to next bounded item"
+    ]
+  }
+}

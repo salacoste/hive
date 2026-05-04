@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T10:15:14Z",
+  "wave": "Wave16-R12C",
+  "title": "Autonomous tick/run-cycle/report continuity consolidation lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "tick + run-cycle + report continuity consolidation remains stable",
+      "dispatch/evaluate/report coupling remains stable for terminal and edge transitions",
+      "no regressions observed in targeted Wave16-R12C bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_tick_all_endpoint or pipeline_loop_tick_resolves_execution_completed_from_event_log or pipeline_loop_tick_resolves_execution_failed_from_event_log or pipeline_dispatch_next_rejects_when_active_run_exists or pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_auto_next_endpoint or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "9 passed, 184 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R12C lane closed as keep-local with green continuity consolidation bundle",
+      "next lane continues full continuity super-bundle stabilization"
+    ]
+  }
+}

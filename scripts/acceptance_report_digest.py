@@ -63,6 +63,8 @@ def main() -> int:
     total = len(rows)
     passed = sum(1 for _, _, _, ok in rows if ok)
     failed = total - passed
+    telegram_conflict_warning_records = 0
+    telegram_conflict_max_count = 0
 
     recent_records: list[dict[str, Any]] = []
     print("== Acceptance Report Digest ==")
@@ -74,7 +76,13 @@ def main() -> int:
     for ts, path, data, ok in rows[: args.limit]:
         health = (data.get("health") or {}).get("status")
         ops = (data.get("ops") or {}).get("status")
-        tg = (data.get("telegram_bridge") or {}).get("status")
+        tg_payload = data.get("telegram_bridge") or {}
+        tg = tg_payload.get("status")
+        tg_conflicts = int(tg_payload.get("poll_conflict_409_count") or 0)
+        tg_conflict_warning = bool(tg_payload.get("poll_conflict_warning_active"))
+        telegram_conflict_max_count = max(telegram_conflict_max_count, tg_conflicts)
+        if tg_conflict_warning:
+            telegram_conflict_warning_records += 1
         mark = "PASS" if ok else "FAIL"
         recent_records.append(
             {
@@ -83,16 +91,27 @@ def main() -> int:
                 "health": health,
                 "ops": ops,
                 "telegram": tg,
+                "telegram_conflicts_409": tg_conflicts,
+                "telegram_conflict_warning": tg_conflict_warning,
                 "artifact": path.name,
             }
         )
-        print(f" - {ts.isoformat(timespec='seconds')} [{mark}] health={health} ops={ops} tg={tg} :: {path.name}")
+        print(
+            " - "
+            f"{ts.isoformat(timespec='seconds')} [{mark}] health={health} ops={ops} tg={tg} "
+            f"tg409={tg_conflicts} tg409warn={tg_conflict_warning} :: {path.name}"
+        )
+
+    print(f"telegram_conflict_warning_records={telegram_conflict_warning_records}")
+    print(f"telegram_conflict_max_count={telegram_conflict_max_count}")
 
     summary = {
         "window_days": args.days,
         "artifacts_total": total,
         "pass": passed,
         "fail": failed,
+        "telegram_conflict_warning_records": telegram_conflict_warning_records,
+        "telegram_conflict_max_count": telegram_conflict_max_count,
         "recent": recent_records,
     }
 

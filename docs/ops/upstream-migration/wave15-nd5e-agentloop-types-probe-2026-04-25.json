@@ -1,0 +1,16 @@
+{
+  "generated_at_utc": "2026-04-25T00:31:56Z",
+  "item": 289,
+  "lane": "ND-5E",
+  "title": "Agent-loop types micro-lane probe",
+  "patch": "docs/ops/upstream-migration/wave15-nd5e-agentloop-types.patch",
+  "scope": [
+    "core/framework/agent_loop/types.py",
+    "core/framework/agent_loop/internals/types.py"
+  ],
+  "probe": {
+    "command": "git apply --check docs/ops/upstream-migration/wave15-nd5e-agentloop-types.patch",
+    "exit_code": 0,
+    "status": "replay_ready"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "generated_at_utc": "2026-04-26T13:52:46Z",
+  "wave": "Wave16-R10M",
+  "title": "Execution-template model-profile propagation lane execution",
+  "scope": [
+    "core/framework/server/routes_projects.py",
+    "core/framework/server/routes_config.py",
+    "core/framework/server/tests/test_api.py",
+    "core/tests/test_session_manager_worker_handoff.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "project execution_template API contract remains stable under current local runtime behavior",
+      "session-manager worker handoff keeps model-profile propagation contract green",
+      "no propagation regressions found; runtime code changes are unnecessary"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'project_execution_template' -q",
+        "result": "pass",
+        "summary": "2 passed, 191 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q",
+        "result": "pass",
+        "summary": "9 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10M lane closed as keep-local with green execution-template/model-profile contract coverage",
+      "next lane targets autonomous pipeline stage-profile contract continuity"
+    ]
+  }
+}

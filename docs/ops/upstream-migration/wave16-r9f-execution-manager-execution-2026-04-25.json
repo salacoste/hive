@@ -1,0 +1,48 @@
+{
+  "generated_at_utc": "2026-04-25T11:37:11Z",
+  "wave": "Wave16-R9F",
+  "title": "Execution manager behavior lane execution",
+  "scope": [
+    "core/framework/host/execution_manager.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "delta is limited to cancellation-grace logging level and message text",
+      "local info-level log reduces warning noise while preserving stop lifecycle semantics",
+      "no functional runtime contract gain from replaying upstream warning-level variant"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local execution_manager behavior"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q",
+        "result": "pass",
+        "summary": "29 passed, 164 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_runtime.py -q",
+        "result": "pass",
+        "summary": "15 passed, 2 skipped"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q",
+        "result": "pass",
+        "summary": "11 passed"
+      }
+    ],
+    "observations": [
+      "core/tests/test_session_unified_colony_runtime.py currently fails against current local session_manager contract (out-of-scope for R9F lane)"
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9F lane closed with explicit keep-local decision",
+      "next candidate lane: core/framework/server/routes_logs.py"
+    ]
+  }
+}

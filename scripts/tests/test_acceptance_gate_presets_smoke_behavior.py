@@ -42,6 +42,7 @@ def test_presets_smoke_is_deterministic_with_contaminated_env() -> None:
     assert "HIVE_ACCEPTANCE_SUMMARY_JSON=" in fast_block
     assert "HIVE_ACCEPTANCE_RUN_PRESET_SMOKE=" in fast_block
     assert "HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE=" in fast_block
+    assert "HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET=false" in fast_block
     assert "HIVE_DELIVERY_E2E_SKIP_REAL=" in fast_block
     assert "HIVE_ACCEPTANCE_SELF_CHECK_RUN_RUNTIME_PARITY=" in fast_block
 
@@ -50,10 +51,12 @@ def test_presets_smoke_is_deterministic_with_contaminated_env() -> None:
     assert "HIVE_ACCEPTANCE_RUN_SELF_CHECK=" in strict_block
     assert "HIVE_ACCEPTANCE_RUN_PRESET_SMOKE=" in strict_block
     assert "HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE=" in strict_block
+    assert "HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET=true" in strict_block
     assert "HIVE_DELIVERY_E2E_SKIP_REAL=" in strict_block
 
     full_deep_block = _extract_mode_block(out, "full-deep")
     assert "HIVE_ACCEPTANCE_RUN_PRESET_SMOKE=true" in full_deep_block
     assert "HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE=true" in full_deep_block
+    assert "HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET=true" in full_deep_block
     assert "HIVE_DELIVERY_E2E_SKIP_REAL=true" in full_deep_block
     assert "HIVE_ACCEPTANCE_SELF_CHECK_RUN_RUNTIME_PARITY=true" in full_deep_block

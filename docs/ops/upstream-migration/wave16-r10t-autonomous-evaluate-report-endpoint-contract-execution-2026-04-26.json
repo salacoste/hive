@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-26T15:16:27Z",
+  "wave": "Wave16-R10T",
+  "title": "Autonomous evaluate + report endpoint contract lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "evaluate endpoint contract remains stable for checks ingestion and status-field normalization",
+      "report endpoint continuity remains stable after evaluate updates",
+      "no endpoint regressions observed; no runtime change needed"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_evaluate_endpoint_uses_checks_and_updates_report or pipeline_evaluate_endpoint_accepts_status_field or pipeline_report_endpoint' -q",
+        "result": "pass",
+        "summary": "3 passed, 190 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10T lane closed as keep-local with green evaluate/report endpoint contracts",
+      "next lane targets run-cycle reporting continuity"
+    ]
+  }
+}

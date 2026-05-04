@@ -9,27 +9,23 @@ from datetime import UTC
 from pathlib import Path
 from typing import Any
 
-from framework.config import get_hive_config, get_max_context_tokens, get_preferred_model
+from framework.config import get_hive_config, get_preferred_model
 from framework.credentials.validation import (
     ensure_credential_key_env as _ensure_credential_key_env,
 )
-from framework.graph import Goal
-from framework.graph.edge import (
-    DEFAULT_MAX_TOKENS,
+from framework.host.agent_host import AgentHost, AgentRuntimeConfig
+from framework.host.execution_manager import EntryPointSpec
+from framework.llm.provider import LLMProvider, Tool
+from framework.loader.preload_validation import run_preload_validation
+from framework.loader.tool_registry import ToolRegistry
+from framework.orchestrator import Goal
+from framework.orchestrator.edge import (
     EdgeCondition,
     EdgeSpec,
     GraphSpec,
 )
-from framework.graph.executor import ExecutionResult
-from framework.graph.node import NodeSpec
-from framework.llm.provider import LLMProvider, Tool
-from framework.model_routing import resolve_model_chain, resolve_model_connection
-from framework.runner.preload_validation import run_preload_validation
-from framework.runner.tool_registry import ToolRegistry
-from framework.runtime.agent_runtime import AgentRuntime, AgentRuntimeConfig, create_agent_runtime
-from framework.runtime.execution_stream import EntryPointSpec
-from framework.runtime.runtime_log_store import RuntimeLogStore
-from framework.tools.flowchart_utils import generate_fallback_flowchart
+from framework.orchestrator.node import NodeSpec
+from framework.orchestrator.orchestrator import ExecutionResult
 
 logger = logging.getLogger(__name__)
 
@@ -557,18 +553,10 @@ def get_kimi_code_token() -> str | None:
 # VSCode-style SQLite state database under the key
 # "antigravityUnifiedStateSync.oauthToken" as a base64-encoded protobuf blob.
 ANTIGRAVITY_IDE_STATE_DB = (
-    Path.home()
-    / "Library"
-    / "Application Support"
-    / "Antigravity"
-    / "User"
-    / "globalStorage"
-    / "state.vscdb"
+    Path.home() / "Library" / "Application Support" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
 )
 # Linux fallback for the IDE state DB
-ANTIGRAVITY_IDE_STATE_DB_LINUX = (
-    Path.home() / ".config" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
-)
+ANTIGRAVITY_IDE_STATE_DB_LINUX = Path.home() / ".config" / "Antigravity" / "User" / "globalStorage" / "state.vscdb"
 # Antigravity credentials stored by native OAuth implementation
 ANTIGRAVITY_AUTH_FILE = Path.home() / ".hive" / "antigravity-accounts.json"
 
@@ -712,9 +700,7 @@ def _is_antigravity_token_expired(auth_data: dict) -> bool:
             return True
     elif isinstance(last_refresh_val, str):
         try:
-            last_refresh_val = datetime.fromisoformat(
-                last_refresh_val.replace("Z", "+00:00")
-            ).timestamp()
+            last_refresh_val = datetime.fromisoformat(last_refresh_val.replace("Z", "+00:00")).timestamp()
         except (ValueError, TypeError):
             return True
 
@@ -845,8 +831,7 @@ def get_antigravity_token() -> str | None:
         return token_data["access_token"]
 
     logger.warning(
-        "Antigravity token refresh failed. "
-        "Re-open the Antigravity IDE or run 'antigravity-auth accounts add'."
+        "Antigravity token refresh failed. Re-open the Antigravity IDE or run 'antigravity-auth accounts add'."
     )
     return access_token
 
@@ -880,6 +865,167 @@ class ValidationResult:
     warnings: list[str] = field(default_factory=list)
     missing_tools: list[str] = field(default_factory=list)
     missing_credentials: list[str] = field(default_factory=list)
+
+
+def _resolve_template_vars(text: str | None, variables: dict[str, str]) -> str | None:
+    """Resolve ``{{variable_name}}`` placeholders in *text*."""
+    if text is None or not variables:
+        return text
+    import re
+
+    def _replace(m: re.Match) -> str:
+        key = m.group(1).strip()
+        return variables.get(key, m.group(0))
+
+    return re.sub(r"\{\{(.+?)\}\}", _replace, text)
+
+
+def load_agent_config(data: str | dict) -> tuple[GraphSpec, Goal]:
+    """Load ``GraphSpec`` and ``Goal`` from a declarative :class:`AgentConfig`.
+
+    The declarative format uses a ``name`` key at the top level, unlike the
+    legacy export format which uses ``graph``/``goal`` keys.  The runner
+    auto-detects the format in :meth:`AgentLoader.load`.
+
+    Template variables in ``config.variables`` are resolved in all
+    ``system_prompt`` and ``identity_prompt`` fields via ``{{var_name}}``.
+
+    Returns:
+        Tuple of (GraphSpec, Goal)
+    """
+    from framework.orchestrator.edge import EdgeCondition, EdgeSpec
+    from framework.orchestrator.goal import Constraint, Goal as GoalModel, SuccessCriterion
+    from framework.schemas.agent_config import AgentConfig
+
+    if isinstance(data, str):
+        data = json.loads(data)
+
+    config = AgentConfig.model_validate(data)
+    tvars = config.variables
+
+    # Build Goal
+    success_criteria = [
+        SuccessCriterion(
+            id=f"sc-{i}",
+            description=sc,
+            metric="llm_judge",
+            target="",
+        )
+        for i, sc in enumerate(config.goal.success_criteria)
+    ]
+    constraints = [
+        Constraint(
+            id=f"c-{i}",
+            description=c,
+            constraint_type="hard",
+            category="general",
+        )
+        for i, c in enumerate(config.goal.constraints)
+    ]
+    goal = GoalModel(
+        id=f"{config.name}-goal",
+        name=config.name,
+        description=config.goal.description,
+        success_criteria=success_criteria,
+        constraints=constraints,
+    )
+
+    # Build nodes
+    condition_map = {
+        "always": EdgeCondition.ALWAYS,
+        "on_success": EdgeCondition.ON_SUCCESS,
+        "on_failure": EdgeCondition.ON_FAILURE,
+        "conditional": EdgeCondition.CONDITIONAL,
+        "llm_decide": EdgeCondition.LLM_DECIDE,
+    }
+
+    nodes = []
+    for nc in config.nodes:
+        # Resolve tool access: node-level config -> agent-level fallback
+        if nc.tools.policy == "explicit" and nc.tools.allowed:
+            tools_list = nc.tools.allowed
+            tool_policy = "explicit"
+        elif nc.tools.policy == "none":
+            tools_list = []
+            tool_policy = "none"
+        else:
+            # Inherit agent-level tool config
+            if config.tools.policy == "explicit" and config.tools.allowed:
+                tools_list = config.tools.allowed
+            else:
+                tools_list = []
+            tool_policy = config.tools.policy
+
+        node_kwargs: dict = {
+            "id": nc.id,
+            "name": nc.name or nc.id,
+            "description": nc.description or "",
+            "node_type": nc.node_type,
+            "system_prompt": _resolve_template_vars(nc.system_prompt, tvars),
+            "tools": tools_list,
+            "tool_access_policy": tool_policy,
+            "model": nc.model,
+            "input_keys": nc.input_keys,
+            "output_keys": nc.output_keys,
+            "nullable_output_keys": nc.nullable_output_keys,
+            "max_iterations": nc.max_iterations,
+            "success_criteria": nc.success_criteria,
+            "skip_judge": nc.skip_judge,
+        }
+        # Optional fields -- only pass when set (avoids overriding defaults)
+        if nc.client_facing:
+            node_kwargs["client_facing"] = nc.client_facing
+        if nc.max_node_visits != 1:
+            node_kwargs["max_node_visits"] = nc.max_node_visits
+        if nc.failure_criteria:
+            node_kwargs["failure_criteria"] = nc.failure_criteria
+        if nc.max_retries is not None:
+            node_kwargs["max_retries"] = nc.max_retries
+
+        nodes.append(NodeSpec(**node_kwargs))
+
+    # Build edges
+    edges = []
+    for i, ec in enumerate(config.edges):
+        edges.append(
+            EdgeSpec(
+                id=f"e-{i}-{ec.from_node}-{ec.to_node}",
+                source=ec.from_node,
+                target=ec.to_node,
+                condition=condition_map.get(ec.condition, EdgeCondition.ON_SUCCESS),
+                condition_expr=ec.condition_expr,
+                priority=ec.priority,
+                input_mapping=ec.input_mapping,
+            )
+        )
+
+    # Build entry_points dict for GraphSpec
+    entry_points_dict: dict = {}
+    if config.entry_points:
+        for ep in config.entry_points:
+            entry_points_dict[ep.id] = ep.entry_node or config.entry_node
+    else:
+        entry_points_dict = {"default": config.entry_node}
+
+    # Build GraphSpec
+    graph_kwargs: dict = {
+        "id": f"{config.name}-graph",
+        "goal_id": goal.id,
+        "version": config.version,
+        "entry_node": config.entry_node,
+        "entry_points": entry_points_dict,
+        "terminal_nodes": config.terminal_nodes,
+        "pause_nodes": config.pause_nodes,
+        "nodes": nodes,
+        "edges": edges,
+        "max_tokens": config.max_tokens,
+        "loop_config": dict(config.loop_config),
+        "conversation_mode": config.conversation_mode,
+        "identity_prompt": _resolve_template_vars(config.identity_prompt, tvars) or "",
+    }
+
+    graph = GraphSpec(**graph_kwargs)
+    return graph, goal
 
 
 def load_agent_export(data: str | dict) -> tuple[GraphSpec, Goal]:
@@ -943,7 +1089,7 @@ def load_agent_export(data: str | dict) -> tuple[GraphSpec, Goal]:
     )
 
     # Build Goal
-    from framework.graph.goal import Constraint, SuccessCriterion
+    from framework.orchestrator.goal import Constraint, SuccessCriterion
 
     success_criteria = []
     for sc_data in goal_data.get("success_criteria", []):
@@ -980,7 +1126,7 @@ def load_agent_export(data: str | dict) -> tuple[GraphSpec, Goal]:
     return graph, goal
 
 
-class AgentRunner:
+class AgentLoader:
     """
     Loads and runs exported agents with minimal boilerplate.
 
@@ -992,25 +1138,22 @@ class AgentRunner:
 
     Usage:
         # Simple usage
-        runner = AgentRunner.load("exports/outbound-sales-agent")
+        runner = AgentLoader.load("exports/outbound-sales-agent")
         result = await runner.run({"lead_id": "123"})
 
         # With context manager
-        async with AgentRunner.load("exports/outbound-sales-agent") as runner:
+        async with AgentLoader.load("exports/outbound-sales-agent") as runner:
             result = await runner.run({"lead_id": "123"})
 
         # With custom tools
-        runner = AgentRunner.load("exports/outbound-sales-agent")
+        runner = AgentLoader.load("exports/outbound-sales-agent")
         runner.register_tool("my_tool", my_tool_func)
         result = await runner.run({"lead_id": "123"})
     """
 
     @staticmethod
-    def _resolve_default_model(task_profile: str | None = None) -> str:
-        """Resolve default model from profile routing first, then global config."""
-        chain = resolve_model_chain(profile=task_profile)
-        if chain:
-            return chain[0]
+    def _resolve_default_model() -> str:
+        """Resolve the default model from ~/.hive/configuration.json."""
         return get_preferred_model()
 
     def __init__(
@@ -1021,7 +1164,6 @@ class AgentRunner:
         mock_mode: bool = False,
         storage_path: Path | None = None,
         model: str | None = None,
-        task_profile: str | None = None,
         intro_message: str = "",
         runtime_config: "AgentRuntimeConfig | None" = None,
         interactive: bool = True,
@@ -1032,7 +1174,7 @@ class AgentRunner:
         credential_store: Any | None = None,
     ):
         """
-        Initialize the runner (use AgentRunner.load() instead).
+        Initialize the runner (use AgentLoader.load() instead).
 
         Args:
             agent_path: Path to agent folder
@@ -1055,8 +1197,7 @@ class AgentRunner:
         self.graph = graph
         self.goal = goal
         self.mock_mode = mock_mode
-        self.task_profile = task_profile
-        self.model = model or self._resolve_default_model(task_profile)
+        self.model = model or self._resolve_default_model()
         self.intro_message = intro_message
         self.runtime_config = runtime_config
         self._interactive = interactive
@@ -1071,7 +1212,6 @@ class AgentRunner:
             self._storage_path = storage_path
             self._temp_dir = None
         else:
-            # Use persistent storage in ~/.hive/agents/{agent_name}/ per RUNTIME_LOGGING.md spec
             home = Path.home()
             default_storage = home / ".hive" / "agents" / agent_path.name
             default_storage.mkdir(parents=True, exist_ok=True)
@@ -1088,7 +1228,7 @@ class AgentRunner:
         self._approval_callback: Callable | None = None
 
         # AgentRuntime — unified execution path for all agents
-        self._agent_runtime: AgentRuntime | None = None
+        self._agent_runtime: AgentHost | None = None
         # Pre-load validation: structural checks + credentials.
         # Fails fast with actionable guidance — no MCP noise on screen.
         run_preload_validation(
@@ -1102,18 +1242,18 @@ class AgentRunner:
         if tools_path.exists():
             self._tool_registry.discover_from_module(tools_path)
 
-        # Set environment variables for MCP subprocesses
-        # These are inherited by MCP servers (e.g., GCU browser tools)
-        os.environ["HIVE_AGENT_NAME"] = agent_path.name
-        os.environ["HIVE_STORAGE_PATH"] = str(self._storage_path)
+        # Per-agent env for MCP subprocesses. Stored on the registry so
+        # parallel workers in the same process don't clobber each other
+        # via the shared os.environ dict — the registry merges these
+        # into every MCPServerConfig.env at registration time.
+        self._tool_registry.set_mcp_extra_env(
+            {
+                "HIVE_AGENT_NAME": agent_path.name,
+                "HIVE_STORAGE_PATH": str(self._storage_path),
+            }
+        )
 
-        # Auto-discover MCP servers from mcp_servers.json
-        mcp_config_path = agent_path / "mcp_servers.json"
-        if mcp_config_path.exists():
-            self._load_mcp_servers_from_config(mcp_config_path)
-
-        # Auto-discover registry-selected MCP servers from mcp_registry.json
-        self._load_registry_mcp_servers(agent_path)
+        # MCP tools are loaded by McpRegistryStage in the pipeline during AgentHost.start()
 
     @staticmethod
     def _import_agent_module(agent_path: Path):
@@ -1144,11 +1284,7 @@ class AgentRunner:
         # Evict cached submodules first (e.g. deep_research_agent.nodes,
         # deep_research_agent.agent) so the top-level reload picks up
         # changes in the entire package — not just __init__.py.
-        stale = [
-            name
-            for name in sys.modules
-            if name == package_name or name.startswith(f"{package_name}.")
-        ]
+        stale = [name for name in sys.modules if name == package_name or name.startswith(f"{package_name}.")]
         for name in stale:
             del sys.modules[name]
 
@@ -1161,172 +1297,100 @@ class AgentRunner:
         mock_mode: bool = False,
         storage_path: Path | None = None,
         model: str | None = None,
-        task_profile: str | None = None,
         interactive: bool = True,
         skip_credential_validation: bool | None = None,
         credential_store: Any | None = None,
-    ) -> "AgentRunner":
+    ) -> "AgentLoader":
         """
-        Load an agent from an export folder.
+        Load a colony worker from its config directory.
 
-        Imports the agent's Python package and reads module-level variables
-        (goal, nodes, edges, etc.) to build a GraphSpec. Falls back to
-        agent.json if no Python module is found.
+        Finds {worker_name}.json files in the directory and builds a
+        minimal GraphSpec from the first one found.
 
         Args:
-            agent_path: Path to agent folder
+            agent_path: Path to colony directory containing worker config JSONs
             mock_mode: If True, use mock LLM responses
-            storage_path: Path for runtime storage (defaults to ~/.hive/agents/{name})
-            model: LLM model to use (reads from agent's default_config if None)
-            task_profile: Optional model routing profile (heavy, implementation,
-                documentation, review_validation). Applied only when model is None.
+            storage_path: Path for runtime storage
+            model: LLM model to use
             interactive: If True (default), offer interactive credential setup.
-                Set to False from TUI callers that handle setup via their own UI.
-            skip_credential_validation: If True, skip credential checks at load time.
-                When None (default), uses the agent module's setting.
-            credential_store: Optional shared CredentialStore (avoids creating redundant stores).
+            skip_credential_validation: If True, skip credential checks.
+            credential_store: Optional shared CredentialStore.
 
         Returns:
-            AgentRunner instance ready to run
+            AgentLoader instance ready to run
         """
         agent_path = Path(agent_path)
 
-        # Try loading from Python module first (code-based agents)
-        agent_py = agent_path / "agent.py"
-        if agent_py.exists():
-            agent_module = cls._import_agent_module(agent_path)
+        # Find {worker_name}.json worker config files in the colony directory
+        worker_jsons = sorted(
+            p
+            for p in agent_path.iterdir()
+            if p.is_file()
+            and p.suffix == ".json"
+            and p.stem not in ("agent", "flowchart", "triggers", "configuration", "metadata")
+        )
 
-            goal = getattr(agent_module, "goal", None)
-            nodes = getattr(agent_module, "nodes", None)
-            edges = getattr(agent_module, "edges", None)
+        if not worker_jsons:
+            raise FileNotFoundError(f"No worker config found in {agent_path}")
 
-            if goal is None or nodes is None or edges is None:
-                raise ValueError(
-                    f"Agent at {agent_path} must define 'goal', 'nodes', and 'edges' "
-                    f"in agent.py (or __init__.py)"
-                )
+        from framework.orchestrator.edge import GraphSpec
+        from framework.orchestrator.goal import Constraint, Goal as GoalModel, SuccessCriterion
+        from framework.orchestrator.node import NodeSpec
 
-            # Read model and max_tokens from agent's config if not explicitly provided
-            agent_config = getattr(agent_module, "default_config", None)
-            if model is None:
-                if agent_config and hasattr(agent_config, "model"):
-                    model = agent_config.model
+        # Load the first worker config
+        first_worker = json.loads(worker_jsons[0].read_text(encoding="utf-8"))
+        worker_name = first_worker.get("name", worker_jsons[0].stem)
+        system_prompt = first_worker.get("system_prompt", "")
+        tool_names = first_worker.get("tools", [])
+        goal_data = first_worker.get("goal", {})
+        loop_config = first_worker.get("loop_config", {})
 
-            if agent_config and hasattr(agent_config, "max_tokens"):
-                max_tokens = agent_config.max_tokens
-                logger.info(
-                    "Agent default_config overrides max_tokens: %d "
-                    "(configuration.json value ignored)",
-                    max_tokens,
-                )
-            else:
-                hive_config = get_hive_config()
-                max_tokens = hive_config.get("llm", {}).get("max_tokens", DEFAULT_MAX_TOKENS)
+        success_criteria = [
+            SuccessCriterion(id=f"sc-{i}", description=sc, metric="llm_judge", target="")
+            for i, sc in enumerate(goal_data.get("success_criteria", []))
+        ]
+        constraints = [
+            Constraint(id=f"c-{i}", description=c, constraint_type="hard", category="general")
+            for i, c in enumerate(goal_data.get("constraints", []))
+        ]
+        goal = GoalModel(
+            id=f"{agent_path.name}-goal",
+            name=goal_data.get("description", worker_name),
+            description=goal_data.get("description", ""),
+            success_criteria=success_criteria,
+            constraints=constraints,
+        )
 
-            # Resolve max_context_tokens with priority:
-            #   1. agent loop_config["max_context_tokens"] (explicit, wins silently)
-            #   2. agent default_config.max_context_tokens (logged)
-            #   3. configuration.json llm.max_context_tokens
-            #   4. hardcoded default (32_000)
-            agent_loop_config: dict = dict(getattr(agent_module, "loop_config", {}))
-            if "max_context_tokens" not in agent_loop_config:
-                if agent_config and hasattr(agent_config, "max_context_tokens"):
-                    agent_loop_config["max_context_tokens"] = agent_config.max_context_tokens
-                    logger.info(
-                        "Agent default_config overrides max_context_tokens: %d"
-                        " (configuration.json value ignored)",
-                        agent_config.max_context_tokens,
-                    )
-                else:
-                    agent_loop_config["max_context_tokens"] = get_max_context_tokens()
+        node = NodeSpec(
+            id=worker_name,
+            name=worker_name.replace("_", " ").title(),
+            description=first_worker.get("description", ""),
+            node_type="event_loop",
+            tools=tool_names,
+            system_prompt=system_prompt,
+        )
+        graph = GraphSpec(
+            id=f"{agent_path.name}-graph",
+            goal_id=goal.id,
+            entry_node=worker_name,
+            nodes=[node],
+            edges=[],
+            max_tokens=loop_config.get("max_tokens", 4096),
+            loop_config=loop_config,
+            identity_prompt=first_worker.get("identity_prompt", ""),
+            conversation_mode="continuous",
+        )
 
-            # Read intro_message from agent metadata (shown on TUI load)
-            agent_metadata = getattr(agent_module, "metadata", None)
-            intro_message = ""
-            if agent_metadata and hasattr(agent_metadata, "intro_message"):
-                intro_message = agent_metadata.intro_message
+        logger.info(
+            "Loaded colony worker config from %s (name=%s, tools=%d)",
+            worker_jsons[0].name,
+            worker_name,
+            len(tool_names),
+        )
 
-            # Build GraphSpec from module-level variables
-            graph_kwargs: dict = {
-                "id": f"{agent_path.name}-graph",
-                "goal_id": goal.id,
-                "version": "1.0.0",
-                "entry_node": getattr(agent_module, "entry_node", nodes[0].id),
-                "entry_points": getattr(agent_module, "entry_points", {}),
-                "terminal_nodes": getattr(agent_module, "terminal_nodes", []),
-                "pause_nodes": getattr(agent_module, "pause_nodes", []),
-                "nodes": nodes,
-                "edges": edges,
-                "max_tokens": max_tokens,
-                "loop_config": agent_loop_config,
-            }
-            # Only pass optional fields if explicitly defined by the agent module
-            conversation_mode = getattr(agent_module, "conversation_mode", None)
-            if conversation_mode is not None:
-                graph_kwargs["conversation_mode"] = conversation_mode
-            identity_prompt = getattr(agent_module, "identity_prompt", None)
-            if identity_prompt is not None:
-                graph_kwargs["identity_prompt"] = identity_prompt
-
-            graph = GraphSpec(**graph_kwargs)
-
-            # Generate flowchart.json if missing (for template/legacy agents)
-            generate_fallback_flowchart(graph, goal, agent_path)
-            # Read skill configuration from agent module
-            agent_default_skills = getattr(agent_module, "default_skills", None)
-            agent_skills = getattr(agent_module, "skills", None)
-
-            # Read runtime config (webhook settings, etc.) if defined
-            agent_runtime_config = getattr(agent_module, "runtime_config", None)
-
-            # Read pre-run hooks (e.g., credential_tester needs account selection)
-            skip_cred = getattr(agent_module, "skip_credential_validation", False)
-            if skip_credential_validation is not None:
-                skip_cred = skip_credential_validation
-            needs_acct = getattr(agent_module, "requires_account_selection", False)
-            configure_fn = getattr(agent_module, "configure_for_account", None)
-            list_accts_fn = getattr(agent_module, "list_connected_accounts", None)
-
-            runner = cls(
-                agent_path=agent_path,
-                graph=graph,
-                goal=goal,
-                mock_mode=mock_mode,
-                storage_path=storage_path,
-                model=model,
-                task_profile=task_profile,
-                intro_message=intro_message,
-                runtime_config=agent_runtime_config,
-                interactive=interactive,
-                skip_credential_validation=skip_cred,
-                requires_account_selection=needs_acct,
-                configure_for_account=configure_fn,
-                list_accounts=list_accts_fn,
-                credential_store=credential_store,
-            )
-            # Stash skill config for use in _setup()
-            runner._agent_default_skills = agent_default_skills
-            runner._agent_skills = agent_skills
-            return runner
-
-        # Fallback: load from agent.json (legacy JSON-based agents)
-        agent_json_path = agent_path / "agent.json"
-        if not agent_json_path.is_file():
-            raise FileNotFoundError(f"No agent.py or agent.json found in {agent_path}")
-
-        with open(agent_json_path, encoding="utf-8") as f:
-            export_data = f.read()
-
-        if not export_data.strip():
-            raise ValueError(f"Empty agent export file: {agent_json_path}")
-
-        try:
-            graph, goal = load_agent_export(export_data)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON in agent export file: {agent_json_path}") from exc
-
-        # Generate flowchart.json if missing (for legacy JSON-based agents)
-        generate_fallback_flowchart(graph, goal, agent_path)
+        if storage_path is None:
+            storage_path = Path.home() / ".hive" / "agents" / agent_path.name / worker_name
+            storage_path.mkdir(parents=True, exist_ok=True)
 
         runner = cls(
             agent_path=agent_path,
@@ -1335,13 +1399,23 @@ class AgentRunner:
             mock_mode=mock_mode,
             storage_path=storage_path,
             model=model,
-            task_profile=task_profile,
             interactive=interactive,
             skip_credential_validation=skip_credential_validation or False,
             credential_store=credential_store,
         )
         runner._agent_default_skills = None
-        runner._agent_skills = None
+        # Colony workers attached to a SQLite task queue get the
+        # colony-progress-tracker skill pre-activated so its full
+        # claim / step / SOP-gate protocol lands in the system prompt
+        # on turn 0, bypassing the progressive-disclosure catalog
+        # lookup. Triggered by the presence of ``input_data.db_path``
+        # in worker.json (written by fork_session_into_colony and
+        # backfilled by ensure_progress_db for pre-existing colonies).
+        _preactivate: list[str] = []
+        _input_data = first_worker.get("input_data") or {}
+        if isinstance(_input_data, dict) and _input_data.get("db_path"):
+            _preactivate.append("hive.colony-progress-tracker")
+        runner._agent_skills = _preactivate or None
         return runner
 
     def register_tool(
@@ -1407,60 +1481,6 @@ class AgentRunner:
         }
         return self._tool_registry.register_mcp_server(server_config)
 
-    def _load_mcp_servers_from_config(self, config_path: Path) -> None:
-        """Load and register MCP servers from a configuration file."""
-        self._tool_registry.load_mcp_config(config_path)
-
-    def _load_registry_mcp_servers(self, agent_path: Path) -> None:
-        """Load and register MCP servers selected via ``mcp_registry.json``."""
-        registry_json = agent_path / "mcp_registry.json"
-        if registry_json.is_file():
-            self._tool_registry.set_mcp_registry_agent_path(agent_path)
-        else:
-            self._tool_registry.set_mcp_registry_agent_path(None)
-
-        from framework.runner.mcp_registry import MCPRegistry
-
-        try:
-            registry = MCPRegistry()
-            registry.initialize()
-            server_configs, selection_max_tools = registry.load_agent_selection(agent_path)
-        except Exception as exc:
-            logger.warning(
-                "Failed to load MCP registry servers for '%s': %s",
-                agent_path.name,
-                exc,
-            )
-            return
-
-        if not server_configs:
-            return
-
-        results = self._tool_registry.load_registry_servers(
-            server_configs,
-            preserve_existing_tools=True,
-            log_collisions=True,
-            max_tools=selection_max_tools,
-        )
-        loaded = [result for result in results if result["status"] == "loaded"]
-        skipped = [result for result in results if result["status"] != "loaded"]
-
-        logger.info(
-            "Loaded %d/%d MCP registry server(s) for agent '%s'",
-            len(loaded),
-            len(results),
-            agent_path.name,
-        )
-        if skipped:
-            logger.info(
-                "Skipped MCP registry servers for agent '%s': %s",
-                agent_path.name,
-                [
-                    {"server": result["server"], "reason": result["skipped_reason"]}
-                    for result in skipped
-                ],
-            )
-
     def set_approval_callback(self, callback: Callable) -> None:
         """
         Set a callback for human-in-the-loop approval during execution.
@@ -1471,274 +1491,116 @@ class AgentRunner:
         self._approval_callback = callback
 
     def _setup(self, event_bus=None) -> None:
-        """Set up runtime, LLM, and executor."""
-        # Configure structured logging (auto-detects JSON vs human-readable)
+        """Set up runtime via pipeline stages.
+
+        Builds a pipeline with the default stages (LLM, credentials, MCP,
+        skills) and passes it to AgentHost.  The stages initialize during
+        ``AgentHost.start()`` and inject tools/LLM/credentials/skills.
+        """
         from framework.observability import configure_logging
+        from framework.pipeline.stages.credential_resolver import CredentialResolverStage
+        from framework.pipeline.stages.llm_provider import LlmProviderStage
+        from framework.pipeline.stages.mcp_registry import McpRegistryStage
+        from framework.pipeline.stages.skill_registry import SkillRegistryStage
+        from framework.skills.config import SkillsConfig
 
         configure_logging(level="INFO", format="auto")
 
-        # Set up session context for tools (agent_id)
+        # Set up session context for tools
         agent_id = self.graph.id or "unknown"
+        self._tool_registry.set_session_context(agent_id=agent_id)
 
-        self._tool_registry.set_session_context(
-            agent_id=agent_id,
-        )
+        # Read MCP server refs from agent.json
+        mcp_refs = []
+        agent_json = self.agent_path / "agent.json"
+        if agent_json.exists():
+            try:
+                import json as _json
 
-        # Create LLM provider
-        # Uses LiteLLM which auto-detects the provider from model name
-        # Skip if already injected (e.g. worker agents with a pre-built LLM)
-        if self._llm is not None:
-            pass  # LLM already configured externally
-        elif self.mock_mode:
-            # Use mock LLM for testing without real API calls
-            from framework.llm.mock import MockLLMProvider
+                data = _json.loads(agent_json.read_text(encoding="utf-8"))
+                mcp_refs = data.get("mcp_servers", [])
+            except Exception:
+                pass
 
-            self._llm = MockLLMProvider(model=self.model)
-        else:
-            from framework.llm.litellm import LiteLLMProvider
-
-            # Check if a subscription mode is configured
-            config = get_hive_config()
-            llm_config = config.get("llm", {})
-            use_claude_code = llm_config.get("use_claude_code_subscription", False)
-            use_codex = llm_config.get("use_codex_subscription", False)
-            use_kimi_code = llm_config.get("use_kimi_code_subscription", False)
-            use_antigravity = llm_config.get("use_antigravity_subscription", False)
-            api_base = llm_config.get("api_base")
-
-            api_key = None
-            if use_claude_code:
-                # Get OAuth token from Claude Code subscription
-                api_key = get_claude_code_token()
-                if not api_key:
-                    logger.warning(
-                        "Claude Code subscription configured but no token found. "
-                        "Run 'claude' to authenticate, then try again."
-                    )
-            elif use_codex:
-                # Get OAuth token from Codex subscription
-                api_key = get_codex_token()
-                if not api_key:
-                    logger.warning(
-                        "Codex subscription configured but no token found. "
-                        "Run 'codex' to authenticate, then try again."
-                    )
-            elif use_kimi_code:
-                # Get API key from Kimi Code CLI config (~/.kimi/config.toml)
-                api_key = get_kimi_code_token()
-                if not api_key:
-                    logger.warning(
-                        "Kimi Code subscription configured but no key found. "
-                        "Run 'kimi /login' to authenticate, then try again."
-                    )
-            elif use_antigravity:
-                pass  # AntigravityProvider handles credentials internally
-
-            if api_key and use_claude_code:
-                # Use litellm's built-in Anthropic OAuth support.
-                # The lowercase "authorization" key triggers OAuth detection which
-                # adds the required anthropic-beta and browser-access headers.
-                self._llm = LiteLLMProvider(
-                    model=self.model,
-                    api_key=api_key,
-                    api_base=api_base,
-                    extra_headers={"authorization": f"Bearer {api_key}"},
-                )
-            elif api_key and use_codex:
-                # OpenAI Codex subscription routes through the ChatGPT backend
-                # (chatgpt.com/backend-api/codex/responses), NOT the standard
-                # OpenAI API.  The consumer OAuth token lacks platform API scopes.
-                extra_headers: dict[str, str] = {
-                    "Authorization": f"Bearer {api_key}",
-                    "User-Agent": "CodexBar",
-                }
-                account_id = get_codex_account_id()
-                if account_id:
-                    extra_headers["ChatGPT-Account-Id"] = account_id
-                self._llm = LiteLLMProvider(
-                    model=self.model,
-                    api_key=api_key,
-                    api_base="https://chatgpt.com/backend-api/codex",
-                    extra_headers=extra_headers,
-                    store=False,
-                    allowed_openai_params=["store"],
-                )
-            elif api_key and use_kimi_code:
-                # Kimi Code subscription uses the Kimi coding API (OpenAI-compatible).
-                # The api_base is set automatically by LiteLLMProvider for kimi/ models.
-                self._llm = LiteLLMProvider(
-                    model=self.model,
-                    api_key=api_key,
-                    api_base=api_base,
-                )
-            elif use_antigravity:
-                # Direct OAuth to Google's internal Cloud Code Assist gateway.
-                # No local proxy required — AntigravityProvider handles token
-                # refresh and Gemini-format request/response conversion natively.
-                from framework.llm.antigravity import AntigravityProvider  # noqa: PLC0415
-
-                provider = AntigravityProvider(model=self.model)
-                if not provider.has_credentials():
-                    print(
-                        "Warning: Antigravity credentials not found. "
-                        "Run: uv run python core/antigravity_auth.py auth account add"
-                    )
-                self._llm = provider
-            else:
-                # Local models (e.g. Ollama) don't need an API key
-                if self._is_local_model(self.model):
-                    self._llm = LiteLLMProvider(
-                        model=self.model,
-                        api_base=api_base,
-                    )
-                else:
-                    # Fall back to environment variable
-                    # First check api_key_env_var from config (set by quickstart)
-                    api_key_env = llm_config.get("api_key_env_var") or self._get_api_key_env_var(
-                        self.model
-                    )
-                    if api_key_env and os.environ.get(api_key_env):
-                        self._llm = LiteLLMProvider(
-                            model=self.model,
-                            api_key=os.environ[api_key_env],
-                            api_base=api_base,
-                        )
-                    else:
-                        # Fall back to credential store
-                        api_key = self._get_api_key_from_credential_store()
-                        if api_key:
-                            self._llm = LiteLLMProvider(
-                                model=self.model, api_key=api_key, api_base=api_base
-                            )
-                            # Set env var so downstream code (e.g. cleanup LLM in
-                            # node._extract_json) can also find it
-                            if api_key_env:
-                                os.environ[api_key_env] = api_key
-                        elif api_key_env:
-                            logger.warning(
-                                "%s not set. LLM calls will fail. "
-                                "Set it with: export %s=your-api-key",
-                                api_key_env,
-                                api_key_env,
-                            )
-
-            # Fail fast if the agent needs an LLM but none was configured
-            if self._llm is None:
-                has_llm_nodes = any(
-                    node.node_type in ("event_loop", "gcu") for node in self.graph.nodes
-                )
-                if has_llm_nodes:
-                    from framework.credentials.models import CredentialError
-
-                    if self._is_local_model(self.model):
-                        raise CredentialError(
-                            f"Failed to initialize LLM for local model '{self.model}'. "
-                            f"Ensure your local LLM server is running "
-                            f"(e.g. 'ollama serve' for Ollama)."
-                        )
-                    api_key_env = self._get_api_key_env_var(self.model)
-                    hint = (
-                        f"Set it with: export {api_key_env}=your-api-key"
-                        if api_key_env
-                        else "Configure an API key for your LLM provider."
-                    )
-                    raise CredentialError(f"LLM API key not found for model '{self.model}'. {hint}")
-
-            self._apply_model_fallback_chain()
-
-        # For GCU nodes: auto-register GCU MCP server if needed, then expand tool lists
-        has_gcu_nodes = any(node.node_type == "gcu" for node in self.graph.nodes)
-        if has_gcu_nodes:
-            from framework.graph.gcu import GCU_MCP_SERVER_CONFIG, GCU_SERVER_NAME
-
-            # Auto-register GCU MCP server if tools aren't loaded yet
-            gcu_tool_names = self._tool_registry.get_server_tool_names(GCU_SERVER_NAME)
-            if not gcu_tool_names:
-                # Resolve cwd to repo-level tools/ (not relative to agent_path)
-                gcu_config = dict(GCU_MCP_SERVER_CONFIG)
-                _repo_root = Path(__file__).resolve().parent.parent.parent.parent
-                gcu_config["cwd"] = str(_repo_root / "tools")
-                self._tool_registry.register_mcp_server(gcu_config)
-                gcu_tool_names = self._tool_registry.get_server_tool_names(GCU_SERVER_NAME)
-
-            # Expand each GCU node's tools list to include all GCU server tools
-            if gcu_tool_names:
-                for node in self.graph.nodes:
-                    if node.node_type == "gcu":
-                        existing = set(node.tools)
-                        for tool_name in sorted(gcu_tool_names):
-                            if tool_name not in existing:
-                                node.tools.append(tool_name)
-
-        # For event_loop/gcu nodes: auto-register file tools MCP server, then expand tool lists
-        has_loop_nodes = any(node.node_type in ("event_loop", "gcu") for node in self.graph.nodes)
-        if has_loop_nodes:
-            from framework.graph.files import FILES_MCP_SERVER_CONFIG, FILES_MCP_SERVER_NAME
-
-            files_tool_names = self._tool_registry.get_server_tool_names(FILES_MCP_SERVER_NAME)
-            if not files_tool_names:
-                # Resolve cwd to repo-level tools/ (not relative to agent_path)
-                files_config = dict(FILES_MCP_SERVER_CONFIG)
-                _repo_root = Path(__file__).resolve().parent.parent.parent.parent
-                files_config["cwd"] = str(_repo_root / "tools")
-                self._tool_registry.register_mcp_server(files_config)
-                files_tool_names = self._tool_registry.get_server_tool_names(FILES_MCP_SERVER_NAME)
-
-            if files_tool_names:
-                for node in self.graph.nodes:
-                    if node.node_type in ("event_loop", "gcu"):
-                        existing = set(node.tools)
-                        for tool_name in sorted(files_tool_names):
-                            if tool_name not in existing:
-                                node.tools.append(tool_name)
-
-        # Get tools for runtime
-        tools = list(self._tool_registry.get_tools().values())
-        tool_executor = self._tool_registry.get_executor()
-
-        # Collect connected account info for system prompt injection
-        accounts_prompt = ""
-        accounts_data: list[dict] | None = None
-        tool_provider_map: dict[str, str] | None = None
-        try:
-            from aden_tools.credentials.store_adapter import CredentialStoreAdapter
-
-            if self._credential_store is not None:
-                adapter = CredentialStoreAdapter(store=self._credential_store)
-            else:
-                adapter = CredentialStoreAdapter.default()
-            accounts_data = adapter.get_all_account_info()
-            tool_provider_map = adapter.get_tool_provider_map()
-            if accounts_data:
-                from framework.graph.prompting import build_accounts_prompt
-
-                accounts_prompt = build_accounts_prompt(accounts_data, tool_provider_map)
-        except Exception:
-            pass  # Best-effort — agent works without account info
-
-        # Skill configuration — the runtime handles discovery, loading, trust-gating and
-        # prompt rasterization.  The runner just builds the config.
-        from framework.skills.config import SkillsConfig
-        from framework.skills.manager import SkillsManagerConfig
-
-        skills_manager_config = SkillsManagerConfig(
-            skills_config=SkillsConfig.from_agent_vars(
-                default_skills=getattr(self, "_agent_default_skills", None),
-                skills=getattr(self, "_agent_skills", None),
+        # Build default pipeline stages
+        # Default infrastructure stages (always present)
+        pipeline_stages = [
+            LlmProviderStage(
+                model=self.model,
+                mock_mode=self.mock_mode,
+                llm=self._llm,
             ),
-            project_root=self.agent_path,
-            interactive=self._interactive,
-        )
+            CredentialResolverStage(
+                credential_store=self._credential_store,
+            ),
+            McpRegistryStage(
+                server_refs=mcp_refs,
+                agent_path=self.agent_path,
+                tool_registry=self._tool_registry,
+            ),
+            SkillRegistryStage(
+                project_root=self.agent_path,
+                interactive=self._interactive,
+                skills_config=SkillsConfig.from_agent_vars(
+                    default_skills=getattr(self, "_agent_default_skills", None),
+                    skills=getattr(self, "_agent_skills", None),
+                ),
+            ),
+        ]
 
-        self._setup_agent_runtime(
-            tools,
-            tool_executor,
-            accounts_prompt=accounts_prompt,
-            accounts_data=accounts_data,
-            tool_provider_map=tool_provider_map,
+        # Merge user-configured stages from ~/.hive/configuration.json
+        from framework.pipeline.registry import build_pipeline_from_config
+
+        hive_config = get_hive_config()
+        user_stages_config = hive_config.get("pipeline", {}).get("stages", [])
+        if user_stages_config:
+            user_pipeline = build_pipeline_from_config(user_stages_config)
+            pipeline_stages.extend(user_pipeline.stages)
+
+        # Merge agent-level overrides from agent.json pipeline field
+        if agent_json.exists():
+            try:
+                agent_pipeline = (
+                    _json.loads(agent_json.read_text(encoding="utf-8")).get("pipeline", {}).get("stages", [])
+                )
+                if agent_pipeline:
+                    agent_stages = build_pipeline_from_config(agent_pipeline)
+                    pipeline_stages.extend(agent_stages.stages)
+            except Exception:
+                pass
+
+        # Create AgentHost directly (no wrapper)
+        from framework.host.execution_manager import EntryPointSpec
+        from framework.orchestrator.checkpoint_config import CheckpointConfig
+        from framework.tracker.runtime_log_store import RuntimeLogStore
+
+        self._agent_runtime = AgentHost(
+            graph=self.graph,
+            goal=self.goal,
+            storage_path=self._storage_path,
+            runtime_log_store=RuntimeLogStore(
+                base_path=self._storage_path / "runtime_logs",
+            ),
+            checkpoint_config=CheckpointConfig(
+                enabled=True,
+                checkpoint_on_node_complete=True,
+                checkpoint_max_age_days=7,
+                async_checkpoint=True,
+            ),
+            graph_id=self.graph.id or self.agent_path.name,
             event_bus=event_bus,
-            skills_manager_config=skills_manager_config,
+            pipeline_stages=pipeline_stages,
         )
+        self._agent_runtime.register_entry_point(
+            EntryPointSpec(
+                id="default",
+                name="Default",
+                entry_node=self.graph.entry_node,
+                trigger_type="manual",
+                isolation_level="shared",
+            ),
+        )
+        self._agent_runtime.intro_message = self.intro_message
 
     def _get_api_key_env_var(self, model: str) -> str | None:
         """Get the environment variable name for the API key based on model name."""
@@ -1770,12 +1632,6 @@ class AgentRunner:
             return "REPLICATE_API_KEY"
         elif model_lower.startswith("together/"):
             return "TOGETHER_API_KEY"
-        elif (
-            model_lower.startswith("glm-")
-            or model_lower.startswith("zai-glm")
-            or model_lower.startswith("z-ai/")
-        ):
-            return "ZAI_API_KEY"
         elif model_lower.startswith("minimax/") or model_lower.startswith("minimax-"):
             return "MINIMAX_API_KEY"
         elif model_lower.startswith("kimi/"):
@@ -1800,13 +1656,28 @@ class AgentRunner:
         cred_id = None
         if model_lower.startswith("anthropic/") or model_lower.startswith("claude"):
             cred_id = "anthropic"
+        elif model_lower.startswith("openai/") or model_lower.startswith("gpt"):
+            cred_id = "openai"
+        elif model_lower.startswith("gemini/") or model_lower.startswith("gemini"):
+            cred_id = "gemini"
         elif model_lower.startswith("minimax/") or model_lower.startswith("minimax-"):
             cred_id = "minimax"
+        elif model_lower.startswith("groq/"):
+            cred_id = "groq"
+        elif model_lower.startswith("cerebras/"):
+            cred_id = "cerebras"
+        elif model_lower.startswith("openrouter/"):
+            cred_id = "openrouter"
+        elif model_lower.startswith("mistral/"):
+            cred_id = "mistral"
+        elif model_lower.startswith("together_ai/") or model_lower.startswith("together/"):
+            cred_id = "together"
+        elif model_lower.startswith("deepseek/"):
+            cred_id = "deepseek"
         elif model_lower.startswith("kimi/"):
             cred_id = "kimi"
         elif model_lower.startswith("hive/"):
             cred_id = "hive"
-        # Add more mappings as providers are added to LLM_CREDENTIALS
 
         if cred_id is None:
             return None
@@ -1836,128 +1707,6 @@ class AgentRunner:
             "llamacpp/",
         )
         return model.lower().startswith(LOCAL_PREFIXES)
-
-    def _apply_model_fallback_chain(self) -> None:
-        """Wrap current provider with fallback providers from task profile routing."""
-        if self._llm is None:
-            return
-        if not self.task_profile:
-            return
-        from framework.llm.fallback import FallbackLLMProvider
-        from framework.llm.litellm import LiteLLMProvider
-
-        chain = resolve_model_chain(explicit_model=self.model, profile=self.task_profile)
-        # Need at least one fallback beyond the primary.
-        if len(chain) <= 1:
-            return
-
-        providers = [self._llm]
-        seen_provider_signatures: set[tuple[str, str]] = {
-            (
-                str(getattr(self._llm, "model", "")).strip().lower(),
-                str(getattr(self._llm, "api_base", "") or "").strip().rstrip("/"),
-            )
-        }
-        cfg = get_hive_config()
-        for backup_model in chain[1:]:
-            conn = resolve_model_connection(backup_model, cfg)
-            api_key_env = conn.get("api_key_env_var")
-            api_base = conn.get("api_base")
-            api_base_env = conn.get("api_base_env_var")
-            if api_base_env and not api_base:
-                api_base = os.environ.get(api_base_env)
-            api_key = os.environ.get(str(api_key_env)) if api_key_env else None
-            candidate = LiteLLMProvider(
-                model=backup_model,
-                api_key=api_key,
-                api_base=api_base,
-            )
-            signature = (
-                str(getattr(candidate, "model", "")).strip().lower(),
-                str(getattr(candidate, "api_base", "") or "").strip().rstrip("/"),
-            )
-            if signature in seen_provider_signatures:
-                continue
-            seen_provider_signatures.add(signature)
-            providers.append(candidate)
-        self._llm = FallbackLLMProvider(providers)
-
-    def _setup_agent_runtime(
-        self,
-        tools: list,
-        tool_executor: Callable | None,
-        accounts_prompt: str = "",
-        accounts_data: list[dict] | None = None,
-        tool_provider_map: dict[str, str] | None = None,
-        event_bus=None,
-        skills_catalog_prompt: str = "",
-        protocols_prompt: str = "",
-        skill_dirs: list[str] | None = None,
-        skills_manager_config=None,
-    ) -> None:
-        """Set up multi-entry-point execution using AgentRuntime."""
-        entry_points = []
-
-        # Always create a primary entry point for the graph's entry node.
-        # For multi-entry-point agents this ensures the primary path (e.g.
-        # user-facing rule setup) is reachable alongside async entry points.
-        if self.graph.entry_node:
-            entry_points.insert(
-                0,
-                EntryPointSpec(
-                    id="default",
-                    name="Default",
-                    entry_node=self.graph.entry_node,
-                    trigger_type="manual",
-                    isolation_level="shared",
-                ),
-            )
-
-        # Create AgentRuntime with all entry points
-        log_store = RuntimeLogStore(base_path=self._storage_path / "runtime_logs")
-
-        # Enable checkpointing by default for resumable sessions
-        from framework.graph.checkpoint_config import CheckpointConfig
-
-        checkpoint_config = CheckpointConfig(
-            enabled=True,
-            checkpoint_on_node_start=False,  # Only checkpoint after nodes complete
-            checkpoint_on_node_complete=True,
-            checkpoint_max_age_days=7,
-            async_checkpoint=True,  # Non-blocking
-        )
-
-        # Handle runtime_config - only pass through if it's actually an AgentRuntimeConfig.
-        # Agents may export a RuntimeConfig (LLM settings) or queen-generated custom classes
-        # that would crash AgentRuntime if passed through.
-        runtime_config = None
-        if self.runtime_config is not None:
-            from framework.runtime.agent_runtime import AgentRuntimeConfig
-
-            if isinstance(self.runtime_config, AgentRuntimeConfig):
-                runtime_config = self.runtime_config
-
-        self._agent_runtime = create_agent_runtime(
-            graph=self.graph,
-            goal=self.goal,
-            storage_path=self._storage_path,
-            entry_points=entry_points,
-            llm=self._llm,
-            tools=tools,
-            tool_executor=tool_executor,
-            runtime_log_store=log_store,
-            checkpoint_config=checkpoint_config,
-            config=runtime_config,
-            graph_id=self.graph.id or self.agent_path.name,
-            accounts_prompt=accounts_prompt,
-            accounts_data=accounts_data,
-            tool_provider_map=tool_provider_map,
-            event_bus=event_bus,
-            skills_manager_config=skills_manager_config,
-        )
-
-        # Pass intro_message through for TUI display
-        self._agent_runtime.intro_message = self.intro_message
 
     # ------------------------------------------------------------------
     # Execution modes
@@ -2039,7 +1788,7 @@ class AgentRunner:
         sub_ids: list[str] = []
 
         if has_queen and sys.stdin.isatty():
-            from framework.runtime.event_bus import EventType
+            from framework.host.event_bus import EventType
 
             runtime = self._agent_runtime
 
@@ -2228,8 +1977,7 @@ class AgentRunner:
                 for sc in self.goal.success_criteria
             ],
             constraints=[
-                {"id": c.id, "description": c.description, "type": c.constraint_type}
-                for c in self.goal.constraints
+                {"id": c.id, "description": c.description, "type": c.constraint_type} for c in self.goal.constraints
             ],
             required_tools=sorted(required_tools),
             has_tools_module=(self.agent_path / "tools.py").exists(),
@@ -2294,17 +2042,13 @@ class AgentRunner:
                 warnings.append(warning_msg)
         except ImportError:
             # aden_tools not installed - fall back to direct check
-            has_llm_nodes = any(
-                node.node_type in ("event_loop", "gcu") for node in self.graph.nodes
-            )
+            has_llm_nodes = any(node.node_type == "event_loop" for node in self.graph.nodes)
             if has_llm_nodes:
                 api_key_env = self._get_api_key_env_var(self.model)
                 if api_key_env and not os.environ.get(api_key_env):
                     if api_key_env not in missing_credentials:
                         missing_credentials.append(api_key_env)
-                    warnings.append(
-                        f"Agent has LLM nodes but {api_key_env} not set (model: {self.model})"
-                    )
+                    warnings.append(f"Agent has LLM nodes but {api_key_env} not set (model: {self.model})")
 
         return ValidationResult(
             valid=len(errors) == 0,
@@ -2316,8 +2060,8 @@ class AgentRunner:
 
     def cleanup(self) -> None:
         """Clean up resources (synchronous)."""
-        # Clean up MCP client connections
-        self._tool_registry.cleanup()
+        if hasattr(self, "_tool_registry"):
+            self._tool_registry.cleanup()
 
         if self._temp_dir:
             self._temp_dir.cleanup()
@@ -2332,7 +2076,7 @@ class AgentRunner:
         # Run synchronous cleanup
         self.cleanup()
 
-    async def __aenter__(self) -> "AgentRunner":
+    async def __aenter__(self) -> "AgentLoader":
         """Context manager entry."""
         self._setup()
         if self._agent_runtime is not None:
@@ -2346,8 +2090,3 @@ class AgentRunner:
     def __del__(self) -> None:
         """Destructor - cleanup temp dir."""
         self.cleanup()
-
-
-# Backward-compatibility shim for loader public surface.
-# Loader package exports AgentLoader, while implementation class remains AgentRunner.
-AgentLoader = AgentRunner

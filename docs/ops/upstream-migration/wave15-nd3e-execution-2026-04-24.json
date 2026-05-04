@@ -1,0 +1,27 @@
+{
+  "generated_at_utc": "2026-04-24T15:23:01Z",
+  "lane": "ND-3E",
+  "title": "Deletions policy execution for upstream-removed legacy files",
+  "scope_files": [
+    "tools/src/aden_tools/tools/google_auth.py",
+    "tools/tests/tools/test_google_auth.py"
+  ],
+  "apply": {
+    "mode": "explicit_delete",
+    "result": "ok"
+  },
+  "scope_verification": {
+    "reference_scan_command": "rg -n \"google_auth|get_google_access_token_from_env_or_file\" tools/src tools/tests",
+    "reference_scan_result": "no matches",
+    "deleted_files": [
+      "tools/src/aden_tools/tools/google_auth.py",
+      "tools/tests/tools/test_google_auth.py"
+    ]
+  },
+  "validation": {
+    "targeted_tests_command": "uv run --package tools pytest tools/tests/test_coder_tools_server.py -q",
+    "targeted_tests_result": "7 passed",
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  }
+}

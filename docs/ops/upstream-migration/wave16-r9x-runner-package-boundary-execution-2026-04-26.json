@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-26T01:57:30Z",
+  "wave": "Wave16-R9X",
+  "title": "Runner package export boundary lane execution",
+  "scope": [
+    "core/framework/runner/__init__.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local runner package exposes stable public exports and uses lazy __getattr__ for AgentRunner symbols",
+      "lazy export path is part of the import-cycle avoidance contract",
+      "targeted runner/session validation bundles are green"
+    ]
+  },
+  "changes": [
+    "no code patch in R9X lane (runner package boundary retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework python - <<'PY' ... import framework.runner export check ... PY",
+        "result": "pass",
+        "summary": "runner_pkg_exports_ok=True, __all__ size=11"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_runner_api_key_env_var.py core/tests/test_runner_model_fallback_chain.py -q",
+        "result": "pass",
+        "summary": "4 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_session_manager_worker_handoff.py -q",
+        "result": "pass",
+        "summary": "9 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9X lane closed with explicit keep-local decision",
+      "next lane: routes_messages typed AppKey manager access"
+    ]
+  }
+}

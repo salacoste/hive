@@ -1,0 +1,46 @@
+{
+  "generated_at_utc": "2026-04-25T10:45:18Z",
+  "wave": "Wave16-R8L",
+  "title": "Agent host/colony runtime timeout-noise lane execution",
+  "scope": [
+    "core/framework/host/agent_host.py",
+    "core/framework/host/colony_runtime.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "both files apply explicit FutureTimeoutError handling with debug-level timeout acknowledgement",
+      "real failures remain warning-level with exc_info for diagnostics",
+      "paired behavior is intentional continuation of runtime warning-noise hardening"
+    ]
+  },
+  "changes": [
+    "no additional code patch required; paired timeout-noise contract retained intentionally"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"autonomous or execution\" -q",
+        "result": "pass",
+        "summary": "83 passed, 110 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      }
+    ],
+    "gate_reference": {
+      "command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+      "result": "pass",
+      "summary": "latest run ok=7 failed=0"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R8L lane closed with paired keep-local timeout-noise guard",
+      "next checkpoint should decide whether to stop micro-lanes or move to medium-size residuals"
+    ]
+  }
+}

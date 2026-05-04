@@ -1,0 +1,50 @@
+{
+  "generated_at_utc": "2026-04-25T10:13:07Z",
+  "wave": "Wave16-R8E",
+  "title": "Post-R8D residual shortlist refresh",
+  "inventory_command": "git diff --numstat upstream/main -- core/framework",
+  "shortlist": [
+    {
+      "path": "core/framework/server/routes_messages.py",
+      "numstat": {"add": 2, "del": 1, "total": 3},
+      "category": "appkey-contract",
+      "note": "manager lookup moved from raw string key to APP_KEY_MANAGER"
+    },
+    {
+      "path": "core/framework/loader/cli.py",
+      "numstat": {"add": 2, "del": 2, "total": 4},
+      "category": "appkey-contract",
+      "note": "server bootstrap cleanup path switched to APP_KEY_MANAGER"
+    },
+    {
+      "path": "core/framework/server/README.md",
+      "numstat": {"add": 1, "del": 1, "total": 2},
+      "category": "docs-sync",
+      "note": "manager access pattern docs aligned to APP_KEY_MANAGER"
+    }
+  ],
+  "guarded_keep_local": [
+    {
+      "path": "core/framework/server/routes_logs.py",
+      "reason": "runtime/log-store compatibility plus upstream unresolved log_store assignment path"
+    },
+    {
+      "path": "core/framework/loader/mcp_registry.py",
+      "reason": "canonical naming contract pinned to hive-tools across loader+runner+runtime/docs"
+    }
+  ],
+  "selected_next_lane": {
+    "id": "R8E-next",
+    "path": "core/framework/server/routes_messages.py",
+    "rationale": [
+      "smallest remaining executable core code delta",
+      "same AppKey contract family as already hardened routes_config",
+      "low blast radius and straightforward targeted validation"
+    ],
+    "planned_validation": [
+      "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"messages or classify\" -q",
+      "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+      "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh"
+    ]
+  }
+}

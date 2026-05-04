@@ -1,0 +1,15 @@
+{
+  "generated_at_utc": "2026-04-25T00:11:37Z",
+  "item": 287,
+  "lane": "ND-5C",
+  "title": "Agent-loop prompting micro-lane probe",
+  "patch": "docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting.patch",
+  "scope": [
+    "core/framework/agent_loop/prompting.py"
+  ],
+  "probe": {
+    "command": "git apply --check docs/ops/upstream-migration/wave15-nd5c-agentloop-prompting.patch",
+    "exit_code": 0,
+    "status": "replay_ready"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-26T13:13:48Z",
+  "wave": "Wave16-R10I",
+  "title": "Runtime trigger-definition contract lane precheck",
+  "scope": [
+    "core/framework/runtime/triggers.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/runtime/triggers.py",
+      "add": 22,
+      "del": 0,
+      "total": 22
+    }
+  },
+  "delta_summary": [
+    "introduces runtime-level TriggerDefinition dataclass used by session/API trigger flows",
+    "establishes explicit trigger schema (id/type/config/description/task/active)",
+    "reduces cross-module trigger type drift"
+  ],
+  "risk_signals": [
+    {
+      "type": "type-contract",
+      "evidence": "TriggerDefinition import path/shape now consumed by server trigger routes",
+      "impact": "trigger CRUD/activation APIs may regress if schema diverges"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'update_trigger or test_trigger' -q",
+    "uv run --package framework pytest core/tests/test_trigger_fires_into_queen.py -q"
+  ],
+  "decision_gate": "keep_local acceptable if trigger API + queen trigger firing suites remain green"
+}

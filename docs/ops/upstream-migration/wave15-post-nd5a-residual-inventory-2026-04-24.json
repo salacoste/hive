@@ -1,0 +1,1804 @@
+{
+  "generated_at_utc": "2026-04-24T18:15:30Z",
+  "base_ref": "upstream/main",
+  "target_ref": "HEAD",
+  "totals": {
+    "entries_non_destructive": 428
+  },
+  "top_prefixes_non_destructive": [
+    {
+      "prefix": "core/framework",
+      "count": 114
+    },
+    {
+      "prefix": "docs/ops",
+      "count": 57
+    },
+    {
+      "prefix": "scripts/tests",
+      "count": 38
+    },
+    {
+      "prefix": "docs/autonomous-factory",
+      "count": 34
+    },
+    {
+      "prefix": "core/tests",
+      "count": 18
+    },
+    {
+      "prefix": "core/frontend",
+      "count": 9
+    },
+    {
+      "prefix": ".github/workflows",
+      "count": 3
+    },
+    {
+      "prefix": "tools/src",
+      "count": 3
+    },
+    {
+      "prefix": "tools/tests",
+      "count": 2
+    },
+    {
+      "prefix": ".dockerignore",
+      "count": 1
+    },
+    {
+      "prefix": ".env.mcp.example",
+      "count": 1
+    },
+    {
+      "prefix": ".gitignore",
+      "count": 1
+    },
+    {
+      "prefix": ".gitleaks.toml",
+      "count": 1
+    },
+    {
+      "prefix": ".pre-commit-config.yaml",
+      "count": 1
+    },
+    {
+      "prefix": "Dockerfile",
+      "count": 1
+    },
+    {
+      "prefix": "Makefile",
+      "count": 1
+    },
+    {
+      "prefix": "ai-proxy-docs/README.md",
+      "count": 1
+    },
+    {
+      "prefix": "ai-proxy-docs/claude-clove.md",
+      "count": 1
+    },
+    {
+      "prefix": "ai-proxy-docs/codex-lb.md",
+      "count": 1
+    },
+    {
+      "prefix": "ai-proxy-docs/gemini-antigravity.md",
+      "count": 1
+    }
+  ],
+  "entries_non_destructive": [
+    {
+      "status": "A",
+      "path": ".dockerignore"
+    },
+    {
+      "status": "A",
+      "path": ".env.mcp.example"
+    },
+    {
+      "status": "A",
+      "path": ".github/workflows/docker-compose-smoke.yml"
+    },
+    {
+      "status": "A",
+      "path": ".github/workflows/secret-scan.yml"
+    },
+    {
+      "status": "A",
+      "path": ".github/workflows/upstream-sync-watch.yml"
+    },
+    {
+      "status": "M",
+      "path": ".gitignore"
+    },
+    {
+      "status": "A",
+      "path": ".gitleaks.toml"
+    },
+    {
+      "status": "M",
+      "path": ".pre-commit-config.yaml"
+    },
+    {
+      "status": "A",
+      "path": "Dockerfile"
+    },
+    {
+      "status": "M",
+      "path": "Makefile"
+    },
+    {
+      "status": "A",
+      "path": "ai-proxy-docs/README.md"
+    },
+    {
+      "status": "A",
+      "path": "ai-proxy-docs/claude-clove.md"
+    },
+    {
+      "status": "A",
+      "path": "ai-proxy-docs/codex-lb.md"
+    },
+    {
+      "status": "A",
+      "path": "ai-proxy-docs/gemini-antigravity.md"
+    },
+    {
+      "status": "A",
+      "path": "ai-proxy-docs/zai-glm.md"
+    },
+    {
+      "status": "A",
+      "path": "automation/hive.factory-policy.yaml"
+    },
+    {
+      "status": "A",
+      "path": "automation/hive.manifest.yaml"
+    },
+    {
+      "status": "A",
+      "path": "automation/hive.task.yaml"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agent_loop/agent_loop.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agent_loop/conversation.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agent_loop/internals/compaction.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agent_loop/internals/cursor_persistence.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agent_loop/internals/event_publishing.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agent_loop/internals/synthetic_tools.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agent_loop/internals/types.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agent_loop/prompting.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agent_loop/types.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agents/discovery.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agents/queen/mcp_registry.json"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/agents/queen/queen_memory_v2.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/config.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/__init__.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/checkpoint_config.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/client_io.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/context.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/context_handoff.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/conversation.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/conversation_judge.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/edge.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/__init__.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/compaction.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/cursor_persistence.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/event_publishing.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/judge_pipeline.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/stall_detector.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/subagent_executor.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/synthetic_tools.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/tool_result_handler.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop/types.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/event_loop_node.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/executor.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/files.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/gcu.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/goal.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/node.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/prompt_composer.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/prompting.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/safe_eval.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/validator.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/graph/worker_agent.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/host/event_bus.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/llm/fallback.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/llm/litellm.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/loader/cli.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/loader/mcp_client.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/loader/mcp_registry.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/loader/tool_registry.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/model_routing.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/__init__.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/cli.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/mcp_client.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/mcp_connection_manager.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/mcp_errors.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/mcp_registry.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/mcp_registry_cli.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/preload_validation.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/protocol.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/runner.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runner/tool_registry.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/EVENT_TYPES.md"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/README.md"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/__init__.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/agent_runtime.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/core.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/event_bus.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/execution_stream.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/llm_debug_logger.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/outcome_aggregator.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/runtime_log_schemas.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/runtime_log_store.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/runtime_logger.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/shared_state.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/stream_runtime.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/tests/__init__.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/tests/test_agent_runtime.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/tests/test_idempotency.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/tests/test_runtime_logging_paths.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/tests/test_webhook_server.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/triggers.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/runtime/webhook_server.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/README.md"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/app.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/autonomous_pipeline.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/project_execution.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/project_metrics.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/project_onboarding.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/project_policy.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/project_retention.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/project_store.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/project_templates.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/project_toolchain.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/queen_orchestrator.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/routes_autonomous.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/routes_config.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/routes_credentials.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/routes_events.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/routes_execution.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/routes_graphs.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/routes_logs.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/routes_messages.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/routes_projects.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/routes_queens.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/routes_sessions.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/session_manager.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/telegram_bridge.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/tests/test_api.py"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/server/tests/test_queen_orchestrator.py"
+    },
+    {
+      "status": "A",
+      "path": "core/framework/server/tests/test_telegram_bridge.py"
+    },
+    {
+      "status": "R",
+      "path": "core/framework/skills/_default_skills/browser-automation/SKILL.md"
+    },
+    {
+      "status": "R",
+      "path": "core/framework/skills/_default_skills/linkedin-automation/SKILL.md"
+    },
+    {
+      "status": "R",
+      "path": "core/framework/skills/_default_skills/x-automation/SKILL.md"
+    },
+    {
+      "status": "M",
+      "path": "core/framework/tools/queen_lifecycle_tools.py"
+    },
+    {
+      "status": "M",
+      "path": "core/frontend/src/api/sessions.ts"
+    },
+    {
+      "status": "M",
+      "path": "core/frontend/src/api/types.ts"
+    },
+    {
+      "status": "M",
+      "path": "core/frontend/src/components/ColonyHeader.tsx"
+    },
+    {
+      "status": "M",
+      "path": "core/frontend/src/components/QueenSessionSwitcher.tsx"
+    },
+    {
+      "status": "M",
+      "path": "core/frontend/src/lib/chat-helpers.ts"
+    },
+    {
+      "status": "M",
+      "path": "core/frontend/src/pages/colony-chat.tsx"
+    },
+    {
+      "status": "M",
+      "path": "core/frontend/src/pages/org-chart.tsx"
+    },
+    {
+      "status": "M",
+      "path": "core/frontend/src/pages/queen-dm.tsx"
+    },
+    {
+      "status": "M",
+      "path": "core/frontend/src/types/colony.ts"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/conftest.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_colony_fork_flow.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_colony_runtime_overseer.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_create_colony_tool.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_event_bus.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_event_loop_node.py"
+    },
+    {
+      "status": "A",
+      "path": "core/tests/test_fallback_llm_provider.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_litellm_provider.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_mcp_client.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_model_catalog.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_node_conversation.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_queen_memory.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_run_parallel_workers_tool.py"
+    },
+    {
+      "status": "A",
+      "path": "core/tests/test_runner_model_fallback_chain.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_safe_eval.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_session_manager_worker_handoff.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_stream_events.py"
+    },
+    {
+      "status": "M",
+      "path": "core/tests/test_tool_registry.py"
+    },
+    {
+      "status": "A",
+      "path": "docker-compose.yml"
+    },
+    {
+      "status": "A",
+      "path": "docker-entrypoint.sh"
+    },
+    {
+      "status": "A",
+      "path": "docs/LOCAL_PROD_RUNBOOK.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/01-target-architecture.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/02-access-and-security.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/03-onboarding-repositories.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/04-operations-runbook.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/05-rollout-plan.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/06-mcp-server-bundle.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/07-access-setup-playbook.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/08-official-hive-docs-map.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/09-autonomous-control-plane.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/10-coding-factory-operating-model.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/11-project-scoped-sessions.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/12-backlog-task-list.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/13-master-implementation-plan.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/14-upstream-memory-reflection-compatibility-plan.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/15-upstream-sync-governance.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/16-upstream-wave2-delta-inventory.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/17-memory-architecture-transition-decision.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/18-unclassified-delta-triage-playbook.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/19-unclassified-delta-decision-register.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/20-multi-project-autonomy-blueprint.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/21-upstream-migration-wave3-plan.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/BACKLOG_COMPACTION_CHECKLIST.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/README.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/archive/INDEX.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/archive/ROTATION_POLICY.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/archive/backlog-done-snapshot-20260409-165752.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/templates/autonomous-backlog-task.json"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/templates/factory-policy.yaml"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/templates/project-create.json"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/templates/project-execution-template.json"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/templates/project-onboarding.json"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/templates/project-policy-binding.json"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/templates/repo-automation-manifest.yaml"
+    },
+    {
+      "status": "A",
+      "path": "docs/autonomous-factory/templates/task-brief.yaml"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/acceptance-automation-map.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/acceptance-reports/INDEX.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/acceptance-reports/digest-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/autonomous-slo-policy.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/backlog-status/INDEX.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/final-go-live-acceptance-pack.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/google-canary/latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/google-oauth-rotation-runbook.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/mcp-env-vars-all.txt"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/mcp-tool-env-map.csv"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/mcp-tools-all.txt"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/mcp-tools-verified.txt"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/phase-a-closure-checklist.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/phase-b-closure-checklist.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/phase-c-closure-checklist.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/phase-d-closure-checklist.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/phase-e-closure-checklist.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/telegram-signoff/latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/baseline-2026-04-17.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/landing-branch-bootstrap-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/landing-branch-bootstrap.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/landing-branch-probe-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-conflict-probe-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-dependency-bundle-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-execution-queue.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-file-probe-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-focus-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-focus-latest.patch"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-focus-probe-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-focus-summary-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-hotspots-bundle-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-integration-probe-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-landing-integration-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-landing-rehearsal-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a-latest.patch"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-a.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-b-bundle-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-b-dependency-bundle-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-b-landing-rehearsal-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-b-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-b-latest.patch"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-b.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-c-bundle-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-c-dependency-bundle-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-c-landing-rehearsal-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-c-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-c-latest.patch"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/overlap-batch-c.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/replay-apply-probe-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/replay-bundle-wave3-compat-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/replay-bundle-wave3-latest.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/replay-bundle-wave3.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-migration/replay-validation-wave3.md"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-unclassified-decisions.json"
+    },
+    {
+      "status": "A",
+      "path": "docs/ops/upstream-unclassified-decisions.md"
+    },
+    {
+      "status": "M",
+      "path": "quickstart.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/_cron_job_lib.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_gate_presets.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_gate_presets_smoke.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_ops_summary.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_report_artifact.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_report_digest.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_report_hygiene.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_report_regression_guard.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_scheduler_snapshot.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_toolchain_self_check.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_toolchain_self_check_deep.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/acceptance_weekly_maintenance.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/apply_hive_toolchain_profile.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/audit_mcp_credentials.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/autonomous_acceptance_gate.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/autonomous_delivery_e2e_smoke.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/autonomous_loop_tick.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/autonomous_operator_profile.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/autonomous_ops_drill.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/autonomous_ops_health_check.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/autonomous_remediate_stale_runs.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/autonomous_scheduler_daemon.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/backlog_archive_hygiene.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/backlog_archive_snapshot.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/backlog_status.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/backlog_status_artifact.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/backlog_status_hygiene.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/backup_hive_state.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/bootstrap_autonomous_factory.sh"
+    },
+    {
+      "status": "M",
+      "path": "scripts/browser_remote_ui.html"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_acceptance_docs_navigation.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_acceptance_gate_toggles_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_acceptance_guardrail_marker_set_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_acceptance_guardrails_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_acceptance_preset_contract_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_acceptance_preset_smoke_determinism.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_acceptance_runbook_sanity_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_acceptance_self_check_test_bundle_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_backlog_archive_index.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_backlog_status_artifacts_index.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_backlog_status_consistency.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_backlog_status_drift.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_backlog_status_json_contract.py"
+    },
+    {
+      "status": "M",
+      "path": "scripts/check_llm_key.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_runbook_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_runtime_parity.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_unclassified_delta_decisions.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/check_upstream_bucket_contract_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/detect_project_toolchains.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/export_mcp_inventory.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/google_mcp_canary.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/google_mcp_smoke_test.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/google_oauth_token_manager.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/google_token_auto_refresh.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/google_token_refresher_daemon.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/hive_hot_sync.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/hive_model_profiles.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/hive_ops_preflight.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/hive_ops_run.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/install_acceptance_gate_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/install_acceptance_gate_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/install_acceptance_weekly_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/install_acceptance_weekly_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/install_autonomous_loop_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/install_autonomous_loop_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/install_google_canary_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/install_google_canary_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/install_google_refresh_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/local_prod_checklist.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/mcp_health_summary.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/render_unclassified_decision_report.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/restore_hive_state.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/setup_local_pro.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/status_acceptance_gate_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/status_acceptance_gate_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/status_acceptance_weekly_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/status_acceptance_weekly_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/status_autonomous_loop_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/status_autonomous_loop_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/status_google_canary_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/status_google_canary_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/status_google_refresh_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/telegram_chat_id_probe.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/telegram_operator_signoff.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_acceptance_gate_presets.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_acceptance_gate_presets_smoke_behavior.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_acceptance_gate_presets_smoke_script.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_acceptance_ops_summary.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_acceptance_report_hygiene.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_acceptance_toolchain_self_check_deep_script.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_acceptance_toolchain_self_check_script.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_autonomous_delivery_e2e_smoke.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_autonomous_operator_profile_script.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_autonomous_scheduler_daemon.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_backlog_status.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_backlog_status_artifact.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_backlog_status_hygiene.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_acceptance_docs_navigation.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_acceptance_gate_toggles_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_acceptance_guardrail_marker_set_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_acceptance_guardrails_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_acceptance_preset_contract_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_acceptance_preset_smoke_determinism_script.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_acceptance_runbook_sanity_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_acceptance_self_check_test_bundle_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_backlog_archive_index.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_backlog_status_artifacts_index.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_backlog_status_consistency.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_backlog_status_drift.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_backlog_status_json_contract.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_runbook_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_unclassified_delta_decisions.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_check_upstream_bucket_contract_sync.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_detect_project_toolchains.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_google_mcp_canary.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_google_token_refresher_daemon.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_mcp_health_summary.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_render_unclassified_decision_report.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_telegram_chat_id_probe.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_telegram_operator_signoff.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_upstream_delta_status.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/tests/test_validate_backlog_markdown.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/uninstall_acceptance_gate_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/uninstall_acceptance_gate_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/uninstall_acceptance_weekly_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/uninstall_acceptance_weekly_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/uninstall_autonomous_loop_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/uninstall_autonomous_loop_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/uninstall_google_canary_cron.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/uninstall_google_canary_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/uninstall_google_refresh_launchd.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_delta_status.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_landing_branch_bootstrap.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_landing_branch_probe.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_apply.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_bundle_apply.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_conflict_probe.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_dependency_bundle.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_export.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_file_probe.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_focus_map.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_focus_patch.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_focus_probe.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_hotspots_bundle.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_integration_probe.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_landing_integrate.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_a_landing_rehearsal.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_b_bundle.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_b_bundle_apply.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_b_dependency_bundle.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_b_export.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_b_landing_rehearsal.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_c_bundle.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_c_bundle_apply.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_c_dependency_bundle.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_c_export.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_overlap_batch_c_landing_rehearsal.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_replay_apply_probe.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_replay_bundle.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_replay_compat_report.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_sync_preflight.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_sync_regression_gate.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/upstream_sync_watch.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/validate_backlog_markdown.py"
+    },
+    {
+      "status": "A",
+      "path": "scripts/validate_factory_config.sh"
+    },
+    {
+      "status": "A",
+      "path": "scripts/verify_access_stack.sh"
+    },
+    {
+      "status": "M",
+      "path": "tools/Dockerfile"
+    },
+    {
+      "status": "M",
+      "path": "tools/coder_tools_server.py"
+    },
+    {
+      "status": "M",
+      "path": "tools/mcp_servers.json"
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/credentials/github.py"
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/credentials/health_check.py"
+    },
+    {
+      "status": "M",
+      "path": "tools/src/aden_tools/tools/__init__.py"
+    },
+    {
+      "status": "M",
+      "path": "tools/tests/test_coder_tools_server.py"
+    },
+    {
+      "status": "M",
+      "path": "tools/tests/tools/test_wandb_tool.py"
+    }
+  ]
+}

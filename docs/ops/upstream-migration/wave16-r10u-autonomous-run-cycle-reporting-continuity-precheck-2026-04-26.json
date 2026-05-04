@@ -1,0 +1,18 @@
+{
+  "generated_at_utc": "2026-04-26T15:16:27Z",
+  "wave": "Wave16-R10U",
+  "title": "Autonomous run-cycle reporting continuity lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "delta_summary": [
+    "R10T closed evaluate/report endpoint contract checks",
+    "next bounded step verifies run-cycle summary/report continuity across outcome variants",
+    "lane is non-destructive and reporting-contract focused"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint' -q"
+  ],
+  "decision_gate": "close lane only after run-cycle summary/report continuity tests remain green across outcome variants"
+}

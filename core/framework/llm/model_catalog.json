@@ -116,13 +116,6 @@
           "max_context_tokens": 131072
         },
         {
-          "id": "llama3.1-8b",
-          "label": "Llama 3.1 8B - Fastest production",
-          "recommended": false,
-          "max_tokens": 8192,
-          "max_context_tokens": 32768
-        },
-        {
           "id": "zai-glm-4.7",
           "label": "Z.ai GLM 4.7 - Strong coding preview",
           "recommended": true,
@@ -145,15 +138,15 @@
           "id": "MiniMax-M2.7",
           "label": "MiniMax M2.7 - Best coding quality",
           "recommended": true,
-          "max_tokens": 32768,
-          "max_context_tokens": 204800
+          "max_tokens": 40960,
+          "max_context_tokens": 180000
         },
         {
           "id": "MiniMax-M2.5",
           "label": "MiniMax M2.5 - Strong value",
           "recommended": false,
-          "max_tokens": 32768,
-          "max_context_tokens": 204800
+          "max_tokens": 40960,
+          "max_context_tokens": 180000
         }
       ]
     },
@@ -272,8 +265,8 @@
           "max_context_tokens": 240000
         },
         {
-          "id": "GLM-5",
-          "label": "GLM-5 - Via Hive",
+          "id": "glm-5.1",
+          "label": "GLM-5.1 - Via Hive",
           "recommended": false,
           "max_tokens": 32768,
           "max_context_tokens": 180000
@@ -288,14 +281,14 @@
           "label": "GPT-5.4 - Best overall",
           "recommended": true,
           "max_tokens": 128000,
-          "max_context_tokens": 922000
+          "max_context_tokens": 872000
         },
         {
           "id": "anthropic/claude-sonnet-4.6",
           "label": "Claude Sonnet 4.6 - Best coding balance",
           "recommended": false,
           "max_tokens": 64000,
-          "max_context_tokens": 936000
+          "max_context_tokens": 872000
         },
         {
           "id": "anthropic/claude-opus-4.6",
@@ -309,49 +302,42 @@
           "label": "Gemini 3.1 Pro Preview - Long-context reasoning",
           "recommended": false,
           "max_tokens": 32768,
-          "max_context_tokens": 1048576
-        },
-        {
-          "id": "deepseek/deepseek-v3.2",
-          "label": "DeepSeek V3.2 - Best value",
-          "recommended": false,
-          "max_tokens": 32768,
-          "max_context_tokens": 163840
+          "max_context_tokens": 872000
         },
         {
           "id": "qwen/qwen3.6-plus",
           "label": "Qwen 3.6 Plus - Strong reasoning",
-          "recommended": false,
+          "recommended": true,
           "max_tokens": 32768,
-          "max_context_tokens": 131072
+          "max_context_tokens": 240000
         },
         {
           "id": "z-ai/glm-5v-turbo",
           "label": "GLM-5V Turbo - Vision capable",
-          "recommended": false,
-          "max_tokens": 16384,
-          "max_context_tokens": 128000
+          "recommended": true,
+          "max_tokens": 32768,
+          "max_context_tokens": 192000
         },
         {
-          "id": "x-ai/grok-4.20",
-          "label": "Grok 4.20 - xAI flagship",
+          "id": "z-ai/glm-5.1",
+          "label": "GLM-5.1 - Better but Slower",
+          "recommended": true,
+          "max_tokens": 40960,
+          "max_context_tokens": 192000
+        },
+        {
+          "id": "minimax/minimax-m2.7",
+          "label": "Minimax M2.7 - Minimax flagship",
           "recommended": false,
-          "max_tokens": 32768,
-          "max_context_tokens": 131072
+          "max_tokens": 40960,
+          "max_context_tokens": 180000
         },
         {
           "id": "xiaomi/mimo-v2-pro",
           "label": "MiMo V2 Pro - Xiaomi multimodal",
-          "recommended": false,
-          "max_tokens": 16384,
-          "max_context_tokens": 65536
-        },
-        {
-          "id": "stepfun/step-3.5-flash",
-          "label": "Step 3.5 Flash - Fast inference",
-          "recommended": false,
-          "max_tokens": 32768,
-          "max_context_tokens": 128000
+          "recommended": true,
+          "max_tokens": 64000,
+          "max_context_tokens": 240000
         }
       ]
     }
@@ -366,7 +352,7 @@
     "zai_code": {
       "provider": "openai",
       "api_key_env_var": "ZAI_API_KEY",
-      "model": "glm-5",
+      "model": "glm-5.1",
       "max_tokens": 32768,
       "max_context_tokens": 180000,
       "api_base": "https://api.z.ai/api/coding/paas/v4"
@@ -382,8 +368,8 @@
       "provider": "minimax",
       "api_key_env_var": "MINIMAX_API_KEY",
       "model": "MiniMax-M2.7",
-      "max_tokens": 32768,
-      "max_context_tokens": 204800,
+      "max_tokens": 40960,
+      "max_context_tokens": 180800,
       "api_base": "https://api.minimax.io/v1"
     },
     "kimi_code": {
@@ -413,8 +399,8 @@
           "recommended": false
         },
         {
-          "id": "GLM-5",
-          "label": "GLM-5",
+          "id": "glm-5.1",
+          "label": "glm-5.1",
           "recommended": false
         }
       ]

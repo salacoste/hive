@@ -73,6 +73,8 @@ export interface DiscoverEntry {
   name: string;
   description: string;
   category: string;
+  created_at?: number;
+  icon?: string | null;
   session_count: number;
   run_count: number;
   node_count: number;

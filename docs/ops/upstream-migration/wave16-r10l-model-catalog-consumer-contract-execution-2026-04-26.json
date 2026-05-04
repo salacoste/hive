@@ -1,0 +1,50 @@
+{
+  "generated_at_utc": "2026-04-26T13:49:06Z",
+  "wave": "Wave16-R10L",
+  "title": "Model catalog consumer contract lane execution",
+  "scope": [
+    "core/framework/llm/model_catalog.json",
+    "core/framework/llm/provider.py",
+    "core/framework/server/routes_config.py",
+    "core/tests/test_model_catalog.py",
+    "core/tests/test_litellm_provider.py",
+    "core/tests/test_routes_config_appkey_contract.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "reconciled model-catalog baseline from R10K is consumed consistently by provider and routes-config paths",
+      "consumer-contract bundle is green without additional runtime or catalog edits",
+      "AppKey routes-config contract remains stable under catalog baseline"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_model_catalog.py -q",
+        "result": "pass",
+        "summary": "14 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_litellm_provider.py -q",
+        "result": "pass",
+        "summary": "100 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_routes_config_appkey_contract.py -q",
+        "result": "pass",
+        "summary": "3 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R10L lane closed as keep-local with green consumer-contract coverage",
+      "next lane continues into execution-template/model-profile propagation contract"
+    ]
+  }
+}

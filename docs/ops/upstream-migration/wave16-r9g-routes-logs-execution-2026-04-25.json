@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-25T11:39:31Z",
+  "wave": "Wave16-R9G",
+  "title": "Routes logs behavior lane execution",
+  "scope": [
+    "core/framework/server/routes_logs.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local route preserves graph-runtime and colony-runtime compatibility",
+      "local route preserves backward-compatible graph-scoped node logs endpoint used by existing clients",
+      "upstream-only topology assumptions increase regression risk for current deployment"
+    ]
+  },
+  "changes": [
+    "no code patch applied; retained local routes_logs behavior"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"logs\" -q",
+        "result": "pass",
+        "summary": "8 passed, 185 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q",
+        "result": "pass",
+        "summary": "29 passed, 164 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9G lane closed with explicit keep-local compatibility contract",
+      "next candidate lane: core/framework/host/agent_host.py"
+    ]
+  }
+}

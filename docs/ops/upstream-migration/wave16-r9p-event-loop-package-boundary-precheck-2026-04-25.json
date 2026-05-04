@@ -1,0 +1,32 @@
+{
+  "generated_at_utc": "2026-04-25T13:23:32Z",
+  "wave": "Wave16-R9P",
+  "title": "Event-loop package boundary lane precheck",
+  "scope": [
+    "core/framework/graph/event_loop/__init__.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/graph/event_loop/__init__.py",
+      "add": 6,
+      "del": 0,
+      "total": 6
+    }
+  },
+  "delta_summary": [
+    "local subpackage initializer documents event-loop modular boundary",
+    "keeps backward-compat guidance explicit (public symbols re-exported via parent module)"
+  ],
+  "risk_signals": [
+    {
+      "type": "package-boundary-doc-contract",
+      "evidence": "without package initializer, submodule boundary intent is implicit and import hygiene regresses",
+      "impact": "upstream replay can remove explicit boundary docs and increase accidental deep-coupling risk"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_event_loop_node.py -q",
+    "uv run --package framework python - <<'PY' ... import framework.graph.event_loop.* submodule check ... PY"
+  ],
+  "decision_gate": "prefer keep_local if additive package-boundary initializer remains benign and validation is green"
+}

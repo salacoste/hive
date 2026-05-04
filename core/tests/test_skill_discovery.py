@@ -1,8 +1,10 @@
 """Tests for skill discovery."""
 
+import logging
 from pathlib import Path
 
 from framework.skills.discovery import DiscoveryConfig, SkillDiscovery
+from framework.skills.parser import ParsedSkill
 
 
 def _write_skill(base: Path, name: str, description: str = "A test skill.") -> Path:
@@ -158,3 +160,61 @@ class TestSkillDiscovery:
         )
         skills = discovery.discover()
         assert not any(s.name == "too-deep" for s in skills)
+
+    def test_framework_preset_collision_is_suppressed(self, caplog):
+        discovery = SkillDiscovery(DiscoveryConfig(skip_user_scope=True))
+        framework_skill = ParsedSkill(
+            name="hive.browser-automation",
+            description="framework",
+            location="/framework/_default_skills/browser-automation/SKILL.md",
+            base_dir="/framework/_default_skills/browser-automation",
+            source_scope="framework",
+            body="framework",
+        )
+        preset_skill = ParsedSkill(
+            name="hive.browser-automation",
+            description="preset",
+            location="/framework/_preset_skills/browser-automation/SKILL.md",
+            base_dir="/framework/_preset_skills/browser-automation",
+            source_scope="preset",
+            body="preset",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            resolved = discovery._resolve_collisions([framework_skill, preset_skill])
+
+        assert len(resolved) == 1
+        assert resolved[0].source_scope == "preset"
+        assert all(
+            (record.__dict__.get("skill_error_code") or "") != "SKILL_COLLISION"
+            for record in caplog.records
+        )
+
+    def test_user_project_collision_still_warns(self, caplog):
+        discovery = SkillDiscovery(DiscoveryConfig(skip_user_scope=True))
+        user_skill = ParsedSkill(
+            name="shared-skill",
+            description="user",
+            location="/home/.agents/skills/shared-skill/SKILL.md",
+            base_dir="/home/.agents/skills/shared-skill",
+            source_scope="user",
+            body="user",
+        )
+        project_skill = ParsedSkill(
+            name="shared-skill",
+            description="project",
+            location="/project/.agents/skills/shared-skill/SKILL.md",
+            base_dir="/project/.agents/skills/shared-skill",
+            source_scope="project",
+            body="project",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            resolved = discovery._resolve_collisions([user_skill, project_skill])
+
+        assert len(resolved) == 1
+        assert resolved[0].source_scope == "project"
+        assert any(
+            record.__dict__.get("skill_error_code") == "SKILL_COLLISION"
+            for record in caplog.records
+        )

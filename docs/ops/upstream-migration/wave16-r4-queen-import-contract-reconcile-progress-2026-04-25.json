@@ -1,0 +1,39 @@
+{
+  "generated_at_utc": "2026-04-25T01:18:00Z",
+  "wave": "Wave16-R4",
+  "title": "Queen orchestrator import-contract reconcile progress",
+  "scope": [
+    "core/framework/server/queen_orchestrator.py"
+  ],
+  "changes": [
+    "replaced strict symbol imports from framework.agents.queen.nodes with compatibility resolver",
+    "added legacy->new phase/tool/prompt fallback mapping to avoid runtime ImportError when symbol sets diverge",
+    "updated reflection trigger subscription call to current API (global_memory_dir/queen_memory_dir/queen_id)"
+  ],
+  "validation": {
+    "unit_tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "3 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py core/framework/server/tests/test_api.py -k \"queen\" -q",
+        "result": "pass",
+        "summary": "12 passed, 184 deselected"
+      }
+    ],
+    "runtime_probe": {
+      "command": "uv run python <create_queen probe>",
+      "result": "pass_with_observations",
+      "summary": "create_queen bootstrap now initializes and cancels without ImportError/signature crash; observed separate skill-collision warnings and identity-prompt content gap"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "import-contract mismatch and reflection signature mismatch reconciled",
+      "follow-up lane required for queen identity/prompt contract verification"
+    ]
+  }
+}

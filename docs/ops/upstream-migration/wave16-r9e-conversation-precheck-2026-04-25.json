@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-25T11:33:56Z",
+  "wave": "Wave16-R9E",
+  "title": "Conversation behavior lane precheck",
+  "scope": [
+    "core/framework/agent_loop/conversation.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/agent_loop/conversation.py",
+      "add": 11,
+      "del": 99,
+      "total": 110
+    }
+  },
+  "risk_signals": [
+    {
+      "type": "runtime-contract-mismatch",
+      "evidence": "core/framework/server/routes_execution.py constructs Message(... inherited_from=...) while local Message dataclass no longer exposed inherited_from field",
+      "impact": "compact-and-fork / colony-fork summary message creation can raise TypeError at runtime"
+    },
+    {
+      "type": "schema-compatibility",
+      "evidence": "upstream conversation shape includes inherited_from/is_trigger persistence fields",
+      "impact": "loss of cross-session provenance + trigger-banner metadata persistence if not restored"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_event_loop_node.py core/tests/test_node_conversation.py -q",
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q"
+  ],
+  "decision_gate": "reconcile lane by restoring runtime metadata contract while keeping local conversation behavior"
+}

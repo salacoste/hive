@@ -1,0 +1,33 @@
+{
+  "generated_at_utc": "2026-04-25T11:36:53Z",
+  "wave": "Wave16-R9F",
+  "title": "Execution manager behavior lane precheck",
+  "scope": [
+    "core/framework/host/execution_manager.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/host/execution_manager.py",
+      "add": 3,
+      "del": 2,
+      "total": 5
+    }
+  },
+  "delta_summary": [
+    "only behavior delta: log level/message in cancellation grace path of ExecutionManager.stop()",
+    "local code emits info-level message with stream_id instead of warning noise"
+  ],
+  "risk_signals": [
+    {
+      "type": "operational-noise",
+      "evidence": "upstream warning-level line for pending cancellation tasks after 5s",
+      "impact": "warning spam in expected cancellation windows"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution\" -q",
+    "uv run --package framework pytest core/tests/test_runtime.py -q",
+    "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py -q"
+  ],
+  "decision_gate": "prefer keep_local if lifecycle semantics unchanged and only warning-noise suppression differs"
+}

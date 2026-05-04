@@ -1,0 +1,18 @@
+{
+  "generated_at_utc": "2026-04-26T14:09:43Z",
+  "wave": "Wave16-R10S",
+  "title": "Autonomous loop tick heartbeat + dispatch contract lane precheck",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "delta_summary": [
+    "R10R closed tick-resolution transition contracts",
+    "next bounded step validates tick idle/active-run dispatch semantics and execution heartbeat updates",
+    "lane is non-destructive and loop-state contract focused"
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_tick_dispatches_next_when_idle or pipeline_loop_tick_returns_await_execution_for_active_execution_run or pipeline_loop_tick_updates_execution_heartbeat_while_running or pipeline_dispatch_next_rejects_when_active_run_exists' -q"
+  ],
+  "decision_gate": "close lane only after tick idle/active-run dispatch and heartbeat behavior remains green under current autonomous pipeline loop semantics"
+}

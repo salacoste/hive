@@ -112,6 +112,7 @@ def test_mode_contract_flags_are_stable() -> None:
     assert _extract_value(fast, "HIVE_ACCEPTANCE_RUN_SELF_CHECK") == ""
     assert _extract_value(fast, "HIVE_ACCEPTANCE_RUN_PRESET_SMOKE") == ""
     assert _extract_value(fast, "HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE") == ""
+    assert _extract_value(fast, "HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET") == "false"
     assert _extract_value(fast, "HIVE_DELIVERY_E2E_SKIP_REAL") == ""
 
     strict = _run("strict")
@@ -119,6 +120,7 @@ def test_mode_contract_flags_are_stable() -> None:
     assert _extract_value(strict, "HIVE_ACCEPTANCE_RUN_SELF_CHECK") == ""
     assert _extract_value(strict, "HIVE_ACCEPTANCE_RUN_PRESET_SMOKE") == ""
     assert _extract_value(strict, "HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE") == ""
+    assert _extract_value(strict, "HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET") == "true"
     assert _extract_value(strict, "HIVE_DELIVERY_E2E_SKIP_REAL") == ""
 
     full = _run("full")
@@ -126,6 +128,7 @@ def test_mode_contract_flags_are_stable() -> None:
     assert _extract_value(full, "HIVE_ACCEPTANCE_RUN_SELF_CHECK") == "true"
     assert _extract_value(full, "HIVE_ACCEPTANCE_RUN_PRESET_SMOKE") == ""
     assert _extract_value(full, "HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE") == ""
+    assert _extract_value(full, "HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET") == "true"
     assert _extract_value(full, "HIVE_DELIVERY_E2E_SKIP_REAL") == ""
 
     full_deep = _run("full-deep")
@@ -133,5 +136,6 @@ def test_mode_contract_flags_are_stable() -> None:
     assert _extract_value(full_deep, "HIVE_ACCEPTANCE_RUN_SELF_CHECK") == "true"
     assert _extract_value(full_deep, "HIVE_ACCEPTANCE_RUN_PRESET_SMOKE") == "true"
     assert _extract_value(full_deep, "HIVE_ACCEPTANCE_RUN_DELIVERY_E2E_SMOKE") == "true"
+    assert _extract_value(full_deep, "HIVE_ACCEPTANCE_RUN_MIN_REGRESSION_SET") == "true"
     assert _extract_value(full_deep, "HIVE_DELIVERY_E2E_SKIP_REAL") == "true"
     assert _extract_value(full_deep, "HIVE_ACCEPTANCE_SELF_CHECK_RUN_RUNTIME_PARITY") == "true"

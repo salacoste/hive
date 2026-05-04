@@ -228,6 +228,27 @@ class TestToolConversion:
         assert result["function"]["parameters"]["properties"]["query"]["type"] == "string"
         assert result["function"]["parameters"]["required"] == ["query"]
 
+    def test_tool_to_openai_format_anthropic_uses_input_schema(self):
+        """Anthropic-compatible models should receive native input_schema tools."""
+        provider = LiteLLMProvider(model="claude-opus-4-6", api_key="test-key")
+
+        tool = Tool(
+            name="search",
+            description="Search the web",
+            parameters={
+                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
+            },
+        )
+
+        result = provider._tool_to_openai_format(tool)
+
+        assert "type" not in result
+        assert result["name"] == "search"
+        assert result["description"] == "Search the web"
+        assert result["input_schema"]["properties"]["query"]["type"] == "string"
+        assert result["input_schema"]["required"] == ["query"]
+
     def test_parse_tool_call_arguments_repairs_truncated_json(self):
         """Truncated JSON fragments should be repaired into valid tool inputs."""
         provider = LiteLLMProvider(model="gpt-4o-mini", api_key="test-key")

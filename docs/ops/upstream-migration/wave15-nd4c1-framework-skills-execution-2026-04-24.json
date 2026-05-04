@@ -1,0 +1,29 @@
+{
+  "generated_at_utc": "2026-04-24T16:13:17Z",
+  "lane": "ND-4C1",
+  "title": "Framework skills bounded replay execution",
+  "scope_files": [
+    "core/framework/skills/_preset_skills/browser-automation/SKILL.md",
+    "core/framework/skills/_preset_skills/linkedin-automation/SKILL.md",
+    "core/framework/skills/_preset_skills/x-automation/SKILL.md",
+    "core/framework/skills/authoring.py",
+    "core/framework/skills/catalog.py",
+    "core/framework/skills/discovery.py",
+    "core/framework/skills/manager.py",
+    "core/framework/skills/overrides.py",
+    "core/framework/skills/tool_gating.py",
+    "core/framework/skills/trust.py"
+  ],
+  "apply": {
+    "command": "git apply docs/ops/upstream-migration/wave15-nd4c1-framework-skills.patch",
+    "result": "ok"
+  },
+  "validation": {
+    "targeted_tests": {
+      "command": "uv run pytest core/tests/test_skill_registry.py core/tests/test_skill_parser.py core/tests/test_skill_allowlist.py core/tests/test_skill_catalog.py core/tests/test_skill_installer.py core/tests/test_skill_errors.py core/tests/test_skill_resources.py core/tests/test_skill_trust.py core/tests/test_default_skills.py core/tests/test_skill_cli_commands.py core/tests/test_skill_integration.py core/tests/test_skill_discovery.py core/tests/test_skill_context_protection.py core/tests/test_skill_validator.py -q",
+      "result": "256 passed"
+    },
+    "full_gate_command": "HIVE_UPSTREAM_SYNC_GATE_PROFILE=full HIVE_UPSTREAM_SYNC_GATE_PROJECT_ID=default ./scripts/upstream_sync_regression_gate.sh",
+    "full_gate_summary": "ok=7 failed=0"
+  }
+}

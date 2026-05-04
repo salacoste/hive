@@ -1,0 +1,45 @@
+{
+  "generated_at_utc": "2026-04-25T19:59:58Z",
+  "wave": "Wave16-R9U",
+  "title": "Runner MCP registry baseline lane execution",
+  "scope": [
+    "core/framework/runner/mcp_registry.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "runner MCP registry is a large local baseline and cannot be safely replayed as a micro-lane",
+      "default seeding and alias cleanup behavior are validated in local smoke checks",
+      "loader-side MCP registry test suite remains fully green"
+    ]
+  },
+  "changes": [
+    "no code patch in R9U lane (local runner MCP registry baseline retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework python - <<'PY' ... import framework.runner.mcp_registry check ... PY",
+        "result": "pass",
+        "summary": "runner_mcp_registry_import_ok=True"
+      },
+      {
+        "command": "uv run --package framework python - <<'PY' ... MCPRegistry.ensure_defaults stale alias cleanup smoke ... PY",
+        "result": "pass",
+        "summary": "runner_mcp_registry_defaults_ok with servers ['files-tools','gcu-tools','hive-tools']"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_mcp_registry.py -q",
+        "result": "pass",
+        "summary": "89 passed"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9U lane closed with explicit keep-local decision",
+      "next lane: server README AppKey docs alignment"
+    ]
+  }
+}

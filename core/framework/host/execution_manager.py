@@ -438,8 +438,9 @@ class ExecutionManager:
             # in long-running operations (LLM calls, tool executions).
             _, pending = await asyncio.wait(tasks_to_wait, timeout=5.0)
             if pending:
-                logger.warning(
-                    "%d execution task(s) did not finish within 5s after cancellation",
+                logger.info(
+                    "ExecutionStream '%s': %d execution task(s) still cancelling after 5s grace window",
+                    self.stream_id,
                     len(pending),
                 )
 

@@ -1,0 +1,32 @@
+{
+  "generated_at_utc": "2026-04-25T11:44:41Z",
+  "wave": "Wave16-R9I",
+  "title": "Colony runtime behavior lane precheck",
+  "scope": [
+    "core/framework/host/colony_runtime.py"
+  ],
+  "inventory": {
+    "numstat_vs_upstream_main": {
+      "path": "core/framework/host/colony_runtime.py",
+      "add": 5,
+      "del": 1,
+      "total": 6
+    }
+  },
+  "delta_summary": [
+    "added explicit FutureTimeoutError handling in ColonyRuntime.cancel_all_tasks()",
+    "timeout case downgraded to debug; generic failures keep warning with traceback"
+  ],
+  "risk_signals": [
+    {
+      "type": "shutdown-observability",
+      "evidence": "upstream uses single warning for timeout-or-failure path",
+      "impact": "reduced signal quality for diagnosing colony cancellation behavior"
+    }
+  ],
+  "planned_validation": [
+    "uv run --package framework pytest core/tests/test_colony_runtime_overseer.py core/tests/test_run_parallel_workers_tool.py -q",
+    "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"execution or logs\" -q"
+  ],
+  "decision_gate": "prefer keep_local if runtime/overseer/tests stay green and diagnostics improve"
+}

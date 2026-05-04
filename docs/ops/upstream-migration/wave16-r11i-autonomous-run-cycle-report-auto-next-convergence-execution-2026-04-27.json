@@ -1,0 +1,36 @@
+{
+  "generated_at_utc": "2026-04-27T00:17:41Z",
+  "wave": "Wave16-R11I",
+  "title": "Autonomous run-cycle + report + auto-next convergence continuity lane execution",
+  "scope": [
+    "core/framework/server/routes_autonomous.py",
+    "core/framework/server/tests/test_api.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "run-cycle/report continuity remains stable when combined with auto-next outcomes",
+      "report endpoint consistency remains stable across terminal/pr_ready/manual_pending branches",
+      "no regressions observed in targeted convergence bundle"
+    ]
+  },
+  "changes": [
+    "no code changes in this lane (verification-only closure)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k 'pipeline_loop_run_cycle_reports_terminal_and_pr_ready or pipeline_loop_run_cycle_summary_outcomes or pipeline_loop_run_cycle_report_endpoint or pipeline_report_endpoint or pipeline_auto_next_endpoint or pipeline_auto_next_no_checks_manual_pending_policy' -q",
+        "result": "pass",
+        "summary": "6 passed, 187 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R11I lane closed as keep-local with green run-cycle/report/auto-next convergence bundle",
+      "next lane continues loop tick/dispatch/report convergence continuity"
+    ]
+  }
+}

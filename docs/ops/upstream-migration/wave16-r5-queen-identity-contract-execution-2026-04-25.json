@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-25T01:30:00Z",
+  "wave": "Wave16-R5",
+  "title": "Queen identity/prompt contract execution",
+  "scope": [
+    "core/framework/server/queen_orchestrator.py",
+    "core/framework/server/tests/test_queen_orchestrator.py"
+  ],
+  "changes": [
+    "added _hydrate_queen_identity_prompt helper to load queen profile and inject identity prompt into phase_state",
+    "invoked identity hydration during queen bootstrap right after phase_state creation",
+    "added unit tests covering identity hydration and default queen fallback"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_queen_orchestrator.py -q",
+        "result": "pass",
+        "summary": "5 passed"
+      },
+      {
+        "command": "uv run --package framework pytest core/framework/server/tests/test_api.py -k \"queen\" -q",
+        "result": "pass",
+        "summary": "9 passed, 184 deselected"
+      }
+    ],
+    "runtime_probe": {
+      "command": "uv run python <create_queen probe>",
+      "result": "pass_with_observations",
+      "summary": "phase_state prompt now contains <core_identity> and 'Head of Technology'; bootstrap/cancel path works"
+    }
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "identity contract restored for queen bootstrap prompt",
+      "environment still logs skill-collision warnings and async cleanup timeout messages (out of this lane scope)"
+    ]
+  }
+}

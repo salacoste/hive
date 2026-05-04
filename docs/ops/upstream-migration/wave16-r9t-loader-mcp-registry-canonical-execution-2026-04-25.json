@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2026-04-25T19:56:13Z",
+  "wave": "Wave16-R9T",
+  "title": "Loader MCP registry canonical default alias lane execution",
+  "scope": [
+    "core/framework/loader/mcp_registry.py"
+  ],
+  "reconcile_decision": {
+    "mode": "keep_local",
+    "reason": [
+      "local canonical naming (`hive-tools`) matches current runtime/queen MCP contract",
+      "stale alias cleanup path intentionally handles legacy `hive_tools` entries",
+      "targeted MCP registry and CLI bundles are green"
+    ]
+  },
+  "changes": [
+    "no additional code patch required in R9T lane (canonical alias behavior retained)"
+  ],
+  "validation": {
+    "tests": [
+      {
+        "command": "uv run --package framework pytest core/tests/test_mcp_registry.py -k 'ensure_defaults or stale or hive_tools or hive-tools' -q",
+        "result": "pass",
+        "summary": "5 passed, 84 deselected"
+      },
+      {
+        "command": "uv run --package framework pytest core/tests/test_mcp_registry_cli.py -k 'defaults or list or info or config' -q",
+        "result": "pass",
+        "summary": "18 passed, 44 deselected"
+      }
+    ]
+  },
+  "outcome": {
+    "status": "done",
+    "notes": [
+      "R9T lane closed with explicit keep-local decision",
+      "next lane: runner MCP registry baseline divergence (`core/framework/runner/mcp_registry.py`)"
+    ]
+  }
+}

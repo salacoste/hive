@@ -1,0 +1,10 @@
+{
+  "generated_at_utc": "2026-04-24T16:09:05Z",
+  "lane": "ND-4C1-framework-skills",
+  "patch_path": "docs/ops/upstream-migration/wave15-nd4c1-framework-skills.patch",
+  "command": "git apply --check docs/ops/upstream-migration/wave15-nd4c1-framework-skills.patch",
+  "exit_code": 0,
+  "stdout": "",
+  "stderr": "",
+  "result": "pass"
+}
